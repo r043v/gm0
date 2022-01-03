@@ -63,6 +63,7 @@ void generateGfxBank( void ){
 
 u_int8_t gfxLineBuffer[8];
 u_int32_t *gfxLineBuffer32 = (u_int32_t*)gfxLineBuffer ;
+u_int64_t *gfxLineBuffer64 = (u_int64_t*)gfxLineBuffer ;
 
 #define getGfxBank( p, pal ){ \
   register u_int32_t b1 = *p++ ;\
@@ -94,9 +95,11 @@ u_int32_t *gfxLineBuffer32 = (u_int32_t*)gfxLineBuffer ;
   gfxLineBuffer32[1] = rgfxBank32[ ( b1 >> 4 ) * 16 + ( b2 >> 4 ) ] ;\
 }
 
-uint32_t palette[14*16]  __attribute__((section (".usbsram"))) ;
+#define palNumber 14
 
-const u_int32_t palettes[14*16] = {
+uint32_t palette[palNumber*16]  __attribute__((section (".usbsram"))) ;
+
+const u_int32_t palettes[ palNumber*16 ] = {
   // grayscale
   0x73ae0,0x4e7a0,0x25460,0x8518,  // bg
   0x73ae0,0x4e7a0,0x25460,0x8518,  // sprite pal 0
@@ -134,12 +137,6 @@ const u_int32_t palettes[14*16] = {
   0x0,0x5a248,0x73270,0x5bae8,0x0,0x6c000,0x7e080,0x7fff8,0x70718,0x110b8,0x77690,0x7fff8,0x1da00,0x63918,0x7bf98,0x7fff8
 };
 
-#define palNumber 14
-
-
-void initPal( void ){
-  memcpy( palette, palettes, palNumber * 16*4 ) ;
-}
 
 
 //u_int32_t * palette = (u_int32_t*)palettes;
@@ -154,8 +151,18 @@ u8  bgColorTable[4] __attribute__((section (".sram"))) = { 0,0,0,0 },
 ;
 
 u8  spriteColorTable[2][4] __attribute__((section (".sram"))) = { { 0,0,0,0 }, { 0,0,0,0 } },
-    spriteCurrentPal[2] = { 0, 0 }
+    spriteCurrentPal[2] __attribute__((section (".sram"))) = { 0, 0 }
 ;
+
+void initPal( void ){
+  memcpy( palette, palettes, palNumber * 16*4 ) ;
+  *(u32*)bgColorTable = 0 ;
+  *(u32*)wdColorTable = 0 ;
+  *(uint64_t*)spriteColorTable = 0 ;
+  //memset( spriteColorTable, 0, 8 ) ;
+  *(u16*)spriteCurrentPal = 0 ;
+}
+
 
 //#define extendGfxCache true
 
@@ -217,51 +224,34 @@ void setGfxCache( __uint8_t * id ){
 
 #endif
 
-//union {
-//  u_int8_t gfxLineBuffer[8];
-//  __uint64_t gfxLineBuffer64;
-//};
-
-u_int32_t *gfxBuffer = ( u_int32_t * )gfxLineBuffer ;
-
-//__uint64_t gfxCache64[ 256 ][ 4 ] ;
-
 #define gfxCacheLength 12
 #define wgfxCacheLength 12
 
-
 #ifdef gfxCacheLength
-u_int32_t gfxCache[ gfxCacheLength*2 ] __attribute__((section (".sram2"))) ;
-//const u_int32_t *gfxCache  = (u_int32_t*)(usbsram+1024) ;//[ gfxCacheLength*2 ] ;
-uint16_t gfxCacheId[ gfxCacheLength ] ;
+u_int64_t gfxCache[ gfxCacheLength ] __attribute__((section (".sram"))) ;
+uint16_t gfxCacheId[ gfxCacheLength ]  __attribute__((section (".usbsram"))) ;
 u_int8_t gfxCacheN = 0 ;
 u_int8_t gfxCacheNb = 0 ;
 #define gfxCacheReset gfxCacheNb = gfxCacheN = 0
 
 int getGfxCache( uint16_t id ){
-  //gfxCache64[ id&0xff ][ 0 ] = id>>8 ;
-  int n = 0 ;
-  while( n != gfxCacheNb ){
-    if( id == gfxCacheId[ n ] ){
-      u_int32_t * cache = &gfxCache[ n*2 ];
-
-      gfxLineBuffer32[0] = *cache++ ;
-      gfxLineBuffer32[1] = *cache ;
+  u16*last = &gfxCacheId[gfxCacheNb], *current = gfxCacheId ;
+  //int n = 0 ;
+  while( /*n != gfxCacheNb*/ current != last ){
+    if( id == /*gfxCacheId[ n ]*/ *current ){
+      *gfxLineBuffer64 = gfxCache[ /*n*/ current - gfxCacheId  ] ;
       return 1 ;
     }
 
-    n++;
+    //n++;
+    current++;
   };
 
   return 0 ;
 }
 
 void setGfxCache( uint16_t id ){
-  u_int32_t * cache = &gfxCache[ gfxCacheN*2 ];
-
-  *cache++ = gfxLineBuffer32[0] ;
-  *cache   = gfxLineBuffer32[1] ;
-
+  gfxCache[ gfxCacheN ] = *gfxLineBuffer64 ;
   gfxCacheId[ gfxCacheN ] = id ;
   if( ++gfxCacheN == gfxCacheLength ) gfxCacheN = 0 ;
   if( gfxCacheNb != gfxCacheLength ) gfxCacheNb++ ;
@@ -271,40 +261,30 @@ void setGfxCache( uint16_t id ){
 
 
 #ifdef wgfxCacheLength
-//u_int32_t wgfxCache[ wgfxCacheLength*2 ] ;
-//const u_int32_t *wgfxCache = (u_int32_t*)(usbsram+1024+512);
-u_int32_t wgfxCache[ wgfxCacheLength*2 ] __attribute__((section (".sram"))) ;
-
-uint16_t wgfxCacheId[ wgfxCacheLength ] ;
+u_int64_t wgfxCache[ wgfxCacheLength ] __attribute__((section (".sram"))) ;
+uint16_t wgfxCacheId[ wgfxCacheLength ]  __attribute__((section (".usbsram"))) ;
 u_int8_t wgfxCacheN = 0 ;
 u_int8_t wgfxCacheNb = 0 ;
 #define wgfxCacheReset wgfxCacheNb = wgfxCacheN = 0
 
 int wgetGfxCache( uint16_t id ){
-  //gfxCache64[ id&0xff ][ 0 ] = id>>8 ;
-  int n = 0 ;
-  while( n != wgfxCacheNb ){
-    if( id == wgfxCacheId[ n ] ){
-      u_int32_t * cache = &wgfxCache[ n*2 ];
-      
-      gfxLineBuffer32[0] = *cache++ ;
-      gfxLineBuffer32[1] = *cache ;
-
+  //int n = 0 ;
+  u16*last = &wgfxCacheId[wgfxCacheNb], *current = wgfxCacheId ;
+  while( /*n != wgfxCacheNb*/current != last ){
+    if( id == /*wgfxCacheId[ n ]*/ *current ){
+      *gfxLineBuffer64 = wgfxCache[ /*n*/ current - wgfxCacheId ] ;
       return 1 ;
     }
 
-    n++;
+    //n++;
+    current++;
   };
 
   return 0 ;
 }
 
 void wsetGfxCache( uint16_t id ){
-  u_int32_t * cache = &wgfxCache[ wgfxCacheN*2 ] ;
-
-  *cache++ = gfxLineBuffer32[0] ;
-  *cache   = gfxLineBuffer32[1] ;
-
+  wgfxCache[ wgfxCacheN ] = *gfxLineBuffer64 ;
   wgfxCacheId[ wgfxCacheN ] = id ;
   if( ++wgfxCacheN == wgfxCacheLength ) wgfxCacheN = 0 ;
   if( wgfxCacheNb != wgfxCacheLength ) wgfxCacheNb++ ;
