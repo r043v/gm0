@@ -16,19 +16,22 @@ MEMORY
   Ram1_2 (rwx) : ORIGIN = 0x20000000, LENGTH = 0x800 /* 2K bytes */
   Ram2USB_2 (rwx) : ORIGIN = 0x20004000, LENGTH = 0x800 /* 2K bytes */
 
-
+  SRAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 0x800
+  USBSRAM (rwx) : ORIGIN = 0x20004000, LENGTH = 0x800
 }
   /* Define a symbol for the top of each memory region */
   __top_MFlash256 = 0x0 + 0x40000;
   __top_Ram0_32 = 0x10000000 + 0x8000;
   __top_Ram1_2 = 0x20000000 + 0x800;
   __top_Ram2USB_2 = 0x20004000 + 0x800;
+  __top_SRAM = 0x20000000 + 0x800;
+  __top_USBSRAM = 0x20004000 + 0x800;
+  
 
 ENTRY(ResetISR)
 
 SECTIONS
 {
-
     /* MAIN TEXT SECTION */    
     .text : ALIGN(4)
     {
@@ -180,6 +183,23 @@ SECTIONS
 	   _edata = . ;
 	} > Ram0_32 AT>MFlash256
 
+  .sram :
+  {
+    . = ALIGN(4);
+    __sram_start__ = .;
+	*(.sram*)
+    __sram_end__ = .;
+  } > SRAM AT>MFlash256
+
+  .usbsram :
+  {
+    . = ALIGN(4);
+    __usbsram_start__ = .;
+	*(.usbsram*)
+    __usbsram_end__ = .;
+  } > USBSRAM AT>MFlash256
+
+
     /* BSS section for Ram1_2 */
     .bss_RAM2 : ALIGN(4)
     {
@@ -231,6 +251,7 @@ SECTIONS
         _end_noinit = .;
     } > Ram0_32
     
+
     PROVIDE(_pvHeapStart = .);
     PROVIDE(_vStackTop = __top_Ram0_32 - 0);
 

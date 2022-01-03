@@ -263,7 +263,11 @@ void __wrap_exit( int num );
 void gbGetTitle( void );
 void rd_wr_mreq_reset( void );
 
+#include "gdl.h"
+
 /* gfm */
+
+/*
 
 #define SCREEN_WIDTH 200
 #define SCREEN_HEIGHT 176
@@ -286,10 +290,10 @@ union gfmHeader {
   };
 };
 
-
 void blitGfm( u8*gfm, clDeep*screen );
 
 extern u8 *framebuffer ;
+*/
 
 #define CHAR_PADDING 1 /* padding between chars */
 #define CHAR_SPACE 4 /* space char width */

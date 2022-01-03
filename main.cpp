@@ -6,11 +6,14 @@ extern "C" {
 
   void fgb( void *_rom );
   void cqsort( int*f, int*l );
+  void generateGfxBank( void );
+  void initPal(void);
 }
 
 #include "./pokitto/MCP23S17/MCP23S17.h"
 #include "./font.gfm2.h"
 
+/*
 SPI spi(P1_22, P1_21, P1_20, P1_23);
 MCP23S17 chip1 = MCP23S17(spi, P1_23, 0x40);
 MCP23S17 chip2 = MCP23S17(spi, P1_23, 0x42);
@@ -37,20 +40,8 @@ u8 gbPort = 0 ;
 
 #define gbPortUpdate chip2.write( PORT_B, gbPort )
 #define gbData chip2.read(PORT_A)
-
-/*
-void clkPin_high () { PortGB |= (1<<0);chip2.write(PORT_B, PortGB);}
-void clkPin_low  () { PortGB &= ~(1<<0);    chip2.write(PORT_B, PortGB);}
-void wrPin_high () { PortGB |= (1<<1);chip2.write(PORT_B, PortGB);}
-void wrPin_low  () { PortGB &= ~(1<<1);    chip2.write(PORT_B, PortGB);}
-void rdPin_high () { PortGB |= (1<<2);    chip2.write(PORT_B, PortGB);}
-void rdPin_low  () { PortGB &= ~(1<<2);    chip2.write(PORT_B, PortGB);}
-void mreqPin_high () { PortGB |= (1<<3);    chip2.write(PORT_B, PortGB);}
-void mreqPin_low  () { PortGB &= ~(1<<3);    chip2.write(PORT_B, PortGB);}
-void resetPin_high () { PortGB |= (1<<4);chip2.write(PORT_B, PortGB);}
-void resetPin_low  () { PortGB &= ~(1<<4);    chip2.write(PORT_B, PortGB);}
 */
-
+/*
 uint8_t read_byte(uint16_t address) {
   //shiftout_address(address); // Shift out address
   chip1.write(PORT_B, address >> 8);
@@ -75,11 +66,6 @@ void rd_wr_mreq_reset () {
   //rdPin_high(); // RD off
   //wrPin_high(); // WR off
   //mreqPin_high(); // MREQ off
-/*
-  GB_RD_H ;
-  GB_WR_H ;
-  GB_CS_H ;
-*/
   GB_RD_WR_CS_H;
   gbPortUpdate ;
 }
@@ -89,19 +75,13 @@ void gbGetTitle( void ){
   char * p = title;
   while( i <= 0x143 ){
     char c = (char)read_byte( i );
-/*
-    if( c >= ' ' && c <= 'z' )
-      *p = c;
-    else
-      *p = ' ';
-*/
     *p = c;
     p++;
     i++;
   }
   *p = 0;
 }
-
+*/
 extern u32 SystemCoreClock;
 
 void write_command_16(uint16_t data){
@@ -144,7 +124,7 @@ void SetScanlineN( u_int8_t n ){
 }
 
 extern u_int32_t * palette ;
-extern char title[32] ;
+//extern char title[32] ;
 
 #define clearFramebufferColor 3
 #define clearFramebufferColor32 ( ( clearFramebufferColor << 24 ) | ( clearFramebufferColor << 16 ) | ( clearFramebufferColor << 8 ) | clearFramebufferColor )
@@ -199,60 +179,153 @@ void showTicks( void ){
     while( line++ != 22 ) sendFramebuffer();
   };
 }
+/*
+void writeAdress( u8 v ){
+  u8 line=0;
+  chip1.write(PORT_B, v);
+  chip1.write(PORT_A, v);
+  clearFramebuffer();
+  prints( 8, 0, "adr 0x%x",v );
+  sendFramebuffer(); line++;
+  clearFramebuffer();
+  while( line++ != 22 ) sendFramebuffer();
+}
+*/
+
+union conf {
+  u_int8_t raw ;
+  struct {
+    u8 overclock:1 ;
+    u8 frameskip:2 ;
+    u8 palette:4 ;
+  };
+} conf ;
+
+struct menuEntry {
+  char ** text ;
+  u8 current ;
+  u8 nb ;
+} menuEntry ;
+
+void showChoiceMenuLine( struct menuEntry * e ){
+  clearFramebuffer();
+  //tmp = read_byte(0x0104);
+  char * p = e->text[0] ;
+  prints( 8, 0, p ); // title
+  u8 offset = 2; while(*p++) offset++ ;
+  u8 n = 0 ;
+  while( n != e->nb ){
+    ++n ;
+    p = e->text[ n ] ;
+    prints( 8*offset, 0, n == e->current ? "<%s>" : " %s ", p ) ;
+    while( *p++ ) offset++ ;
+    offset+=2;
+  };
+  sendFramebuffer();
+}
+
+struct menuEntry menu1 ;
+
 
 void showMenu( void ){
   u_int8_t cReleased = 0;
-
+  static u8 selectedLine = 0 ;
+  u32 time = 0, total = 0 ;
+  resetSysTick;
   while(1){
-
+    time = getTick ;
+    resetSysTick;
+    
     if( *bBtn ){
       showTicks();
       while( *bBtn );
     }
 
+    if( *leftBtn ){
+      while( *leftBtn );
+      if( menu1.current > 1 ) menu1.current-- ;
+      //while( !*leftBtn );
+      //while( *leftBtn );
+    }
+
+    if( *rightBtn ){
+      while( *rightBtn );
+      if( menu1.current != menu1.nb ) menu1.current++ ;
+      //while( !*rightBtn );
+      //while( *rightBtn );
+    }
+
+/*
+    if( *upBtn ){
+        while( *upBtn );
+        writeAdress( 0xFF );
+        while( !*upBtn );
+        while( *upBtn );
+    }
+
+    if( *downBtn ){
+        while( *downBtn );
+        writeAdress( 0x00 );
+        while( !*downBtn );
+        while( *downBtn );
+    }
+*/
     if( *cBtn ){
        if( cReleased ) break;
     } else cReleased = 1;
 
   u8 line = 0;
 
-  rd_wr_mreq_reset();
-  waitUs(10);
+  //rd_wr_mreq_reset();
+  //waitUs(10);
 
   clearFramebuffer();
   prints( 8, 0, "%uMHz", SystemCoreClock/MHZ );
   sendFramebuffer(); line++;
 
   clearFramebuffer();
-  gbGetTitle();
-  prints(  8, 0, "title -%s-", (const char *)title );
+  //gbGetTitle();
+  //prints(  8, 0, "title -%s-", (const char *)title );
   sendFramebuffer(); line++;
 
   u32 tmp ;
 
-  clearFramebuffer();
-  tmp = read_byte(0x0104);
-  prints( 8, 0, "nintendo logo : 0x%02X %s", tmp, tmp == 0xCE ? "OK" : "KO" );
-  sendFramebuffer(); line++;
+  showChoiceMenuLine(&menu1); line++;
+
+  //clearFramebuffer();
+  //tmp = read_byte(0x0104);
+  //prints( 8, 0, "nintendo logo : 0x%02X %s", tmp, tmp == 0xCE ? "OK" : "KO" );
+  //sendFramebuffer(); line++;
+
+  //clearFramebuffer();
+  //tmp = read_byte(0x0147);
+  //prints( 8, 0, "cart type : 0x%02X", tmp );
+  //sendFramebuffer(); line++;
+
+  //clearFramebuffer();
+  //tmp = read_byte(0x0148);
+  //prints( 8, 0, "rom size : 0x%02X", tmp );
+  //sendFramebuffer(); line++;
 
   clearFramebuffer();
-  tmp = read_byte(0x0147);
-  prints( 8, 0, "cart type : 0x%02X", tmp );
+  //tmp = read_byte(0x0149);
+  //prints( 8, 0, "ram size : 0x%02X", tmp );
   sendFramebuffer(); line++;
 
-  clearFramebuffer();
-  tmp = read_byte(0x0148);
-  prints( 8, 0, "rom size : 0x%02X", tmp );
-  sendFramebuffer(); line++;
+clearFramebuffer();
+    u32 ms = TICKS_TO_MS(time);
+    total += ms ;
+    prints( 8, 0, "%ums", total );
+    sendFramebuffer(); line++;
+
+    clearFramebuffer();
+    prints( 8, 0, "ms %u, us %u", ms, TICKS_TO_US(time) );
+    sendFramebuffer(); line++;
+
 
   clearFramebuffer();
-  tmp = read_byte(0x0149);
-  prints( 8, 0, "ram size : 0x%02X", tmp );
-  sendFramebuffer(); line++;
-
-  clearFramebuffer();
-  tmp = read_byte(0x014A);
-  prints( 8, 0, "destination : 0x%02X", tmp );
+  //tmp = read_byte(0x014A);
+  //prints( 8, 0, "destination : 0x%02X", tmp );
   sendFramebuffer(); line++;
 
   clearFramebuffer();
@@ -410,13 +483,20 @@ void screenInit( void ){
       b4 - RESET
 */
 
+char * menu1text[4] = { "title", "mdr","wtf","lol" } ;
+
 int main( void ) {
   *(uint32_t *)0x40048080 |= 3 << 26; // enable high ram
   screenInit();
 
-  chip1.direction(PORT_A, 0x00);//OUTPUT
+menu1.text = menu1text ;
+menu1.current = 2;
+menu1.nb = 3;
+
+/*
+  chip1.direction(PORT_A, 0x00); //OUTPUT
   chip1.direction(PORT_B, 0x00);
-  chip2.direction(PORT_A, 0xFF);//INPUT
+  chip2.direction(PORT_A, 0xFF); //INPUT
   chip2.direction(PORT_B, 0x00);
 
   GB_RST_H ; // power on cart
@@ -424,10 +504,12 @@ int main( void ) {
 
   GB_WR_H ;
   gbPortUpdate ;
-
+*/
   setGdlFont( font );
   initSysTick();
-
+  generateGfxBank();
+  initPal();
+  
   fgb( (char*)embedrom );
 
   return 0;

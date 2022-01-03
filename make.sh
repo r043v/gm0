@@ -8,6 +8,7 @@ do
 	make -j4 rom="$game"
 	./crc BUILD/gm0.bin
 	cp BUILD/gm0.bin "./roms/bin/$game.bin"
-	cp BUILD/gm0.bin "/var/run/media/m/1465-94AF/gb/$game.bin"
+	cp BUILD/gm0.bin "/var/run/media/m/gb/gb/$game.bin"
+	cp BUILD/gm0.bin "/var/run/media/m/gb/aaa.bin"
 done
-sync && sudo umount /var/run/media/m/1465-94AF
+sync && sudo umount /var/run/media/m/gb

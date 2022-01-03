@@ -29,7 +29,65 @@ struct scan scan;
 
 /* */
 
-const u_int32_t palettes[] = {
+#define sram1 0x20000000
+#define usbsram 0x20004000
+
+//u8 * gfxBank = (u8*)sram1 ;
+//u32 *gfxBank32 = (u32*)sram1 ;
+
+u8 gfxBank[16*16*4] __attribute__((section (".sram"))) ;
+const u32 *gfxBank32 = (u32*)gfxBank ;
+
+
+//u8 * gfxBankL = gfxBank ;
+//u8 * gfxBankH = gfxBank+256 ;
+
+//uint64_t * gfxBank = ( uint64_t * ) sram1 ;
+
+void generateGfxBank( void ){
+  register u8 *g = gfxBank ;
+  u32 b1n ;
+  register u32 b1, b2 ;
+  for( b1n = 0 ; b1n < 16 ; b1n++ ){
+    for( b2 = 0 ; b2 < 16 ; b2++ ){
+      b1 = b1n << 1 ;
+      *g++ = ( ( b1 & bx00010000 ) | ( b2 & bx00001000 ) ) >> 3;
+      *g++ = ( ( b1 & bx00001000 ) | ( b2 & bx00000100 ) ) >> 2;
+      *g++ = ( ( b1 & bx00000100 ) | ( b2 & bx00000010 ) ) >> 1;
+      *g++ = ( b1 & bx00000010 ) | ( b2 & bx00000001 );
+    }
+  }
+}
+
+u_int8_t gfxLineBuffer[8];
+u_int32_t * gfxLineBuffer32 = (u_int32_t*)gfxLineBuffer ;
+
+#define getGfxBank( p, pal ){ \
+  register u_int32_t b1 = *p++ ;\
+  register u_int32_t b2 = *p ;\
+  register u8 *c = (u8*)&gfxBank32[ ( b1 >> 4 ) * 16 + ( b2 >> 4 ) ] ;\
+  gfxLineBuffer[0] = pal[ c[0] ] ;\
+  gfxLineBuffer[1] = pal[ c[1] ] ;\
+  gfxLineBuffer[2] = pal[ c[2] ] ;\
+  gfxLineBuffer[3] = pal[ c[3] ] ;\
+  c = (u8*)&gfxBank32[ ( b1 & 0xf ) * 16 + ( b2 & 0xf ) ] ;\
+  gfxLineBuffer[4] = pal[ c[0] ] ;\
+  gfxLineBuffer[5] = pal[ c[1] ] ;\
+  gfxLineBuffer[6] = pal[ c[2] ] ;\
+  gfxLineBuffer[7] = pal[ c[3] ] ;\
+}
+
+
+#define getGfxBankNoPal( p ){ \
+  register u_int32_t b1 = *p++ ;\
+  register u_int32_t b2 = *p ;\
+  gfxLineBuffer32[0] = gfxBank32[ ( b1 >> 4 ) * 16 + ( b2 >> 4 ) ] ;\
+  gfxLineBuffer32[1] = gfxBank32[ ( b1 & 0xf ) * 16 + ( b2 & 0xf ) ] ;\
+}
+
+const uint32_t palette[14*16]  __attribute__((section (".usbsram"))) ;
+
+u_int32_t palettes[14*16] = {
   // grayscale
   0x73ae0,0x4e7a0,0x25460,0x8518,  // bg
   0x73ae0,0x4e7a0,0x25460,0x8518,  // sprite pal 0
@@ -41,9 +99,21 @@ const u_int32_t palettes[] = {
   0x3bfa8,0x26b78,0x15438,0x7fff8, // sprite pal 1
   0x73ae0,0x4e7a0,0x25460,0x8518, // wd
 
-  0xce08,0x1d620,0x53428,0x7bc68,0xce08,0x1d620,0x53428,0x7bc68,0xce08,0x1d620,0x53428,0x7bc68,0xce08,0x1d620,0x53428,0x7bc68,
-  0x0,0x3cc00,0x7ea60,0x7fff8,0x0,0x3cc00,0x7b0a0,0x7fff8,0x0,0x3cc00,0x7ea60,0x7fff8,0x0,0x3cc00,0x7ea60,0x7fff8,
-  0x0,0x44e38,0x7e080,0x7fff8,0x0,0x6c000,0x7e080,0x7fff8,0x0,0x2000,0x3bf28,0x7fff8,0x0,0xf0,0x32890,0x7fff8,
+  0xce08,0x1d620,0x53428,0x7bc68,
+  0xce08,0x1d620,0x53428,0x7bc68,
+  0xce08,0x1d620,0x53428,0x7bc68,
+  0xce08,0x1d620,0x53428,0x7bc68,
+
+  0x0,0x3cc00,0x7ea60,0x7fff8,
+  0x0,0x3cc00,0x7b0a0,0x7fff8,
+  0x0,0x3cc00,0x7ea60,0x7fff8,
+  0x0,0x3cc00,0x7ea60,0x7fff8,
+
+  0x0,0x44e38,0x7e080,0x7fff8,
+  0x0,0x6c000,0x7e080,0x7fff8,
+  0x0,0x2000,0x3bf28,0x7fff8,
+  0x0,0xf0,0x32890,0x7fff8,
+
   0x2cc08,0x41a20,0x66680,0x7f9b8,0x0,0x35428,0x52048,0x7fff8,0x0,0x3cc00,0x7ea60,0x7fff8,0x0,0x3cc00,0x7ea60,0x7fff8,
   0x0,0x52080,0x29560,0x7fd90,0x0,0x6c000,0x7e080,0x7ff00,0x0,0x2000,0x6e068,0x7fff8,0x0,0x14a40,0x2e2a8,0x7fff8,
   0x7fff8,0x7e930,0x12500,0x21830,0x0,0x6c000,0x7e080,0x7fff8,0x7ff00,0x3cc10,0x3bf28,0x7fff8,0x0,0x75b08,0x7fff8,0x7fff8,
@@ -55,17 +125,179 @@ const u_int32_t palettes[] = {
   0x0,0x5a248,0x73270,0x5bae8,0x0,0x6c000,0x7e080,0x7fff8,0x70718,0x110b8,0x77690,0x7fff8,0x1da00,0x63918,0x7bf98,0x7fff8
 };
 
-u_int32_t * palette = (u_int32_t*)palettes;
+#define palNumber 14
+
+
+void initPal( void ){
+  memcpy( palette, palettes, palNumber * 16*4 ) ;
+}
+
+
+//u_int32_t * palette = (u_int32_t*)palettes;
 extern u_int8_t * framebuffer;
 //uint8_t framebuffer[ /* 220 * 8 * 2 */ 160*8 /* *4 */ ];
-u_int8_t gfxLineBuffer[8];
 u_int8_t bgDrawLimitX ; // if bg is partially draw (covered by window)
 u_int8_t LastLYdraw;
 
-u_int8_t bgColorTable[4] = { 0,0,0,0 }, wdColorTable[4] = { 0,0,0,0 }, bgCurrentPal = 0;
-u_int8_t spriteColorTable[2][4] = { { 0,0,0,0 }, { 0,0,0,0 } }, spriteCurrentPal[2] = { 0, 0 };
+u8  bgColorTable[4] __attribute__((section (".sram"))) = { 0,0,0,0 },
+    wdColorTable[4] __attribute__((section (".sram"))) = { 0,0,0,0 },
+    bgCurrentPal = 0
+;
 
-uint8_t gfxLineBuffer[8];
+u8  spriteColorTable[2][4] __attribute__((section (".sram"))) = { { 0,0,0,0 }, { 0,0,0,0 } },
+    spriteCurrentPal[2] = { 0, 0 }
+;
+
+//#define extendGfxCache true
+
+#ifdef extendGfxCache
+
+union {
+  __uint64_t raw64 ;
+  __uint8_t  raw8[ 8 ] ;
+} gpuCache ;
+
+struct gpuCache * gpuCacheAddress = (struct gpuCache * )0x20000000 ;
+__uint64_t * gpuCacheData    = ( __uint64_t * )0x20004000 ;
+__uint64_t * gpuCacheLast    = &gpuCacheData[ 255 ] ;
+__uint64_t * gpuCacheCurrent = gpuCacheData ;
+
+__uint64_t * getGfxCache( __uint8_t * id ){
+  struct gpuCache * c = gpuCacheAddress[ *id++ ] ;
+  register __uint8_t * i = c.raw8 ;
+  register __uint8_t * l = &c.raw8[7] ;
+  register __uint8_t b = *id ;
+  do {
+    if( b == *i ) // find it
+      return *++i ? &gpuCacheData[ *i ] : 0 ;
+
+    i += 2 ;
+  } while( i != l ) ;
+
+  return 0 ;
+}
+
+void setGfxCache( __uint8_t * id ){
+  if( gpuCacheCurrent == gpuCacheLast ) return ;
+
+  struct gpuCache * c = gpuCacheAddress[ *id++ ] ;
+  register __uint8_t * i = c.raw8 ;
+  register __uint8_t * l = &c.raw8[8] ;
+  register __uint8_t b = *id ;
+  // find a free entry
+  while( 1 ){
+    if( !*i ){
+      *i++ = *id ;
+      *i = gpuCacheCurrent - gpuCacheData ;
+      c = gpuCacheCurrent++ ;
+      break ;
+    }
+    if( i == l ){ // reach end, overwrite first entry
+      /*i = c.raw8 ;
+      *i++ = *id ;
+      c = &gpuCacheData[ *i ] ;
+      break ;*/
+      return ;
+    }
+    i += 2 ;
+  } ;
+  
+  
+  return 0 ;
+}
+
+#endif
+
+//union {
+//  u_int8_t gfxLineBuffer[8];
+//  __uint64_t gfxLineBuffer64;
+//};
+
+u_int32_t *gfxBuffer = ( u_int32_t * )gfxLineBuffer ;
+
+//__uint64_t gfxCache64[ 256 ][ 4 ] ;
+
+#define gfxCacheLength 12
+#define wgfxCacheLength 12
+
+
+#ifdef gfxCacheLength
+u_int32_t gfxCache[ gfxCacheLength*2 ] __attribute__((section (".sram2"))) ;
+//const u_int32_t *gfxCache  = (u_int32_t*)(usbsram+1024) ;//[ gfxCacheLength*2 ] ;
+uint16_t gfxCacheId[ gfxCacheLength ] ;
+u_int8_t gfxCacheN = 0 ;
+u_int8_t gfxCacheNb = 0 ;
+#define gfxCacheReset gfxCacheNb = gfxCacheN = 0
+
+int getGfxCache( uint16_t id ){
+  //gfxCache64[ id&0xff ][ 0 ] = id>>8 ;
+  int n = 0 ;
+  while( n != gfxCacheNb ){
+    if( id == gfxCacheId[ n ] ){
+      u_int32_t * cache = &gfxCache[ n*2 ], *b = (u_int32_t*)gfxLineBuffer ;
+      *b++ = *cache++ ;
+      *b = *cache ;
+      return 1 ;
+    }
+
+    n++;
+  };
+
+  return 0 ;
+}
+
+void setGfxCache( uint16_t id ){
+  u_int32_t * cache = &gfxCache[ gfxCacheN*2 ], *b = (u_int32_t*)gfxLineBuffer ;
+
+  *cache++ = *b++ ;
+  *cache   = *b ;
+
+  gfxCacheId[ gfxCacheN ] = id ;
+  if( ++gfxCacheN == gfxCacheLength ) gfxCacheN = 0 ;
+  if( gfxCacheNb != gfxCacheLength ) gfxCacheNb++ ;
+}
+
+#endif
+
+
+#ifdef wgfxCacheLength
+//u_int32_t wgfxCache[ wgfxCacheLength*2 ] ;
+//const u_int32_t *wgfxCache = (u_int32_t*)(usbsram+1024+512);
+u_int32_t wgfxCache[ wgfxCacheLength*2 ] __attribute__((section (".sram"))) ;
+
+uint16_t wgfxCacheId[ wgfxCacheLength ] ;
+u_int8_t wgfxCacheN = 0 ;
+u_int8_t wgfxCacheNb = 0 ;
+#define wgfxCacheReset wgfxCacheNb = wgfxCacheN = 0
+
+int wgetGfxCache( uint16_t id ){
+  //gfxCache64[ id&0xff ][ 0 ] = id>>8 ;
+  int n = 0 ;
+  while( n != wgfxCacheNb ){
+    if( id == wgfxCacheId[ n ] ){
+      u_int32_t * cache = &wgfxCache[ n*2 ], *b = (u_int32_t*)gfxLineBuffer ;
+      *b++ = *cache++ ;
+      *b = *cache ;
+      return 1 ;
+    }
+
+    n++;
+  };
+
+  return 0 ;
+}
+
+void wsetGfxCache( uint16_t id ){
+  u_int32_t * cache = &wgfxCache[ wgfxCacheN*2 ], *b = (u_int32_t*)gfxLineBuffer ;
+
+  *cache++ = *b++ ;
+  *cache   = *b ;
+
+  wgfxCacheId[ wgfxCacheN ] = id ;
+  if( ++wgfxCacheN == wgfxCacheLength ) wgfxCacheN = 0 ;
+  if( wgfxCacheNb != wgfxCacheLength ) wgfxCacheNb++ ;
+}
+#endif
 
 //void write_command_16( uint16_t );
 //void write_data_16( uint16_t );
@@ -308,6 +540,11 @@ u_int32_t LastDisplayedTile, TilesDataAddr, TilesMapAddr;
 
 void drawBackground( void ){
   LastDisplayedTile = 0xffffffff;
+
+#ifdef gfxCacheLength
+//  gfxCacheReset;
+#endif
+
   TilesDataAddr = lcdControlRegister & 16 ? 0x0000 : 0x0800;
   TilesMapAddr = ( lcdControlRegister & 8 ? 0x1C00 : 0x1800 ) + ( T << 5 ) ;
 
@@ -324,11 +561,30 @@ void drawBackground( void ){
 
     if( ++tilePtr == lastTile ) tilePtr -= 32;
 
-    if( TileToDisplay != LastDisplayedTile ){
-      LastDisplayedTile = TileToDisplay;
+    u_int8_t * tileDataTempPtr = tileDataPtr + ( TileToDisplay << 4 );
+    u_int16_t TileToDisplay16 = *(u_int16_t*)tileDataTempPtr ;
 
+    if( TileToDisplay16 != LastDisplayedTile
+#ifdef gfxCacheLength
+    && !getGfxCache( TileToDisplay16 )
+#endif
+    ){
+/*
       u_int8_t * tileDataTempPtr = tileDataPtr + ( TileToDisplay << 4 );
+*/
 
+      getGfxBank( tileDataTempPtr, bgColorTable ) ;
+/*
+      gfxLineBuffer[0] = bgColorTable[gfxLineBuffer[0]] ;
+      gfxLineBuffer[1] = bgColorTable[gfxLineBuffer[1]] ;
+      gfxLineBuffer[2] = bgColorTable[gfxLineBuffer[2]] ;
+      gfxLineBuffer[3] = bgColorTable[gfxLineBuffer[3]] ;
+      gfxLineBuffer[4] = bgColorTable[gfxLineBuffer[4]] ;
+      gfxLineBuffer[5] = bgColorTable[gfxLineBuffer[5]] ;
+      gfxLineBuffer[6] = bgColorTable[gfxLineBuffer[6]] ;
+      gfxLineBuffer[7] = bgColorTable[gfxLineBuffer[7]] ;
+*/
+/*
       register u_int32_t
         b1 = (*tileDataTempPtr++) << 1,
         b2 = *tileDataTempPtr ;
@@ -372,9 +628,15 @@ void drawBackground( void ){
         ( b1 & bx00000010 )
       | ( b2 & bx00000001 )
       ];
+*/
 
+#ifdef gfxCacheLength
+      setGfxCache( TileToDisplay16 );
+#endif
       //tileBfPtr -= 7;
     }
+
+    LastDisplayedTile = TileToDisplay16;
 
     // crop right
     if( frameBfPtr > maxFullLine ){
@@ -405,6 +667,11 @@ void drawBackground( void ){
 
 void drawWindow(void){
   LastDisplayedTile = 0xffffffff;
+
+#ifdef wgfxCacheLength
+//  wgfxCacheReset;
+#endif
+
   TilesDataAddr = lcdControlRegister & 16 ? 0x0000 : 0x0800 ;
   TilesMapAddr = ( lcdControlRegister & 64 ? 0x1C00 : 0x1800 ) ;
 
@@ -416,11 +683,20 @@ void drawWindow(void){
     u_int8_t TileToDisplay = TilesDataAddr == 0x0000 ? *tilePtr : UbyteToByte( *tilePtr ) + 128 ;
     tilePtr += 1;
 
-    if( TileToDisplay != LastDisplayedTile ){
-      LastDisplayedTile = TileToDisplay;
+    u_int8_t * tileDataTempPtr = tileDataPtr + ( TileToDisplay << 4 );
+    u_int16_t TileToDisplay16 = *(u_int16_t*)tileDataTempPtr ;
 
-      u_int8_t * tileDataTempPtr = tileDataPtr + ( TileToDisplay << 4 );
+    if( TileToDisplay16 != LastDisplayedTile
+#ifdef wgfxCacheLength
+    && !wgetGfxCache( TileToDisplay16 )
+#endif
+    ){
 
+      //u_int8_t * tileDataTempPtr = tileDataPtr + ( TileToDisplay << 4 );
+
+      getGfxBank( tileDataTempPtr, wdColorTable ) ;
+
+/*
       register u_int32_t b1 = ( *tileDataTempPtr++ ) << 1 ;
       register u_int32_t b2 = *tileDataTempPtr ;
 
@@ -463,9 +739,14 @@ void drawWindow(void){
         ( b1 & bx00000010 )
       | ( b2 & bx00000001 )
       ];
-
+*/
+#ifdef wgfxCacheLength
+      wsetGfxCache( TileToDisplay16 );
+#endif
       //tileBfPtr -= 7;
     }
+
+    LastDisplayedTile = TileToDisplay16;
 
     // crop right
     if( frameBfPtr > &framebuffer[ 151 ] ){
@@ -567,10 +848,10 @@ void drawSprites( void ){
       }
     }
 
-    register u_int32_t b1 = ( *p++ ) << 1 ;
-    register u_int32_t b2 = *p ;
-
     if( (*flag) & bx00100000 ){ // xflip
+      register u_int32_t b1 = ( *p++ ) << 1 ;
+      register u_int32_t b2 = *p ;
+
       gfxLineBuffer[0] =
         ( b1 & bx00000010 )
       | ( b2 & bx00000001 )
@@ -611,6 +892,9 @@ void drawSprites( void ){
       | ( b2 &  bx10000000 ) ) >> 7
       ;
     } else {
+
+      getGfxBankNoPal( p ) ;
+/*
       gfxLineBuffer[0] =
       ( ( b1 & bx100000000 )
       | ( b2 &  bx10000000 ) ) >> 7
@@ -649,7 +933,7 @@ void drawSprites( void ){
       gfxLineBuffer[7] =
         ( b1 & bx00000010 )
       | ( b2 & bx00000001 )
-      ;
+      ;*/
     }
 
     register u_int8_t *screen, *s ;

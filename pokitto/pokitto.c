@@ -29,11 +29,15 @@ void spi1ComputePrescalerDivider( void ){
     if( cpuMhz == 72 ){ // 72mhz cpu
       // 9mhz spi
       spi1Prescaler = 4 ;
-      spi1Divider = 2 ;
-    } else { // 48mhz cpu
+      spi1Divider = 1 ;
+
+      // 720khz spi
+/*      spi1Prescaler = 100 ;
+      spi1Divider = 0 ;
+*/    } else { // 48mhz cpu
       // 8mhz spi
       spi1Prescaler = 2 ;
-      spi1Divider = 3 ;
+      spi1Divider = 2 ;
     }
 }
 
@@ -42,7 +46,7 @@ void spi1SetPrescaleDivider( void ){
         ( SPI_LENGTH_8 << 0 ) // 8-bit
       | ( 0 << 6 ) // polarity > 0
       | ( 0 << 7 ) // phase > 0
-      | ( ( spi1Divider - 1 ) << 8 ) // divider-1
+      | ( spi1Divider << 8 ) // divider-1
     ) ;
 
     *SPI1_CPSR = spi1Prescaler ;
@@ -163,6 +167,7 @@ u8 zread_byte(u16 address) {
 }
 */
 
+/*
 u8 * gfmPal = 0;
 clDeep gfmPal16[16] = { 1,2,3,0 };
 
@@ -214,12 +219,12 @@ void blitGfm( u8*gfm, clDeep*screen ){
   }
 
 }
-
+*/
 //extern const u8 ** font;
 
 void zdrawText( u8 x, u8 y, const char *txt ){
   const char *p = txt ;
-  u8 * screen = framebuffer + y*SCREEN_WIDTH + x ;
+  clDeep * screen = framebuffer + y*SCREEN_WIDTH + x ;
 	while(*p){
     u8 c = ( *p++ ) - ' ';
     if( c > 91 ) c = 0 ;

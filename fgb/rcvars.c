@@ -24,7 +24,7 @@ static int nvars;
 void rc_export(rcvar_t *v)
 {
 	const rcvar_t end = RCV_END;
-	
+
 	if (!v) return;
 	nvars++;
 	rcvars = realloc(rcvars, sizeof (rcvar_t) * (nvars+1));
@@ -66,7 +66,7 @@ int my_atoi(const char *s)
 			s++;
 			while (*s)
 			{
-				if (isdigit(*s))
+				if (isdigit((u8)*s))
 					a = (a<<4) + *s - '0';
 				else if (strchr("ABCDEF", *s))
 					a = (a<<4) + *s - 'A' + 10;
@@ -91,7 +91,7 @@ int my_atoi(const char *s)
 		s++;
 		for (;;)
 		{
-			if (isdigit(*s))
+			if (isdigit((u8)*s))
 				a = (a*10) + *s - '0';
 			else return -a;
 			s++;
@@ -99,7 +99,7 @@ int my_atoi(const char *s)
 	}
 	while (*s)
 	{
-		if (isdigit(*s))
+		if (isdigit((u8)*s))
 			a = (a*10) + *s - '0';
 		else return a;
 		s++;
@@ -151,7 +151,7 @@ int rc_setvar_n(int i, int c, char **v)
 int rc_setvar(char *name, int c, char **v)
 {
 	int i;
-	
+
 	i = rc_findvar(name);
 	if (i < 0) return i;
 
@@ -223,11 +223,3 @@ char *rc_getstr(char *name)
 {
 	return rc_getstr_n(rc_findvar(name));
 }
-
-
-
-
-
-
-
-

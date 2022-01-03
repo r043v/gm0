@@ -18,7 +18,7 @@ vpath %.s .
 PROJECT := gm0
 BPROJECT := BUILD/gm0
 
-#SOURCES += $(shell find gdl -type f -iname '*.c' -o -iname '*.s'  -o -iname '*.cpp')
+SOURCES += $(shell find gdl -type f -iname '*.c' -o -iname '*.s'  -o -iname '*.cpp')
 SOURCES += $(shell find fgb -type f -iname '*.c' -o -iname '*.s'  -o -iname '*.cpp')
 SOURCES += $(shell find pokitto -maxdepth 1 -type f -iname '*.c' -o -iname '*.s' -o -iname '*.cpp')
 
