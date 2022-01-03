@@ -19,10 +19,10 @@
 #define u8 uint8_t
 
 
-#define clDeep u16
-#define clDeepDec  1
-#define clDeepSze  2
-#define deepByte    16
+#define clDeep     u8
+#define clDeepDec  0
+#define clDeepSze  1
+#define deepByte   8
 
 /*
 #define clDeep u8
@@ -33,18 +33,21 @@
 
 extern u32 tick;
 
-#define WIDTH 160
-#define HEIGHT 144
+#define WIDTH 200 //160
+#define HEIGHT 176 //144
+
+#define SCREEN_WIDTH 200
+#define SCREEN_HEIGHT 176
 
 extern u32 bufWidth, bufHeight;
 
-
+#include "rate.h"
 #include "gfm.h"
+#include "gfm2.h"
 #include "gfa.h"
-#include "text.h"
-//#include "map.h"
-//#include "rate.h"
-//#include "misc.h"
+//#include "text.h"
+#include "map.h"
+#include "misc.h"
 //#include "btn.h"
 
 #endif

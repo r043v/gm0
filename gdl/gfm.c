@@ -11,16 +11,16 @@ u32 saved_frmWidth=0, saved_frmWidthStart=0, saved_frmWidthEnd=0;
 clDeep *isaved_scrStart=0, *isaved_scrEnd=0, *isaved_screen=0 ;
 u32 isaved_frmWidth=0, isaved_frmWidthStart=0, isaved_frmWidthEnd=0;
 
-void fullBlitLimit(void)
-{	scrStart  = pixel;
+void fullBlitLimit(void){
+	scrStart  = pixel;
 	scrEnd    = &pixel[bufWidth*bufHeight-1];
 	frmWidth  = bufWidth;
 	frmWidthStart = 0;
 	frmWidthEnd   = bufWidth;
 }
 
-void setOutBuffer(clDeep*bf,int w, int h)
-{	pixel = bf;
+void setOutBuffer(clDeep*bf,int w, int h){
+	pixel = bf;
 	bufWidth = w;
 	bufHeight = h;
 	fullBlitLimit();

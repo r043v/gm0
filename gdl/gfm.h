@@ -1,6 +1,5 @@
-// transparent blit routine for 16 & 32b buffer | Gdl�
-// (C) 2k4/2k6 by r043v, under GPL
-
+// transparent blit routine for 16 & 32b buffer | Gdl2
+// (C) 2k4/2k21 by r043v, under CC-BY-NC-SA
 
 #ifndef _gdlGfm_
 #define _gdlGfm_
