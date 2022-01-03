@@ -36,6 +36,7 @@ struct scan scan;
 //u32 *gfxBank32 = (u32*)sram1 ;
 
 u8 gfxBank[16*16*4] __attribute__((section (".sram"))) ;
+u32 rgfxBank32[16*16] __attribute__((section (".usbsram"))) ; // reversed, for sprite flip
 const u32 *gfxBank32 = (u32*)gfxBank ;
 
 
@@ -45,22 +46,23 @@ const u32 *gfxBank32 = (u32*)gfxBank ;
 //uint64_t * gfxBank = ( uint64_t * ) sram1 ;
 
 void generateGfxBank( void ){
-  register u8 *g = gfxBank ;
+  register u8 *g = gfxBank, *rg = (u8*)rgfxBank32 ;
   u32 b1n ;
   register u32 b1, b2 ;
   for( b1n = 0 ; b1n < 16 ; b1n++ ){
     for( b2 = 0 ; b2 < 16 ; b2++ ){
       b1 = b1n << 1 ;
-      *g++ = ( ( b1 & bx00010000 ) | ( b2 & bx00001000 ) ) >> 3;
-      *g++ = ( ( b1 & bx00001000 ) | ( b2 & bx00000100 ) ) >> 2;
-      *g++ = ( ( b1 & bx00000100 ) | ( b2 & bx00000010 ) ) >> 1;
-      *g++ = ( b1 & bx00000010 ) | ( b2 & bx00000001 );
+      rg[3] = *g++ = ( ( b1 & bx00010000 ) | ( b2 & bx00001000 ) ) >> 3;
+      rg[2] = *g++ = ( ( b1 & bx00001000 ) | ( b2 & bx00000100 ) ) >> 2;
+      rg[1] = *g++ = ( ( b1 & bx00000100 ) | ( b2 & bx00000010 ) ) >> 1;
+      rg[0] = *g++ = ( b1 & bx00000010 ) | ( b2 & bx00000001 );
+      rg += 4 ;
     }
   }
 }
 
 u_int8_t gfxLineBuffer[8];
-u_int32_t * gfxLineBuffer32 = (u_int32_t*)gfxLineBuffer ;
+u_int32_t *gfxLineBuffer32 = (u_int32_t*)gfxLineBuffer ;
 
 #define getGfxBank( p, pal ){ \
   register u_int32_t b1 = *p++ ;\
@@ -85,9 +87,16 @@ u_int32_t * gfxLineBuffer32 = (u_int32_t*)gfxLineBuffer ;
   gfxLineBuffer32[1] = gfxBank32[ ( b1 & 0xf ) * 16 + ( b2 & 0xf ) ] ;\
 }
 
-const uint32_t palette[14*16]  __attribute__((section (".usbsram"))) ;
+#define rgetGfxBankNoPal( p ){ \
+  register u_int32_t b1 = *p++ ;\
+  register u_int32_t b2 = *p ;\
+  gfxLineBuffer32[0] = rgfxBank32[ ( b1 & 0xf ) * 16 + ( b2 & 0xf ) ] ;\
+  gfxLineBuffer32[1] = rgfxBank32[ ( b1 >> 4 ) * 16 + ( b2 >> 4 ) ] ;\
+}
 
-u_int32_t palettes[14*16] = {
+uint32_t palette[14*16]  __attribute__((section (".usbsram"))) ;
+
+const u_int32_t palettes[14*16] = {
   // grayscale
   0x73ae0,0x4e7a0,0x25460,0x8518,  // bg
   0x73ae0,0x4e7a0,0x25460,0x8518,  // sprite pal 0
@@ -234,9 +243,10 @@ int getGfxCache( uint16_t id ){
   int n = 0 ;
   while( n != gfxCacheNb ){
     if( id == gfxCacheId[ n ] ){
-      u_int32_t * cache = &gfxCache[ n*2 ], *b = (u_int32_t*)gfxLineBuffer ;
-      *b++ = *cache++ ;
-      *b = *cache ;
+      u_int32_t * cache = &gfxCache[ n*2 ];
+
+      gfxLineBuffer32[0] = *cache++ ;
+      gfxLineBuffer32[1] = *cache ;
       return 1 ;
     }
 
@@ -247,10 +257,10 @@ int getGfxCache( uint16_t id ){
 }
 
 void setGfxCache( uint16_t id ){
-  u_int32_t * cache = &gfxCache[ gfxCacheN*2 ], *b = (u_int32_t*)gfxLineBuffer ;
+  u_int32_t * cache = &gfxCache[ gfxCacheN*2 ];
 
-  *cache++ = *b++ ;
-  *cache   = *b ;
+  *cache++ = gfxLineBuffer32[0] ;
+  *cache   = gfxLineBuffer32[1] ;
 
   gfxCacheId[ gfxCacheN ] = id ;
   if( ++gfxCacheN == gfxCacheLength ) gfxCacheN = 0 ;
@@ -275,9 +285,11 @@ int wgetGfxCache( uint16_t id ){
   int n = 0 ;
   while( n != wgfxCacheNb ){
     if( id == wgfxCacheId[ n ] ){
-      u_int32_t * cache = &wgfxCache[ n*2 ], *b = (u_int32_t*)gfxLineBuffer ;
-      *b++ = *cache++ ;
-      *b = *cache ;
+      u_int32_t * cache = &wgfxCache[ n*2 ];
+      
+      gfxLineBuffer32[0] = *cache++ ;
+      gfxLineBuffer32[1] = *cache ;
+
       return 1 ;
     }
 
@@ -288,10 +300,10 @@ int wgetGfxCache( uint16_t id ){
 }
 
 void wsetGfxCache( uint16_t id ){
-  u_int32_t * cache = &wgfxCache[ wgfxCacheN*2 ], *b = (u_int32_t*)gfxLineBuffer ;
+  u_int32_t * cache = &wgfxCache[ wgfxCacheN*2 ] ;
 
-  *cache++ = *b++ ;
-  *cache   = *b ;
+  *cache++ = gfxLineBuffer32[0] ;
+  *cache   = gfxLineBuffer32[1] ;
 
   wgfxCacheId[ wgfxCacheN ] = id ;
   if( ++wgfxCacheN == wgfxCacheLength ) wgfxCacheN = 0 ;
@@ -849,6 +861,7 @@ void drawSprites( void ){
     }
 
     if( (*flag) & bx00100000 ){ // xflip
+/*
       register u_int32_t b1 = ( *p++ ) << 1 ;
       register u_int32_t b2 = *p ;
 
@@ -891,6 +904,9 @@ void drawSprites( void ){
       ( ( b1 & bx100000000 )
       | ( b2 &  bx10000000 ) ) >> 7
       ;
+*/
+      rgetGfxBankNoPal( p ) ;
+
     } else {
 
       getGfxBankNoPal( p ) ;
