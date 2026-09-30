@@ -1,0 +1,1225 @@
+/*
+ * meta_emu.c — émulateur Gamebuino META en C/SDL2, port du fork TypeScript
+ * (gamebuino-emulator + nos ajouts : exécution SRAM, carte SD, TC4/DAC).
+ *
+ * Fidèle à meta_audio.cpp / meta_main.cpp / meta_sd.cpp du firmware gbl :
+ *  - TC4 en 0x42003000, interruption IRQ19 toutes les 907 instructions
+ *    (369 tirs par frame, comme la carte attend) ;
+ *  - DAC DATA en 0x42004808 -> sortie audio SDL (22 049 Hz) ;
+ *  - carte SD SPI en PA27, image brute (.img) ou dossier… non : image
+ *    brute uniquement ici (le C n'a pas besoin de plus pour tester) ;
+ *  - écran ST7735 160x128 rendu dans une fenêtre SDL2 x2 ;
+ *  - boutons sur PB03 : flèches, J=A, K=B, U=MENU, I=HOME, Entrée=Start
+ *    (HOME tenu 3 s = reset du jeu, comme sur la console).
+ *
+ * Usage : meta_emu <firmware.bin> [carte.img] [--wav out.wav]
+ */
+#include <SDL.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <math.h>
+
+/* ---------------------------------------------------------------- état */
+
+#define FLASH_SIZE 0x40000u
+#define SRAM_SIZE  0x8000u
+#define SCREEN_W   160u
+#define SCREEN_H   128u
+
+static uint8_t  flash[FLASH_SIZE];
+static uint8_t  sram[SRAM_SIZE];
+static uint32_t regs[16];
+static int fN, fZ, fC, fV;
+static uint32_t tickCount;
+static int sysTickTrigger;
+static uint32_t vectorBase;
+static uint32_t sysTickVector, dmacVector, tc4Vector;
+static int dmacInterrupt, tc4Interrupt;
+
+/* périphériques */
+static uint32_t portA_out, portB_out, portA_dir, portB_dir;
+static uint8_t  ser4_data = 0x80;
+static uint8_t  buttonData = 0xff;
+
+/* TC4 + DAC */
+static int      tc4Enabled, tc4Armed;
+static uint32_t tc4Top, tc4Counter, tc4Period = 907;
+static uint32_t tc4Window, tc4Fires, tc4Writes;
+static int      tc4Interrupt;
+
+/* ST7735 */
+static uint16_t pix[SCREEN_W * SCREEN_H];
+static int lcd_xStart, lcd_xEnd, lcd_yStart, lcd_yEnd, lcd_x, lcd_y;
+static int lcd_argIndex, lcd_lastCommand, lcd_tmp;
+static int ramwrCount; /* compte les RAMWR : ~32 par frame rendue */
+
+/* carte SD (PA27) */
+static uint8_t *sd_image = NULL;
+static size_t   sd_size = 0;
+static uint8_t  sd_pending = 0xff;
+static uint8_t  sd_out[512 + 8];
+static int      sd_outLen = 0, sd_outPos = 0;
+static uint8_t  sd_cmdBuf[6];
+static int      sd_cmdIdx = 0;
+static int      sd_writing = 0, sd_writeIdx = 0, sd_writeLba = 0;
+static uint8_t  sd_writeBuf[515];
+
+/* audio SDL : anneau producteur (ISR) -> consommateur (callback) */
+#define AQ_SIZE 65536
+static int16_t aq[AQ_SIZE];
+static volatile int aq_head, aq_tail; /* tail = écrit, head = lu */
+static int16_t audioHold = 0;
+
+static SDL_AudioDeviceID audioDev;
+static int audioOk;
+static FILE *wavFile;
+static uint32_t wavSamples;
+static char wavPathStr[512];
+static char shotPath[512];
+static uint32_t maxFrames;
+
+/* ----------------------------------------------------------- mémoire */
+
+static uint32_t fetchWord(uint32_t a);
+static uint16_t fetchHalf(uint32_t a);
+static uint8_t  fetchByte(uint32_t a);
+static void     writeWord(uint32_t a, uint32_t v);
+static void     writeHalf(uint32_t a, uint16_t v);
+static void     writeByte(uint32_t a, uint8_t v);
+static void     pushStack(uint32_t v);
+static uint32_t popStack(void);
+static void     setReg(int i, uint32_t v);
+static void     incrementPc(void);
+static void     irq_inject(uint32_t vector);
+static void     sercom4_write(uint8_t v);
+static uint8_t  st7735_byte(uint8_t v);
+
+/* ports : OUT/OUTSET/OUTCLR/OUTTGL/DIR* (comme port-register.ts) */
+static void port_write(int group, uint32_t off, uint32_t v) {
+    uint32_t *outp = group ? &portB_out : &portA_out;
+    uint32_t *dirp = group ? &portB_dir : &portA_dir;
+    switch (off) {
+        case 0x00: *dirp ^= v; break;
+        case 0x04: *dirp &= ~v; break;
+        case 0x08: *dirp |= v; break;
+        case 0x0c: *dirp ^= v; break;
+        case 0x10: *outp = v; break;
+        case 0x14: *outp &= ~v; break;
+        case 0x18: *outp |= v; break;
+        case 0x1c: *outp ^= v; break;
+    }
+}
+
+static uint32_t port_read(int group, uint32_t off) {
+    uint32_t out = group ? portB_out : portA_out;
+    uint32_t dir = group ? portB_dir : portA_dir;
+    switch (off) {
+        case 0x00: case 0x04: case 0x08: case 0x0c: return dir;
+        case 0x10: case 0x14: case 0x18: case 0x1c: return out;
+        case 0x20: return 0xffffffff; /* IN : entrées hautes */
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------- DAC/audio */
+
+static void audio_push(int16_t s) {
+    int next = (aq_tail + 1) % AQ_SIZE;
+    if (next == aq_head) return; /* plein : on jette (l'onglet est caché) */
+    aq[aq_tail] = s;
+    aq_tail = next;
+}
+
+static void wav_put(int16_t s) {
+    if (!wavFile) return;
+    uint8_t b[2] = { (uint8_t)(s & 0xff), (uint8_t)((s >> 8) & 0xff) };
+    fwrite(b, 1, 2, wavFile);
+    wavSamples++;
+}
+
+static void wav_finish(void) {
+    if (!wavFile) return;
+    uint32_t bsize = wavSamples * 2, rsize = 36 + bsize;
+    uint8_t w4[4];
+    fseek(wavFile, 4, SEEK_SET);
+    w4[0] = (uint8_t)rsize; w4[1] = (uint8_t)(rsize >> 8); w4[2] = (uint8_t)(rsize >> 16); w4[3] = (uint8_t)(rsize >> 24);
+    fwrite(w4, 1, 4, wavFile);
+    fseek(wavFile, 40, SEEK_SET);
+    w4[0] = (uint8_t)bsize; w4[1] = (uint8_t)(bsize >> 8); w4[2] = (uint8_t)(bsize >> 16); w4[3] = (uint8_t)(bsize >> 24);
+    fwrite(w4, 1, 4, wavFile);
+    fclose(wavFile);
+    wavFile = NULL;
+    printf("WAV : %u échantillons (%.1f s)\n", wavSamples, (double)wavSamples / 22049.0);
+}
+
+static void dac_write(uint16_t v) {
+    tc4Writes++;
+    /* v : 256..766 (milieu 512) -> s16 */
+    int16_t s = (int16_t)((v - 511) * 96);
+    audio_push(s);
+    wav_put(s);
+}
+
+/* --------------------------------------------------- carte SD (PA27) */
+
+static int sd_selected(void) { return (portA_out & (1u << 27)) == 0; }
+
+static void sd_command(uint8_t cmd, uint32_t arg) {
+    sd_outLen = 0; sd_outPos = 0;
+    switch (cmd) {
+        case 0:  sd_out[sd_outLen++] = 0x01; break; /* idle */
+        case 8:  sd_out[sd_outLen++] = 0x01; sd_out[sd_outLen++] = 0x00;
+                 sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0x01;
+                 sd_out[sd_outLen++] = 0xaa; break;
+        case 55: sd_out[sd_outLen++] = 0x01; break;
+        case 41: sd_out[sd_outLen++] = 0x00; break;
+        case 58: sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0xc0;
+                 sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0x00;
+                 sd_out[sd_outLen++] = 0x00; break;
+        case 16: sd_out[sd_outLen++] = 0x00; break;
+        case 17: { /* lecture d'un secteur */
+            size_t base = (size_t)arg * 512;
+            if (sd_image && base + 512 <= sd_size) {
+                sd_out[sd_outLen++] = 0x00;
+                sd_out[sd_outLen++] = 0xfe;
+                memcpy(sd_out + sd_outLen, sd_image + base, 512);
+                sd_outLen += 512;
+                sd_out[sd_outLen++] = 0xff; sd_out[sd_outLen++] = 0xff;
+            } else {
+                sd_out[sd_outLen++] = 0x04;
+            }
+            break;
+        }
+        case 24: /* écriture : token 0xfe + 512 + crc2 puis data-response */
+            sd_writeLba = arg;
+            sd_writeIdx = 0;
+            sd_writing = 1;
+            sd_out[sd_outLen++] = 0x00;
+            break;
+        default: sd_out[sd_outLen++] = 0x04; break;
+    }
+}
+
+static void sd_write_persist(uint32_t lba, const uint8_t *data);
+
+static void sd_byte(uint8_t v) {
+    if (!sd_selected()) {
+        sd_cmdIdx = 0; sd_outLen = 0; sd_outPos = 0; sd_writing = 0;
+        return; /* silencieuse quand désélectionnée */
+    }
+    if (sd_writing) {
+        if (sd_writeIdx == 0 && v == 0xff) return; /* dummy avant le token */
+        sd_writeBuf[sd_writeIdx++] = v;
+        if (sd_writeIdx >= 515) {
+            sd_writing = 0;
+            if (sd_image && sd_writeBuf[0] == 0xfe) {
+                memcpy(sd_image + (size_t)sd_writeLba * 512, sd_writeBuf + 1, 512);
+                sd_write_persist(sd_writeLba, sd_image + (size_t)sd_writeLba * 512);
+            }
+            ser4_data = 0x05; /* accepté */
+            return;
+        }
+        ser4_data = 0xff;
+        return;
+    }
+    if (sd_outPos < sd_outLen) {
+        ser4_data = sd_out[sd_outPos++];
+        return;
+    }
+    if (sd_cmdIdx > 0) {
+        sd_cmdBuf[sd_cmdIdx++] = v;
+        if (sd_cmdIdx >= 6) {
+            sd_cmdIdx = 0;
+            uint32_t arg = ((uint32_t)sd_cmdBuf[1] << 24) | ((uint32_t)sd_cmdBuf[2] << 16) |
+                           ((uint32_t)sd_cmdBuf[3] << 8) | sd_cmdBuf[4];
+            sd_command(sd_cmdBuf[0] & 0x3f, arg);
+        }
+        ser4_data = 0xff;
+        return;
+    }
+    if ((v & 0xc0) == 0x40) sd_cmdBuf[sd_cmdIdx++] = v;
+    ser4_data = 0xff;
+}
+
+
+/* --------- carte SD construite depuis un répertoire local --------- */
+#include <dirent.h>
+#include <sys/stat.h>
+
+#define FAT_SECTOR 512
+#define FAT_SPC 8
+#define FAT_TOTAL 131072u   /* 64 Mio -> FAT16 */
+#define FAT_ROOT  512
+
+typedef struct { char name83[12]; int isDir; uint32_t first, size; char path[1024]; } FatEnt;
+
+static void to83(const char *name, char used[][12], int nUsed, char out[12]) {
+    char up[1024];
+    snprintf(up, sizeof(up), "%s", name);
+    for (char *q = up; *q; q++) *q = (char)toupper((unsigned char)*q);
+    char base[9] = {0}, ext[4] = {0};
+    const char *dot = strrchr(up, '.');
+    if (dot && dot != up) { strncpy(ext, dot + 1, 3); strncpy(base, up, dot - up > 8 ? 8 : dot - up); }
+    else strncpy(base, up, 8);
+    /* nettoie les caractères interdits */
+    for (char *q = base; *q; q++) if (!isalnum((unsigned char)*q) && !strchr("$%'()-@^_`{}~!#", *q)) *q = '_';
+    for (char *q = ext; *q; q++) if (!isalnum((unsigned char)*q) && !strchr("$%'()-@^_`{}~!#", *q)) *q = '_';
+    char comb[16];
+    snprintf(comb, sizeof(comb), "%s%s%s", base, ext[0] ? "." : "", ext);
+    char final[16];
+    snprintf(final, sizeof(final), "%s", comb);
+    for (int i = 1; i < 100; i++) {
+        int dup = 0;
+        for (int j = 0; j < nUsed; j++) if (!strcmp(used[j], final)) dup = 1;
+        if (!dup) break;
+        snprintf(final, sizeof(final), "%.6s~%d%s%s", base, i, ext[0] ? "." : "", ext);
+    }
+    snprintf(used[nUsed < 1000 ? nUsed : 999], 12, "%s", final);
+    memset(out, ' ', 11);
+    memcpy(out, final, strlen(final) > 8 ? 8 : strlen(final));
+    if (ext[0]) memcpy(out + 8, ext, strlen(ext) > 3 ? 3 : strlen(ext));
+}
+
+static int fatTotalSectors;
+static uint8_t *fatImage;
+static size_t   fatImageSize;
+typedef struct { uint32_t lba; size_t bytes; char path[1024]; } FatFile;
+static FatFile  fatFiles[512];
+static int      fatFileCount;
+
+static int fat_used_find(char used[][12], int n, const char *s) {
+    for (int i = 0; i < n; i++) if (!strcmp(used[i], s)) return 1;
+    return 0;
+}
+
+/* alloue et écrit récursivement ; renvoie le premier cluster */
+static uint32_t fatNext = 2;
+static uint8_t *fatTable;
+
+static uint32_t fat_alloc(int clusters) {
+    uint32_t first = fatNext;
+    for (int i = 0; i < clusters; i++) {
+        uint32_t c = first + (uint32_t)i;
+        uint16_t v = (i == clusters - 1) ? 0xffff : (uint16_t)(c + 1);
+        fatTable[c * 2] = v & 0xff; fatTable[c * 2 + 1] = v >> 8;
+    }
+    fatNext += (uint32_t)clusters;
+    return first;
+}
+
+static uint32_t fat_data_lba(uint32_t first) {
+    return 1 + 2 * 65 + (FAT_ROOT * 32 + 511) / 512 + (first - 2) * FAT_SPC;
+}
+
+static void fat_place(const char *dir, uint32_t parentFirst, int isRoot,
+                      FatEnt *entries, int nEntries, uint32_t selfFirst);
+
+static uint32_t fat_alloc_dir_data(void) { return fat_alloc(1); }
+
+static void fat_write_dir_data(uint32_t first, FatEnt *entries, int n, uint32_t selfFirst, uint32_t parentFirst, int isRoot) {
+    uint8_t buf[FAT_SPC * FAT_SECTOR];
+    memset(buf, 0, sizeof(buf));
+    uint32_t lba = fat_data_lba(first);
+    if (!isRoot) {
+        memcpy(buf, ".          ", 11); buf[11] = 0x10;
+        buf[26] = selfFirst & 0xff; buf[27] = selfFirst >> 8;
+        memcpy(buf + 32, "..         ", 11); buf[32 + 11] = 0x10;
+        buf[32 + 26] = parentFirst & 0xff; buf[32 + 27] = parentFirst >> 8;
+    }
+    int off = isRoot ? 0 : 64;
+    for (int i = 0; i < n && off < (int)sizeof(buf) - 32; i++) {
+        memcpy(buf + off, entries[i].name83, 11);
+        buf[off + 11] = entries[i].isDir ? 0x10 : 0x20;
+        buf[off + 26] = entries[i].first & 0xff;
+        buf[off + 27] = entries[i].first >> 8;
+        buf[off + 28] = entries[i].size & 0xff; buf[off + 29] = (entries[i].size >> 8) & 0xff;
+        buf[off + 30] = (entries[i].size >> 16) & 0xff; buf[off + 31] = (entries[i].size >> 24) & 0xff;
+        off += 32;
+    }
+    memcpy(fatImage + lba * FAT_SECTOR, buf, FAT_SPC * FAT_SECTOR);
+}
+
+/* place le contenu du répertoire ; renvoie les entrées allouées */
+static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
+                     FatEnt **outEntries, int *outN) {
+    DIR *d = opendir(dir);
+    if (!d) { *outEntries = NULL; *outN = 0; return; }
+    struct dirent *e;
+    char used[256][12]; int nUsed = 0;
+    FatEnt *ents = calloc(256, sizeof(FatEnt));
+    int n = 0;
+    while ((e = readdir(d)) && n < 200) {
+        if (e->d_name[0] == '.') continue;
+        char full[1024];
+        snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+        to83(e->d_name, used, nUsed++, ents[n].name83);
+        ents[n].isDir = S_ISDIR(st.st_mode);
+        ents[n].size = (uint32_t)st.st_size;
+        snprintf(ents[n].path, sizeof(ents[n].path), "%s", full);
+        n++;
+    }
+    closedir(d);
+    /* alloue dossiers puis fichiers ; écrit les données */
+    for (int i = 0; i < n; i++) {
+        if (ents[i].isDir) {
+            ents[i].first = fat_alloc_dir_data();
+        } else {
+            int clusters = (int)((ents[i].size + FAT_SPC * FAT_SECTOR - 1) / (FAT_SPC * FAT_SECTOR));
+            if (clusters == 0) clusters = 1;
+            ents[i].first = fat_alloc(clusters);
+            FILE *g = fopen(ents[i].path, "rb");
+            if (g) {
+                uint8_t *data = malloc((size_t)clusters * FAT_SPC * FAT_SECTOR);
+                memset(data, 0, (size_t)clusters * FAT_SPC * FAT_SECTOR);
+                size_t got = fread(data, 1, ents[i].size, g);
+                (void)got;
+                memcpy(fatImage + fat_data_lba(ents[i].first) * FAT_SECTOR, data,
+                       (size_t)clusters * FAT_SPC * FAT_SECTOR);
+                free(data);
+                fclose(g);
+                if (fatFileCount < 512) {
+                    fatFiles[fatFileCount].lba = fat_data_lba(ents[i].first);
+                    fatFiles[fatFileCount].bytes = ents[i].size;
+                    snprintf(fatFiles[fatFileCount].path, sizeof(fatFiles[fatFileCount].path), "%s", ents[i].path);
+                    fatFileCount++;
+                }
+            }
+        }
+    }
+    /* place les sous-dossiers (récursif) */
+    for (int i = 0; i < n; i++) {
+        if (ents[i].isDir) {
+            FatEnt *sub = NULL; int nSub = 0;
+            fat_walk(ents[i].path, ents[i].first, 0, &sub, &nSub);
+            fat_write_dir_data(ents[i].first, sub, nSub, ents[i].first, isRoot ? 0 : parentFirst, isRoot);
+            free(sub);
+        }
+    }
+    *outEntries = ents; *outN = n;
+}
+
+static void fat_build_from_dir(const char *dir) {
+    fatImageSize = (size_t)FAT_TOTAL * FAT_SECTOR;
+    fatImage = calloc(1, fatImageSize);
+    fatTable = calloc(65 * FAT_SECTOR, 1);
+    fatTable[0] = 0xf8; fatTable[1] = 0xff;
+    fatTable[2] = 0xff; fatTable[3] = 0xff;
+    uint16_t fatsz = 65;
+    fatImage[0] = 0xeb; fatImage[1] = 0x3c; fatImage[2] = 0x90;
+    memcpy(fatImage + 3, "GBREMU", 6);
+    fatImage[0x0b] = 0x00; fatImage[0x0c] = 0x02;
+    fatImage[0x0d] = FAT_SPC;
+    fatImage[0x0e] = 0x01; fatImage[0x0f] = 0x00;
+    fatImage[0x10] = 0x02;
+    fatImage[0x11] = FAT_ROOT & 0xff; fatImage[0x12] = FAT_ROOT >> 8;
+    fatImage[0x15] = 0xf8;
+    fatImage[0x16] = 65 & 0xff; fatImage[0x17] = 0;  /* 65 secteurs/FAT */
+    fatImage[0x18] = 32; fatImage[0x19] = 0;   /* secteurs/piste */
+    fatImage[0x1a] = 8; fatImage[0x1b] = 0;    /* têtes */
+    uint32_t total = FAT_TOTAL;
+    fatImage[0x20] = total & 0xff; fatImage[0x21] = (total >> 8) & 0xff;
+    fatImage[0x22] = (total >> 16) & 0xff; fatImage[0x23] = (total >> 24) & 0xff;
+    fatImage[510] = 0x55; fatImage[511] = 0xaa;
+    /* racine */
+    FatEnt *root = NULL; int nRoot = 0;
+    fat_walk(dir, 0, 1, &root, &nRoot);
+    uint8_t *rootBuf = calloc(FAT_ROOT * 32, 1);
+    int off = 0;
+    for (int i = 0; i < nRoot; i++) {
+        memcpy(rootBuf + off, root[i].name83, 11);
+        rootBuf[off + 11] = root[i].isDir ? 0x10 : 0x20;
+        rootBuf[off + 26] = root[i].first & 0xff;
+        rootBuf[off + 27] = root[i].first >> 8;
+        rootBuf[off + 28] = root[i].size & 0xff; rootBuf[off + 29] = (root[i].size >> 8) & 0xff;
+        rootBuf[off + 30] = (root[i].size >> 16) & 0xff; rootBuf[off + 31] = (root[i].size >> 24) & 0xff;
+        off += 32;
+    }
+    uint32_t rootLba = 1 + 2 * fatsz;
+    memcpy(fatImage + rootLba * FAT_SECTOR, rootBuf, FAT_ROOT * 32);
+    /* les 2 FAT (la table a été remplie par les allocations) */
+    memcpy(fatImage + FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
+    memcpy(fatImage + (1 + fatsz) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
+    free(rootBuf); free(root);
+    if (getenv("FAT_DUMP")) {
+        FILE *g = fopen(getenv("FAT_DUMP"), "wb");
+        if (g) { fwrite(fatImage, 1, fatImageSize, g); fclose(g);
+                 printf("image FAT test : %s\n", getenv("FAT_DUMP")); }
+    }
+    printf("carte SD : répertoire %s (%d fichiers)\n", dir, fatFileCount);
+}
+
+/* écriture CMD24 : répercute dans le fichier local si le secteur appartient
+ * à un fichier du répertoire */
+static void sd_write_persist(uint32_t lba, const uint8_t *data) {
+    for (int i = 0; i < fatFileCount; i++) {
+        if (lba >= fatFiles[i].lba && (lba - fatFiles[i].lba) * 512 < fatFiles[i].bytes) {
+            FILE *g = fopen(fatFiles[i].path, "r+b");
+            if (g) { fwrite(data, 1, 512, g); fclose(g); }
+            return;
+        }
+    }
+}
+
+/* --------------------------------------------------- ST7735 -> pixels */
+
+static uint8_t st7735_byte(uint8_t v) {
+    if (portB_out & (1u << 22)) return 0xff; /* CS écran haut */
+    if (portB_out & (1u << 23)) { /* données */
+        switch (lcd_lastCommand) {
+            case 0x2c: /* RAMWR */
+                if (lcd_argIndex % 2 == 0) lcd_tmp = v;
+                else {
+                    uint16_t p = (uint16_t)((lcd_tmp << 8) | v);
+                    if (lcd_x < SCREEN_W && lcd_y < SCREEN_H) pix[lcd_y * SCREEN_W + lcd_x] = p;
+                    if (++lcd_x > lcd_xEnd) { lcd_x = lcd_xStart; if (++lcd_y > lcd_yEnd) lcd_y = lcd_yStart; }
+                }
+                break;
+            case 0x2a: /* CASET */
+                if (lcd_argIndex == 1) lcd_xStart = lcd_x = v;
+                else if (lcd_argIndex == 3) lcd_xEnd = v;
+                break;
+            case 0x2b: /* RASET */
+                if (lcd_argIndex == 1) lcd_yStart = lcd_y = v;
+                else if (lcd_argIndex == 3) lcd_yEnd = v;
+                break;
+        }
+        lcd_argIndex++;
+    } else {
+        lcd_lastCommand = v;
+        lcd_argIndex = 0;
+        if (v == 0x2c) ramwrCount++;
+    }
+    return 0xff;
+}
+
+/* ------------------------------------------------------------ DMAC */
+
+static uint32_t dmac_baseAddr, dmac_wrbAddr, dmac_desc, dmac_chid;
+
+static void irq_inject(uint32_t vector);
+
+/* ------------------------------------------------- interruptions */
+
+static void irq_inject(uint32_t vector) {
+    /* même motif que le TypeScript : xPSR, PC, LR, r12, r3..r0 */
+    uint32_t psr = (fC ? 1 : 0) | (fN ? 2 : 0) | (fV ? 4 : 0) | (fZ ? 8 : 0);
+    pushStack(psr);
+    pushStack(regs[15]);
+    pushStack(regs[14]);
+    pushStack(regs[12]);
+    pushStack(regs[3]);
+    pushStack(regs[2]);
+    pushStack(regs[1]);
+    pushStack(regs[0]);
+    regs[15] = vector;
+    regs[14] = 0xfffffff9u;
+    regs[15] += 2; /* pipeline */
+}
+
+/* ----------------------------------------------------------- mémoire */
+
+#define RD8(a)  ((a) < FLASH_SIZE ? flash[a] : 0)
+#define RD8S(a) ((a) < SRAM_SIZE ? sram[a] : 0)
+
+static uint32_t fetchWord(uint32_t a) {
+    if (a < 0x20000000u) { if (a + 4 > FLASH_SIZE) return 0;
+        return (uint32_t)flash[a] | ((uint32_t)flash[a+1] << 8) |
+               ((uint32_t)flash[a+2] << 16) | ((uint32_t)flash[a+3] << 24); }
+    if (a < 0x40000000u) { a -= 0x20000000u; if (a + 4 > SRAM_SIZE) return 0;
+        return (uint32_t)sram[a] | ((uint32_t)sram[a+1] << 8) |
+               ((uint32_t)sram[a+2] << 16) | ((uint32_t)sram[a+3] << 24); }
+    if (a < 0x60000000u) {
+        if (a == 0x40000c00u) return 0;           /* GCLK STATUS */
+        if (a == 0x4200401au) return 0x1234;      /* ADC RESULT */
+        if (a == 0x42004018u) return 1;           /* ADC INTFLAG RESRDY */
+        if (a == 0x4100484eu) return 0x02;        /* DMAC CHINTFLAG TCMPL */
+        if ((a & ~0x1fu) == 0x41004400u) return port_read(0, a & 0x1f);
+        if ((a & ~0x1fu) == 0x41004480u) return port_read(1, a & 0x1f);
+        if (a == 0x42001818u) return 0x07;        /* SERCOM4 INTFLAG */
+        if (a == 0x42001828u) return ser4_data;   /* SERCOM4 DATA */
+        if (a == 0x4200300eu) return 0;           /* TC4 INTFLAG */
+        if (a == 0x4200300au) return 0;           /* TC4 STATUS */
+        if (a == 0x42004800u) return 0;           /* DAC */
+    }
+    return 0;
+}
+
+static uint16_t fetchHalf(uint32_t a) {
+    if (a < 0x20000000u) { if (a + 2 > FLASH_SIZE) return 0;
+        return (uint16_t)(flash[a] | (flash[a+1] << 8)); }
+    if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return 0;
+        return (uint16_t)(sram[a] | (sram[a+1] << 8)); }
+    return (uint16_t)fetchWord(a);
+}
+
+static uint8_t fetchByte(uint32_t a) {
+    if (a < 0x20000000u) return RD8(a);
+    if (a < 0x40000000u) return RD8S(a - 0x20000000u);
+    return (uint8_t)fetchWord(a);
+}
+
+static void writeWord(uint32_t a, uint32_t v);
+static void writeHalf(uint32_t a, uint16_t v);
+static void writeByte(uint32_t a, uint8_t v);
+
+static int dbgTc4Cfg = 0, dbgDac = 0, dbgTc4Fire = 0;
+static void writeWord(uint32_t a, uint32_t v) {
+    if (a < 0x20000000u) return;
+    if (a < 0x40000000u) { a -= 0x20000000u; if (a + 4 > SRAM_SIZE) return;
+        sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff;
+        sram[a+2] = (v >> 16) & 0xff; sram[a+3] = (v >> 24) & 0xff; return; }
+    if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
+    if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
+    if (a == 0x42001828u) { sercom4_write((uint8_t)v); return; } /* SERCOM4 DATA */
+    if (a == 0x42004808u) { dac_write((uint16_t)v); return; }    /* DAC DATA */
+    if (a == 0x42003000u) { if (dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42003018u) { tc4Top = v; return; }                /* TC4 CC0 */
+    if (a == 0x41004834u) { dmac_baseAddr = v; return; }
+    if (a == 0x41004838u) { dmac_wrbAddr = v; return; }
+    if (a == 0x4100483fu) { dmac_chid = v; return; }
+    if (a == 0x41004840u) { /* CHCTRLA == 2 : transfert via descripteur */
+        if (v == 0x02) {
+            if (!dmac_desc) dmac_desc = dmac_baseAddr + dmac_chid * 0x10;
+            uint16_t btcnt = fetchHalf(dmac_desc + 0x02);
+            uint32_t src = fetchWord(dmac_desc + 0x04);
+            uint32_t dst = fetchWord(dmac_desc + 0x08);
+            uint32_t nxt = fetchWord(dmac_desc + 0x0c);
+            for (uint16_t i = 0; i < btcnt; i++)
+                writeByte(dst, fetchByte(src + i - btcnt));
+            dmac_desc = nxt;
+            irq_inject(dmacVector);
+        }
+        return;
+    }
+}
+
+static void writeHalf(uint32_t a, uint16_t v) {
+    if (a < 0x20000000u) return;
+    if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return;
+        sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff; return; }
+    if (a == 0x42004808u) { if (dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
+    if (a == 0x42003000u) { if (dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42003018u) { tc4Top = v; return; }
+    if (a == 0x40000c02u) return;                                /* GCLK CLKCTRL */
+    if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
+    if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
+    writeWord(a, v);
+}
+
+static void writeByte(uint32_t a, uint8_t v) {
+    if (a < 0x20000000u) return;
+    if (a < 0x40000000u) { uint32_t sa = a - 0x20000000u; if (sa < SRAM_SIZE) sram[sa] = v; return; }
+    if (a == 0x4200300du) { if (dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] INTENSET <- %x\n", v); dbgTc4Cfg++; } if (v & 0x10) tc4Armed = 1; return; }
+    if (a == 0x42001828u) { sercom4_write(v); return; }
+    if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; } /* TC4 INTENSET */
+    if (a == 0x4200300eu) return;                                 /* TC4 INTFLAG */
+    if (a == 0x4100483fu) { dmac_chid = v; return; }
+    if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
+    if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
+    writeWord(a, v);
+}
+
+/* --------------------------------------------------- DMAC (écran) */
+
+
+/* ---------------------------------------------------- SERCOM4 data */
+
+static void buttons_apply(void);
+
+static void sercom4_write(uint8_t v) {
+    /* ordre du TypeScript : écran, boutons, carte SD (chaque périphérique
+     * filtrant sur sa broche CS ; seul le sélectionné écrit ser4_data) */
+    st7735_byte(v);
+    if ((portB_out & (1u << 3)) == 0) ser4_data = buttonData; /* boutons PB03 */
+    sd_byte(v);
+}
+
+/* ---------------------------------------------------------------- CPU */
+
+static void incrementPc(void) {
+    sysTickTrigger++;
+    tickCount++;
+    regs[15] += 2;
+
+    if (tc4Enabled && tc4Armed && tc4Top > 0) {
+        if (++tc4Counter >= tc4Period) {
+            tc4Counter = 0;
+            tc4Fires++;
+            tc4Interrupt = 1;
+        }
+    }
+}
+
+static void pushStack(uint32_t v) { regs[13] -= 4; writeWord(regs[13], v); }
+static uint32_t popStack(void) { uint32_t v = fetchWord(regs[13]); regs[13] += 4; return v; }
+
+static void setReg(int i, uint32_t v) { regs[i] = v; }
+static void setNZ(uint32_t r) { fN = (r & 0x80000000u) != 0; fZ = r == 0; }
+
+static uint32_t addSetCond(uint32_t a, uint32_t b, int carry) {
+    uint32_t r = a + b + (unsigned)carry;
+    fC = r < a;
+    fV = (~(a ^ b) & (a ^ r) & 0x80000000u) != 0;
+    setNZ(r);
+    return r;
+}
+
+static void irq_inject(uint32_t vector);
+
+static void step(void) {
+    if (tc4Interrupt) {
+        tc4Interrupt = 0;
+        irq_inject(tc4Vector);
+    }
+    if (dmacInterrupt) {
+        dmacInterrupt = 0;
+        irq_inject(dmacVector);
+    }
+    if (++sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
+        sysTickTrigger = 0;
+        irq_inject(sysTickVector);
+    }
+
+    uint32_t instAddr = regs[15] - 2;
+    /* fin d'interruption : BX LR avec EXC_RETURN (0xfffffff9) fait atterrir
+     * le PC sur 0xfffffff8 -> dépiler r0-r3, r12, lr, pc puis xPSR */
+    while (instAddr == 0xfffffff8u) {
+        setReg(0, popStack());
+        setReg(1, popStack());
+        setReg(2, popStack());
+        setReg(3, popStack());
+        setReg(12, popStack());
+        setReg(14, popStack());
+        setReg(15, popStack());
+        uint32_t cnvz = fetchWord(regs[13]);
+        fC = (cnvz & 1) != 0; fN = (cnvz & 2) != 0;
+        fV = (cnvz & 4) != 0; fZ = (cnvz & 8) != 0;
+        regs[13] += 4;
+        instAddr = regs[15] - 2;
+    }
+    if (instAddr >= 0x42000000u) { regs[15] = vectorBase + fetchWord(vectorBase + 4); return; }
+    uint16_t inst = fetchHalf(instAddr);
+    static int trace = -1;
+    if (trace < 0) trace = getenv("EMU_TRACE") ? 1 : 0;
+    if (trace && (tickCount & 0x3ffff) == 0)
+        fprintf(stderr, "[tick %u] pc=0x%x inst=%04x r0=%08x sp=%08x\n",
+                tickCount, instAddr, inst, regs[0], regs[13]);
+    uint16_t nextInst = fetchHalf(instAddr + 2);
+    incrementPc();
+
+    uint32_t op = inst;
+
+    /* déplacements décalés + add/sub registre/imm3 */
+    if ((op & 0xe000) == 0x0000) {
+        int rs = (op >> 3) & 7, rd = op & 7;
+        if ((op & 0x1800) != 0x1800) {
+            int opc = (op >> 11) & 3, off = (op >> 6) & 0x1f;
+            if (opc == 0) { /* LSL imm */
+                uint32_t v = regs[rs];
+                if (off) {
+                    uint32_t partial = v << (off - 1);
+                    setReg(rd, partial << 1);
+                    fC = (partial & 0x80000000u) != 0;
+                } else { setReg(rd, v); }
+                setNZ(regs[rd]);
+            } else if (opc == 1) { /* LSR imm */
+                uint32_t n = off ? off : 32, v = regs[rs];
+                uint32_t partial = v >> (n - 1);
+                setReg(rd, partial >> 1);
+                fC = (partial & 1) != 0;
+                setNZ(regs[rd]);
+            } else if (opc == 2) { /* ASR imm */
+                uint32_t n = off ? off : 32;
+                int32_t sv = (int32_t)regs[rs];
+                int32_t partial = sv >> (int)(n - 1);
+                setReg(rd, (uint32_t)(partial >> 1));
+                fC = (partial & 1) != 0;
+                setNZ(regs[rd]);
+            }
+        } else { /* add/subtract */
+            int opc = (op >> 9) & 3, rn = (op >> 6) & 7;
+            if (opc == 0) setReg(rd, addSetCond(regs[rs], regs[rn], 0));
+            else if (opc == 1) setReg(rd, addSetCond(regs[rs], ~regs[rn], 1));
+            else if (opc == 2) setReg(rd, addSetCond(regs[rs], rn, 0));
+            else setReg(rd, addSetCond(regs[rs], ~((uint32_t)rn), 1));
+        }
+    }
+    /* mov/cmp/add/sub immédiat */
+    else if ((op & 0xe000) == 0x2000) {
+        int rd = (op >> 8) & 7, opc = (op >> 11) & 3;
+        uint32_t imm = op & 0xff;
+        if (opc == 0) { setReg(rd, imm); setNZ(imm); }
+        else if (opc == 1) addSetCond(regs[rd], ~imm, 1);
+        else if (opc == 2) setReg(rd, addSetCond(regs[rd], imm, 0));
+        else setReg(rd, addSetCond(regs[rd], ~imm, 1));
+    }
+    /* opérations ALU */
+    else if ((op & 0xfc00) == 0x4000) {
+        int opc = (op >> 6) & 0xf, rs = (op >> 3) & 7, rd = op & 7;
+        uint32_t a = regs[rd], b = regs[rs];
+        switch (opc) {
+            case 0x0: setReg(rd, a & b); setNZ(regs[rd]); break;
+            case 0x1: setReg(rd, a ^ b); setNZ(regs[rd]); break;
+            case 0x2: { uint32_t r = a << (b & 31); setReg(rd, r);
+                        fC = b < 32 && ((a & (1u << (32 - b))) != 0); setNZ(r); break; }
+            case 0x3: { uint32_t r = b < 32 ? a >> b : 0; setReg(rd, r);
+                        fC = b < 32 && ((a & (1u << (b - 1))) != 0); setNZ(r); break; }
+            case 0x4: { uint32_t r = b < 32 ? (uint32_t)((int32_t)a >> b) : (uint32_t)((int32_t)a >> 31);
+                        setReg(rd, r); fC = (int32_t)a < 0 && b >= 32 ? 1 : b && ((a >> (b - 1)) & 1); setNZ(r); break; }
+            case 0x5: setReg(rd, addSetCond(a, b, fC)); break;                 /* ADC */
+            case 0x6: setReg(rd, addSetCond(a, ~b, fC)); break;                /* SBC */
+            case 0x8: setNZ(a & b); break;                                     /* TST */
+            case 0x9: setReg(rd, addSetCond(0, ~b, 1)); break;                 /* NEG */
+            case 0xa: addSetCond(a, ~b, 1); break;                             /* CMP reg */
+            case 0xb: addSetCond(a, b, 0); break;                              /* CMN */
+            case 0xc: setReg(rd, a | b); setNZ(regs[rd]); break;               /* ORR */
+            case 0xd: { uint32_t r = a * b; setReg(rd, r); setNZ(r); break; }  /* MUL */
+            case 0xe: setReg(rd, a & ~b); setNZ(regs[rd]); break;              /* BIC */
+            case 0xf: setReg(rd, ~b); setNZ(regs[rd]); break;                  /* MVN */
+        }
+    }
+    /* opérations sur registres hauts / BX / BLX */
+    else if ((op & 0xfc00) == 0x4400) {
+        int opH = (op >> 6) & 0xf;
+        int rs = (op >> 3) & 7, rd = op & 7;
+        switch (opH) {
+            case 0x1: setReg(rd, addSetCond(regs[rd], regs[rs + 8], 0)); break;
+            case 0x2: setReg(rd + 8, addSetCond(regs[rd + 8], regs[rs], 0)); break;
+            case 0x3: setReg(rd + 8, addSetCond(regs[rd + 8], regs[rs + 8], 0)); break;
+            case 0x5: addSetCond(regs[rd], ~regs[rs + 8], 1); break;
+            case 0x6: addSetCond(regs[rd + 8], ~regs[rs], 1); break;
+            case 0x7: addSetCond(regs[rd + 8], ~regs[rs + 8], 1); break;
+            case 0x8: setReg(rd, regs[rs]); break;
+            case 0x9: setReg(rd, regs[rs + 8]); break;
+            case 0xa: if (rd + 8 == 15) { setReg(15, regs[rs] & ~1u); incrementPc(); }
+                      else setReg(rd + 8, regs[rs]); break;
+            case 0xb: if (rd + 8 == 15) { setReg(15, regs[rs + 8] & ~1u); incrementPc(); }
+                      else setReg(rd + 8, regs[rs + 8]); break;
+            case 0xc: setReg(15, regs[rs] & ~1u); incrementPc(); break;        /* BX r */
+            case 0xd: setReg(15, regs[rs + 8] & ~1u); incrementPc(); break;    /* BX h */
+            case 0xe: case 0xf: /* BLX r<rm> */
+                setReg(14, (regs[15] - 2) | 1);
+                setReg(15, regs[(op >> 3) & 7] & ~1u);
+                incrementPc();
+                break;
+        }
+    }
+    /* LDR littéral (PC) */
+    else if ((op & 0xf800) == 0x4800) {
+        int rd = (op >> 8) & 7;
+        uint32_t imm = (uint32_t)(op & 0xff) << 2;
+        setReg(rd, fetchWord((regs[15] & ~3u) + imm));
+    }
+    /* load/store offset par registre */
+    else if ((op & 0xf200) == 0x5000) {
+        int lb = (op >> 10) & 3, ro = (op >> 6) & 7, rb = (op >> 3) & 7, rd = op & 7;
+        uint32_t a = regs[rb] + regs[ro];
+        if (lb == 0) writeWord(a, regs[rd]);
+        else if (lb == 1) writeByte(a, (uint8_t)regs[rd]);
+        else if (lb == 2) setReg(rd, fetchWord(a));
+        else setReg(rd, fetchByte(a));
+    }
+    /* load/store signé / demi-mot par registre */
+    else if ((op & 0xf200) == 0x5200) {
+        int hs = (op >> 10) & 3, ro = (op >> 6) & 7, rb = (op >> 3) & 7, rd = op & 7;
+        uint32_t a = regs[rb] + regs[ro];
+        if (hs == 0) writeHalf(a, (uint16_t)regs[rd]);
+        else if (hs == 1) { uint32_t v = fetchByte(a); setReg(rd, v & 0x80 ? v | 0xffffff00u : v); }
+        else if (hs == 2) setReg(rd, fetchHalf(a));
+        else { uint32_t v = fetchHalf(a); setReg(rd, v & 0x8000 ? v | 0xffff0000u : v); }
+    }
+    /* load/store immédiat mot/octet */
+    else if ((op & 0xe000) == 0x6000) {
+        int bl = (op >> 11) & 3, off = (op >> 6) & 0x1f, rb = (op >> 3) & 7, rd = op & 7;
+        if (bl == 0) writeWord(regs[rb] + ((uint32_t)off << 2), regs[rd]);
+        else if (bl == 1) setReg(rd, fetchWord(regs[rb] + ((uint32_t)off << 2)));
+        else if (bl == 2) writeByte(regs[rb] + off, (uint8_t)regs[rd]);
+        else setReg(rd, fetchByte(regs[rb] + off));
+    }
+    /* load/store demi-mot immédiat */
+    else if ((op & 0xf000) == 0x8000) {
+        int l = (op >> 11) & 1, off = (op >> 6) & 0x1f, rb = (op >> 3) & 7, rd = op & 7;
+        if (l) setReg(rd, fetchHalf(regs[rb] + ((uint32_t)off << 1)));
+        else writeHalf(regs[rb] + ((uint32_t)off << 1), (uint16_t)regs[rd]);
+    }
+    /* SP-relatif */
+    else if ((op & 0xf000) == 0x9000) {
+        int l = (op >> 11) & 1, rd = (op >> 8) & 7;
+        uint32_t off = (uint32_t)(op & 0xff) << 2;
+        if (l) setReg(rd, fetchWord(regs[13] + off));
+        else writeWord(regs[13] + off, regs[rd]);
+    }
+    /* ADR / ADD rd, SP */
+    else if ((op & 0xf000) == 0xa000) {
+        int sp = (op >> 11) & 1, rd = (op >> 8) & 7;
+        uint32_t c = (uint32_t)(op & 0xff) << 2;
+        setReg(rd, sp ? regs[13] + c : (regs[15] & ~3u) + c);
+    }
+    /* add SP+offset */
+    else if ((op & 0xff00) == 0xb000) {
+        int neg = (op >> 7) & 1;
+        uint32_t v = (uint32_t)(op & 0x7f) << 2;
+        regs[13] += neg ? -v : v;
+    }
+    /* extensions signées / rev */
+    else if ((op & 0xff00) == 0xb200) {
+        int rm = (op >> 3) & 7, rd = op & 7, opc = (op >> 6) & 3;
+        uint32_t v = regs[rm];
+        if (opc == 0) { v &= 0xffff; if (v & 0x8000) v |= 0xffff0000u; }
+        else if (opc == 1) { v &= 0xff; if (v & 0x80) v |= 0xffffff00u; }
+        else if (opc == 2) v &= 0xffff;
+        else v &= 0xff;
+        setReg(rd, v);
+    }
+    else if ((op & 0xff00) == 0xba00) {
+        int rm = (op >> 3) & 7, rd = op & 7, opc = (op >> 6) & 3;
+        uint32_t v = regs[rm];
+        if (opc == 0) v = ((v & 0xff000000u) >> 24) | ((v & 0x00ff0000u) >> 8) |
+                          ((v & 0x0000ff00u) << 8) | ((v & 0x000000ffu) << 24);
+        else if (opc == 1) v = ((v & 0xff00ff00u) >> 8) | ((v & 0x00ff00ffu) << 8);
+        setReg(rd, v);
+    }
+    else if ((op & 0xffe8) == 0xb666) { /* CPS : no-op comme le TS */ }
+    /* push/pop */
+    else if ((op & 0xfe00) == 0xb400) {
+        int l = (op >> 11) & 1, r = (op >> 8) & 1, rlist = op & 0xff;
+        if (!l) {
+            if (r) pushStack(regs[14]);
+            for (int i = 7; i >= 0; i--) if (rlist & (1u << i)) pushStack(regs[i]);
+        } else {
+            for (int i = 0; i < 8; i++) if (rlist & (1u << i)) setReg(i, popStack());
+            if (r) { setReg(15, popStack() & ~1u); incrementPc(); }
+        }
+    }
+    /* LDMIA/STMIA */
+    else if ((op & 0xf000) == 0xc000) {
+        int l = (op >> 11) & 1, rb = (op >> 8) & 7, rlist = op & 0xff;
+        uint32_t addr = regs[rb];
+        for (int i = 0; i < 8; i++) {
+            if (rlist & (1u << i)) {
+                if (l) setReg(i, fetchWord(addr)); else writeWord(addr, regs[i]);
+                addr += 4;
+            }
+        }
+        regs[rb] = addr;
+    }
+    /* branchement conditionnel */
+    else if ((op & 0xf000) == 0xd000) {
+        int cond = (op >> 8) & 0xf;
+        int32_t off = op & 0xff;
+        if (off & 0x80) off |= ~0xff;
+        off <<= 1;
+        int take = 0;
+        switch (cond) {
+            case 0x0: take = fZ; break;
+            case 0x1: take = !fZ; break;
+            case 0x2: take = fC; break;
+            case 0x3: take = !fC; break;
+            case 0x4: take = fN; break;
+            case 0x5: take = !fN; break;
+            case 0x6: take = fV; break;
+            case 0x7: take = !fV; break;
+            case 0x8: take = fC && !fZ; break;
+            case 0x9: take = !fC || fZ; break;
+            case 0xa: take = fN == fV; break;
+            case 0xb: take = fN != fV; break;
+            case 0xc: take = !fZ && (fN == fV); break;
+            case 0xd: take = fZ || (fN != fV); break;
+        }
+        if (take) { regs[15] = (uint32_t)((int32_t)regs[15] + off); incrementPc(); }
+    }
+    /* SWI : no-op (comme le TS qui ne le décode pas) */
+    else if ((op & 0xff00) == 0xdf00) { }
+    /* branchement inconditionnel */
+    else if ((op & 0xf800) == 0xe000) {
+        int32_t off = op & 0x7ff;
+        if (off & 0x400) off |= ~0x7ff;
+        off <<= 1;
+        regs[15] = (uint32_t)((int32_t)regs[15] + off);
+        incrementPc();
+    }
+    /* BL long + MRS/DMB */
+    else if ((op & 0xf800) == 0xf000 && (nextInst & 0xf800) == 0xf800) {
+        int32_t off1 = op & 0x7ff;
+        if (off1 & 0x400) off1 |= ~0x7ff;
+        int32_t off2 = nextInst & 0x7ff;
+        setReg(14, regs[15] + ((uint32_t)off1 << 12));
+        setReg(15, regs[15] + ((uint32_t)(off2 << 1)) + 2);
+        incrementPc();
+    }
+    else if (op == 0xf3bf || (op & 0xffe0) == 0xf3e0) { /* DMB/MRS : no-op */ }
+    else {
+        /* instruction non décodée : comme le TS, on continue */
+    }
+    if (trace && (tickCount & 127) == 0)
+        fprintf(stderr, "%u pc=%x r0=%x r1=%x r2=%x r3=%x r4=%x r5=%x r6=%x r7=%x sp=%x\n",
+                tickCount, instAddr, regs[0], regs[1], regs[2], regs[3],
+                regs[4], regs[5], regs[6], regs[7], regs[13]);
+}
+
+/* --------------------------------------------------------- SDL + main */
+
+static SDL_Texture *tex;
+static uint32_t px32[SCREEN_W * SCREEN_H];
+
+static void blit(SDL_Renderer *ren) {
+    for (unsigned i = 0; i < SCREEN_W * SCREEN_H; i++) {
+        uint16_t p = pix[i];
+        uint8_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+        px32[i] = 0xff000000u | ((b * 255 / 31) << 16) | ((g * 255 / 63) << 8) | (r * 255 / 31);
+    }
+    SDL_UpdateTexture(tex, NULL, px32, SCREEN_W * sizeof(uint32_t));
+    SDL_RenderClear(ren);
+    SDL_RenderCopy(ren, tex, NULL, NULL);
+    SDL_RenderPresent(ren);
+}
+
+/* audio SDL : l'ISR écrit dans aq ; le callbackSDL consomme */
+static void audio_cb(void *ud, Uint8 *stream, int len) {
+    (void)ud;
+    int16_t *out = (int16_t *)stream;
+    for (int i = 0; i < len / 2; i++) {
+        if (aq_head != aq_tail) {
+            audioHold = aq[aq_head];
+            aq_head = (aq_head + 1) % AQ_SIZE;
+        }
+        out[i] = audioHold;
+    }
+}
+
+/* boutons : bit0 bas, 1 gauche, 2 droite, 3 haut, 4 A, 5 B, 6 MENU, 7 HOME */
+static uint8_t keyBits(int sym, int down) {
+    uint8_t bit;
+    switch (sym) {
+        case SDLK_DOWN: case SDLK_s: bit = 0; break;
+        case SDLK_LEFT: case SDLK_q: case SDLK_a: bit = 1; break;
+        case SDLK_RIGHT: case SDLK_d: bit = 2; break;
+        case SDLK_UP: case SDLK_z: case SDLK_w: bit = 3; break;
+        case SDLK_j: bit = 4; break;
+        case SDLK_k: bit = 5; break;
+        case SDLK_u: bit = 6; break;
+        case SDLK_i: bit = 7; break;
+        default: return 0;
+    }
+    return (uint8_t)(1u << bit) & (down ? 0xff : 0); /* 0 = enfoncé (actif bas) */
+}
+
+static char fwPath[1024];
+static int fwLoaded;
+
+static void load_firmware(const char *p) {
+    FILE *f = fopen(p, "rb");
+    if (!f) { fprintf(stderr, "firmware introuvable : %s\n", p); return; }
+    if (fread(flash + 0x4000, 1, FLASH_SIZE - 0x4000, f) == 0) {
+        fprintf(stderr, "firmware vide\n"); fclose(f); return;
+    }
+    fclose(f);
+    snprintf(fwPath, sizeof(fwPath), "%s", p);
+    fwLoaded = 1;
+    printf("firmware : %s\n", p);
+    /* la carte SD est, par défaut, le répertoire du binaire */
+    if (!sd_image && !fatImage) {
+        char dirbuf[1024];
+        snprintf(dirbuf, sizeof(dirbuf), "%s", p);
+        char *slash = strrchr(dirbuf, '/');
+        if (slash) {
+            *slash = 0;
+            if (slash != dirbuf) fat_build_from_dir(dirbuf);
+        }
+    }
+}
+
+static void load_sd_from_path(const char *p) {
+    struct stat st;
+    if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) { fat_build_from_dir(p); return; }
+    FILE *g = fopen(p, "rb");
+    if (!g) { fprintf(stderr, "carte introuvable : %s\n", p); return; }
+    fseek(g, 0, SEEK_END); long sz = ftell(g); fseek(g, 0, SEEK_SET);
+    if (sd_image) free(sd_image);
+    sd_image = malloc((size_t)sz);
+    fread(sd_image, 1, (size_t)sz, g);
+    sd_size = (size_t)sz;
+    fclose(g);
+    printf("carte SD : image %s (%ld Kio)\n", p, sz / 1024);
+}
+
+static void boot_vectors(void) {
+    vectorBase = 0x4000;
+    regs[13] = fetchWord(vectorBase);
+    regs[14] = 0xffffffffu;
+    regs[15] = fetchWord(vectorBase + 4) & ~1u;
+    incrementPc();
+    sysTickVector = fetchWord(vectorBase + 0x3c) & ~1u;
+    dmacVector = fetchWord(vectorBase + 0x58) & ~1u;
+    tc4Vector = fetchWord(vectorBase + 0x8c) & ~1u;
+    fprintf(stderr, "SP=%08x PC=%08x systick=%08x dmac=%08x tc4=%08x\n",
+            regs[13], regs[15], sysTickVector, dmacVector, tc4Vector);
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage : meta_emu <firmware.bin> [carte.img] [--wav out.wav]\n");
+        return 1;
+    }
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--wav") == 0 && i + 1 < argc) {
+            snprintf(wavPathStr, sizeof(wavPathStr), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+            maxFrames = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
+            snprintf(shotPath, sizeof(shotPath), "%s", argv[++i]);
+        } else {
+            const char *ext = strrchr(argv[i], '.');
+            struct stat st;
+            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) load_sd_from_path(argv[i]);
+            else if (ext && strcasecmp(ext, ".img") == 0) load_sd_from_path(argv[i]);
+            else if (!fwLoaded) load_firmware(argv[i]);
+            else load_sd_from_path(argv[i]);
+        }
+    }
+    if (fwLoaded) boot_vectors();
+
+    static int trace = -1;
+    if (trace < 0) trace = getenv("EMU_TRACE") ? 1 : 0;
+    Uint32 frame = 0;
+    int running = 1;
+    uint64_t perfFreq = SDL_GetPerformanceFrequency();
+    uint64_t frameStart = SDL_GetPerformanceCounter();
+    const uint64_t frameTicks = 334860; /* 16743 µs émulées */
+    uint32_t nextFrameTick = 334860;
+    uint32_t homeHeld = 0;
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
+        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return 1;
+    }
+    SDL_Window *win;
+    SDL_Renderer *ren;
+    if (SDL_CreateWindowAndRenderer(SCREEN_W * 2, SCREEN_H * 2, 0, &win, &ren) != 0) {
+        fprintf(stderr, "fenêtre: %s\n", SDL_GetError());
+        return 1;
+    }
+    tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STREAMING, SCREEN_W, SCREEN_H);
+
+    SDL_AudioSpec want, got;
+    memset(&want, 0, sizeof(want));
+    want.freq = 22049; want.format = AUDIO_S16SYS; want.channels = 1;
+    want.samples = 2048; want.callback = audio_cb;
+    audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+    audioOk = audioDev != 0;
+    if (!audioOk) fprintf(stderr, "audio indisponible : %s\n", SDL_GetError());
+
+    if (wavPathStr[0]) {
+        wavFile = fopen(wavPathStr, "wb");
+        if (wavFile) {
+            uint8_t hdr[44] = {0};
+            memcpy(hdr, "RIFF", 4); memcpy(hdr + 8, "WAVEfmt ", 8);
+            hdr[16] = 16; hdr[20] = 1; hdr[22] = 1;
+            uint32_t rate = 22049;
+            hdr[24] = rate & 0xff; hdr[25] = (rate >> 8) & 0xff;
+            uint32_t br = rate * 2;
+            hdr[28] = br & 0xff; hdr[29] = (br >> 8) & 0xff;
+            hdr[32] = 2; hdr[34] = 16;
+            memcpy(hdr + 36, "data", 4);
+            fwrite(hdr, 1, 44, wavFile);
+        }
+    }
+    while (running) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
+            else if (ev.type == SDL_DROPFILE) {
+                char *fp = ev.drop.file;
+                const char *ext = strrchr(fp, '.');
+                struct stat st;
+                printf("déposé : %s\n", fp);
+                if (stat(fp, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    load_sd_from_path(fp);
+                } else if (ext && strcasecmp(ext, ".img") == 0) {
+                    load_sd_from_path(fp);
+                } else if (ext && strcasecmp(ext, ".bin") == 0) {
+                    load_firmware(fp);
+                    boot_vectors();
+                    if (audioOk) SDL_PauseAudioDevice(audioDev, 0);
+                } else {
+                    load_sd_from_path(fp);
+                }
+                SDL_free(fp);
+            }
+            else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+                uint8_t bit = keyBits(ev.key.keysym.sym, ev.type == SDL_KEYDOWN);
+                if (bit) {
+                    if (bit & (1u << 7)) {
+                        homeHeld = ev.type == SDL_KEYDOWN ? SDL_GetTicks() : 0;
+                        if (ev.type == SDL_KEYDOWN) buttonData &= (uint8_t)~bit;
+                        else buttonData |= bit;
+                    } else if (ev.type == SDL_KEYDOWN) buttonData &= (uint8_t)~bit;
+                    else buttonData |= bit;
+                }
+            }
+        }
+        if (homeHeld && SDL_GetTicks() - homeHeld > 3000) { /* reset maison */ }
+        if (maxFrames && frame >= maxFrames) break;
+
+        /* une frame émulée */
+        uint32_t target = nextFrameTick;
+        while (tickCount < target && running) step();
+        nextFrameTick += frameTicks;
+        frame++;
+
+        blit(ren);
+        if (trace) { /* empreinte d'écran périodique */
+            static uint32_t lastPrint = 0;
+            if (frame - lastPrint >= 60) {
+                lastPrint = frame;
+                uint32_t h = 0x811c9dc5;
+                int distinct = 0;
+                uint16_t seen[16] = {0};
+                for (unsigned i = 0; i < SCREEN_W * SCREEN_H; i++) {
+                    h = (h ^ pix[i]) * 0x01000193u;
+                    int k = 0;
+                    for (; k < 16; k++) if (seen[k] == pix[i]) break;
+                    if (k == 16) distinct++;
+                }
+                fprintf(stderr, "[frame %u] hash=%08x distinct<=%d\n", frame, h, distinct);
+            }
+        }
+        (void)frameStart; (void)perfFreq; (void)frame;
+
+        /* temps réel : une frame = 1/59,7 s */
+        uint64_t now = SDL_GetPerformanceCounter();
+        double elapsed = (double)(now - frameStart) / (double)perfFreq;
+        double want = (double)frame / 59.7275;
+        if (want > elapsed) SDL_Delay((Uint32)((want - elapsed) * 1000.0));
+        else frameStart -= (uint64_t)((elapsed - want) * perfFreq); /* en retard : rattrape */
+
+    }
+
+    if (shotPath[0]) {
+        FILE *sf = fopen(shotPath, "wb");
+        if (sf) {
+            fprintf(sf, "P6\n%u %u\n255\n", SCREEN_W, SCREEN_H);
+            for (unsigned i = 0; i < SCREEN_W * SCREEN_H; i++) {
+                uint16_t pc = pix[i];
+                uint8_t rgb[3] = { (uint8_t)(((pc >> 11) & 0x1f) * 255 / 31),
+                                   (uint8_t)(((pc >> 5) & 0x3f) * 255 / 63),
+                                   (uint8_t)((pc & 0x1f) * 255 / 31) };
+                fwrite(rgb, 1, 3, sf);
+            }
+            fclose(sf);
+            printf("capture : %s\n", shotPath);
+        }
+    }
+    wav_finish();
+    if (audioDev) SDL_CloseAudioDevice(audioDev);
+    SDL_DestroyRenderer(ren); SDL_DestroyTexture(tex); SDL_DestroyWindow(win);
+    SDL_Quit();
+    return 0;
+}
