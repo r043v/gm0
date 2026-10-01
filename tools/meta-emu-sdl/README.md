@@ -23,7 +23,10 @@ périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
   et tout drop de firmware rebascule la carte sur son répertoire.
 - La fenêtre est **redimensionnable** (échelle entière, pixels carrés) et
   la **barre de titre** affiche le **% de vitesse** (ticks émulés / temps
-  réel, mis à jour toutes les 500 ms).
+  réel, mis à jour toutes les 500 ms, borné à 100 %).  Le pacing est une
+  échéance par frame sans dette : jamais plus vite que le temps réel, et
+  un ralentissement (drag de fenêtre, stall) ne déclenche pas de
+  rattrapage accéléré.
 
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu \
       out/<Jeu>/.pio/build/meta/firmware.bin output/sd-card \

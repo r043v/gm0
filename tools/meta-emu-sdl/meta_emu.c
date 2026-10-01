@@ -1358,7 +1358,8 @@ int main(int argc, char **argv) {
     Uint32 frame = 0;
     int running = 1;
     uint64_t perfFreq = SDL_GetPerformanceFrequency();
-    uint64_t frameStart = SDL_GetPerformanceCounter();
+    const uint64_t frameDur = (uint64_t)((double)perfFreq / 59.7275 + 0.5); /* 1/59,7 s */
+    uint64_t nextPace = 0; /* échéance temps réel de la prochaine frame */
     const uint64_t frameTicks = 334860; /* 16743 µs émulées */
     uint32_t nextFrameTick = 334860;
     uint8_t padDirBits = 0; /* directions tenues par stick/chapeau */
@@ -1545,7 +1546,6 @@ int main(int argc, char **argv) {
              * frame et le chronométrage temps réel */
             seenEpoch = machineEpoch;
             nextFrameTick = tickCount + frameTicks;
-            frameStart = SDL_GetPerformanceCounter();
             titleTick = tickCount;
             titleMs = SDL_GetTicks();
         }
@@ -1569,7 +1569,7 @@ int main(int argc, char **argv) {
                     double wallMs = (double)(nowMs - titleMs);
                     int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
                     if (pct < 0) pct = 0;
-                    if (pct > 9999) pct = 9999;
+                    if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
                     snprintf(title, sizeof(title), "META — %.900s — %d%%", fwName, pct);
                 } else {
                     snprintf(title, sizeof(title), "META — déposez un firmware .bin");
@@ -1597,14 +1597,20 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[frame %u] hash=%08x distinct<=%d\n", frame, h, distinct);
             }
         }
-        (void)frameStart; (void)perfFreq; (void)frame;
-
-        /* temps réel : une frame = 1/59,7 s */
-        uint64_t now = SDL_GetPerformanceCounter();
-        double elapsed = (double)(now - frameStart) / (double)perfFreq;
-        double want = (double)frame / 59.7275;
-        if (want > elapsed) SDL_Delay((Uint32)((want - elapsed) * 1000.0));
-        else frameStart -= (uint64_t)((elapsed - want) * perfFreq); /* en retard : rattrape */
+        /* temps réel : une frame = 1/59,7 s, jamais plus vite.  Échéance
+         * sans dette : en retard de plus de 4 frames (stall, drag de
+         * fenêtre, drop), on repart de maintenant au lieu de rattraper. */
+        {
+            uint64_t now = SDL_GetPerformanceCounter();
+            if (nextPace == 0) nextPace = now + frameDur;
+            nextPace += frameDur;
+            if (now > nextPace + 4 * frameDur) nextPace = now + frameDur;
+            if (now < nextPace) {
+                Uint32 ms = (Uint32)(((nextPace - now) * 1000) / perfFreq);
+                if (ms > 1) SDL_Delay(ms - 1);
+                while (SDL_GetPerformanceCounter() < nextPace) { /* affinage */ }
+            }
+        }
 
     }
 
