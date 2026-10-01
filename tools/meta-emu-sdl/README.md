@@ -29,7 +29,8 @@ périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
       out/<Jeu>/.pio/build/meta/firmware.bin output/sd-card \
       --frames 300 --shot /tmp/shot.ppm
 
-Touches : flèches, ZQSD/WASD, J=A, K=B, U=MENU, I=HOME.
+Touches : flèches, ZQSD/WASD, **Entrée**=Start (MENU), **Espace**=A,
+**Ctrl**=B, **\***=Select (HOME), ou J=A, K=B, U=MENU, I=HOME.
 
 **Manette** (SDL_GameController ; bascule automatique sur joystick brut) :
 A=A, B=B, Start=MENU, Back/Guide=HOME, croix directionnelle et stick

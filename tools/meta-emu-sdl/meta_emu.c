@@ -719,7 +719,7 @@ static void incrementPc(void) {
     }
 }
 
-static int traceAllStep = 0;
+/* (traceAllStep est local à step) */
 static uint32_t traceFrom = 0;
 static void pushStack(uint32_t v) { regs[13] -= 4; writeWord(regs[13], v); }
 static uint32_t popStack(void) { uint32_t v = fetchWord(regs[13]); regs[13] += 4; return v; }
@@ -756,8 +756,9 @@ static void step(void) {
     /* trace instruction par instruction (comparaison TS) : avant toute
      * injection, état = ce qui va s'exécuter */
     static long stepNo = 0;
-    traceAllStep = getenv("TRACE_ALL") ? 1 : 0;
-    if (traceAllStep && tickCount < traceFrom) traceAllStep = 0;
+    static int traceAllOn = -1;
+    if (traceAllOn < 0) traceAllOn = getenv("TRACE_ALL") ? 1 : 0;
+    int traceAllStep = traceAllOn && tickCount >= traceFrom;
     if (traceAllStep)
         fprintf(stderr, "%ld %u %x %04x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n", stepNo, tickCount,
                 regs[15] - 2, fetchHalf(regs[15] - 2), regs[13],
@@ -811,7 +812,6 @@ static void step(void) {
     if (trace && (tickCount & 0x3ffff) == 0)
         fprintf(stderr, "[tick %u] pc=0x%x inst=%04x r0=%08x sp=%08x\n",
                 tickCount, instAddr, inst, regs[0], regs[13]);
-    uint16_t nextInst = fetchHalf(instAddr + 2);
     incrementPc();
 
     uint32_t op = inst;
@@ -1065,26 +1065,30 @@ static void step(void) {
      * (bit Thumb posé) : le TS fixe LR au second demi-mot — l'ancien port C
      * laissait LR = PC + off1<<12, ce qui corrompait tout retour bx lr.
      * La paire coûte 3 ticks et finit avec PC = cible+2, comme le TS. */
-    else if ((op & 0xf800) == 0xf000 && (nextInst & 0xf800) == 0xf800) {
-        int32_t off1 = op & 0x7ff;
-        if (off1 & 0x400) off1 |= ~0x7ff;
-        int32_t off2 = nextInst & 0x7ff;
-        uint32_t retour = regs[15];                      /* instAddr + 4 */
-        setReg(14, regs[15] + ((uint32_t)off1 << 12));   /* intermédiaire */
-        setReg(15, regs[14] + ((uint32_t)(off2 << 1)));  /* cible */
-        if (traceAllStep) { /* ligne du second demi-mot, comme le pas TS
-                             * (LR = valeur intermédiaire à ce stade) */
-            fprintf(stderr, "%ld %u %x %04x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n", stepNo, tickCount,
-                    retour - 2, nextInst, regs[13],
-                    regs[0], regs[1], regs[2], regs[3],
-                    regs[4], regs[5], regs[6], regs[7],
-                    regs[8], regs[9], regs[10], regs[11], regs[12], regs[14]);
-            stepNo++;
+    else if ((op & 0xf800) == 0xf000) { /* BL : second demi-mot lu paresseusement */
+        uint16_t nextInst = fetchHalf(instAddr + 2);
+        if ((nextInst & 0xf800) == 0xf800) {
+            int32_t off1 = op & 0x7ff;
+            if (off1 & 0x400) off1 |= ~0x7ff;
+            int32_t off2 = nextInst & 0x7ff;
+            uint32_t retour = regs[15];                      /* instAddr + 4 */
+            setReg(14, regs[15] + ((uint32_t)off1 << 12));   /* intermédiaire */
+            setReg(15, regs[14] + ((uint32_t)(off2 << 1)));  /* cible */
+            if (traceAllStep) { /* ligne du second demi-mot, comme le pas TS
+                                 * (LR = valeur intermédiaire à ce stade) */
+                fprintf(stderr, "%ld %u %x %04x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n", stepNo, tickCount,
+                        retour - 2, nextInst, regs[13],
+                        regs[0], regs[1], regs[2], regs[3],
+                        regs[4], regs[5], regs[6], regs[7],
+                        regs[8], regs[9], regs[10], regs[11], regs[12], regs[14]);
+                stepNo++;
+            }
+            setReg(14, retour | 1u);                         /* adresse de retour */
+            incrementPc(); /* second demi-mot : PC = cible+2 */
+            incrementPc(); /* troisième tick de la paire (pas du second demi-mot) */
+            regs[15] -= 2; /* état final du TS */
         }
-        setReg(14, retour | 1u);                         /* adresse de retour */
-        incrementPc(); /* second demi-mot : PC = cible+2 */
-        incrementPc(); /* troisième tick de la paire (pas du second demi-mot) */
-        regs[15] -= 2; /* état final du TS */
+        /* demi-mot 0xf0xx isolé : non décodé, on continue (comme le TS) */
     }
     else if (op == 0xf3bf || (op & 0xffe0) == 0xf3e0) { /* DMB/MRS : no-op ; le TS ajoute un tick pour DMB seul */
         if (op == 0xf3bf) incrementPc();
@@ -1159,10 +1163,10 @@ static uint8_t key_bit(SDL_Keycode sym) {
         case SDLK_LEFT: case SDLK_q: case SDLK_a: return BTN_LEFT;
         case SDLK_RIGHT: case SDLK_d: return BTN_RIGHT;
         case SDLK_UP: case SDLK_z: case SDLK_w: return BTN_UP;
-        case SDLK_j: return BTN_A;
-        case SDLK_k: return BTN_B;
-        case SDLK_u: return BTN_MENU;
-        case SDLK_i: return BTN_HOME;
+        case SDLK_j: case SDLK_SPACE: return BTN_A;            /* espace = A */
+        case SDLK_k: case SDLK_LCTRL: case SDLK_RCTRL: return BTN_B; /* ctrl = B */
+        case SDLK_u: case SDLK_RETURN: case SDLK_KP_ENTER: return BTN_MENU; /* entrée = start/menu */
+        case SDLK_i: case SDLK_ASTERISK: case SDLK_KP_MULTIPLY: return BTN_HOME; /* * = select/home */
         default: return 0;
     }
 }
@@ -1513,8 +1517,13 @@ int main(int argc, char **argv) {
                 }
             }
         }
-        if ((frame & 31) == 0) {
-            uint32_t ma = getenv("MILLIS_ADDR") ? (uint32_t)strtoul(getenv("MILLIS_ADDR"), NULL, 16) : 0x20002c48u;
+        if ((frame & 511) == 0) { /* remontée console toutes les 512 frames */
+            static int maInit = -1;
+            static uint32_t ma;
+            if (maInit < 0) {
+                maInit = 0;
+                ma = getenv("MILLIS_ADDR") ? (uint32_t)strtoul(getenv("MILLIS_ADDR"), NULL, 16) : 0x20002c48u;
+            }
             uint32_t millisVal = fetchWord(ma);
             fprintf(stderr, "[f%u] tick=%u pc=%08x millis=%u sysT=%ld stWr=%ld tc4f=%u tc4w=%u msWr=%ld\n",
                     frame, tickCount, regs[15], millisVal, sysTickEntries,
