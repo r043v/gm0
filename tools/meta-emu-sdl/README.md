@@ -1,8 +1,9 @@
 # meta-emu-sdl — émulateur Gamebuino META en C/SDL2 (expérimental)
 
 Port C du fork TypeScript (`output/gbemu/`) : interpréteur ARMv6-M Thumb,
-périphériques (ports, SERCOM4, DMAC, SysTick, TC4+DAC), carte SD SPI
-(image brute) et frontal SDL2 (fenêtre 320×256, clavier, audio 22 049 Hz).
+périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
+(image brute ou dossier FAT16 construit à la volée) et frontal SDL2
+(fenêtre 160×128, clavier, audio 22 049 Hz).
 
 ## Compilation
 
@@ -19,18 +20,57 @@ périphériques (ports, SERCOM4, DMAC, SysTick, TC4+DAC), carte SD SPI
   (.bin = firmware + carte = son répertoire ; .img ou dossier = carte).
 
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu \
-      out/<Jeu>/.pio/build/meta/firmware.bin --frames 300 --shot /tmp/shot.ppm
+      out/<Jeu>/.pio/build/meta/firmware.bin output/sd-card \
+      --frames 300 --shot /tmp/shot.ppm
 
-Touches : flèches, J=A, K=B, U=MENU, I=HOME.
+Touches : flèches, ZQSD/WASD, J=A, K=B, U=MENU, I=HOME.
 `FAT_DUMP=/tmp/x.img` : écrit l'image FAT générée depuis un répertoire
 (vérifiable avec mtools).
 
-## État (préalpha)
+## État
 
-- Le cœur démarre (vecteurs, init Arduino) mais diverge encore du fork
-  TypeScript dans les premiers millions de ticks : les jeux ne bootent pas
-  encore.  Débogage restant : comparaison instruction par instruction avec
-  la référence (`EMU_TRACE=1` pour tracer le PC).
-- Le port est fidèle au sémantique du TS (mêmes quirk : décodage paresseux
-  remplacé par un switch, même motif d'injection d'interruptions, même
-  hack SysTick à 20 000 ticks).
+Le boot est **paritairement validé contre le fork TypeScript** : mêmes
+hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,
+même splash Gamebuino au même tick (proportions de couleurs identiques),
+Millis avancant exactement d'1 ms par entrée SysTick, audio TC4/DAC actif
+(369 échantillons/frame), carte SD lue par le loader.
+
+Corrections par rapport au précédent WIP (les quatre causes racines du
+blocage « f1 / Millis gelé ») :
+- **masque push/pop** : `0xfe00` laissait tous les POP (0xbcxx-0xbdxx)
+  hors du décodeur (traités en no-op → effondrement de pile, chutes dans
+  le code suivant, faux « f1 retourne non-zéro »).  Le TS utilise 0xf600 ;
+- **retenue des additions** : calculée sur la somme tronquée 32 bits
+  (C=0 pour toute comparaison d'égalité) au lieu de la somme 64 bits ;
+- **MUL non masqué** : le TS laisse le produit en double JS (arrondi
+  au-delà de 2^53) — répliqué via des ombres flottantes des registres
+  (`regD`) et `fmod` exact ;
+- **BL** : LR doit pointer après la paire (l'ancien code laissait
+  LR = PC + off1<<12, corrompant tout retour `bx lr`) ; la paire coûte
+  3 ticks comme les deux demi-mots du TS.
+
+Écart résiduel connu : le compteur interne TC4 peut dériver de quelques
+ticks vers 6,9 M ticks (état interne de l'émulateur, invisible côté
+SRAM) ; sans effet observé sur l'écran ni l'audio.
+
+## Débogage (variables d'environnement)
+
+- `EMU_TRACE=1` : échantillonne le PC tous les 0x40000 ticks.
+- `TRACE_ALL=1` (+ `TRACE_FROM=<tick>`) : trace instruction par
+  instruction (pas, tick, pc, inst, sp, r0-r12, lr), même format que le
+  harnais TS `/tmp/ts_steptrace.js` — diff 1:1 avec la référence.
+- `STATE_HASH=1` (+ `HASH_INTERVAL=<ticks>`) : hachage FNV-1a des
+  registres + SRAM toutes les N ticks, avec dump des registres —
+  comparable à `/tmp/ts_hash.js`.
+- `SRAM_DUMP_AT=<tick>` (+ `SRAM_DUMP=<fichier>`) : dump de la SRAM à un
+  tick donné (vs `/tmp/ts_sramdump.js` côté TS).
+- `WATCH_ADDR=<hex>` : journalise les écritures mot vers cette adresse.
+- `MILLIS_ADDR=<hex>` (défaut 0x20002c48) : adresse de la variable Millis
+  affichée par frame ; `MILLIS_WATCH=<hex>` : compteur d'écritures.
+- `ADC_FIXED=1` : ADC RESULT constant (comparaison de trajectoires avec
+  le TS piloté au même ADC).
+
+Le port est fidèle à la sémantique du TS (mêmes quirks : décodage
+paresseux remplacé par un switch, même motif d'injection d'interruptions
+avec chaînage `else if`, même hack SysTick à 20 000 ticks, gouverneur
+TC4, lectures périphériques par largeur d'accès).
