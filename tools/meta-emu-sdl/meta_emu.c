@@ -1138,27 +1138,133 @@ static void audio_cb(void *ud, Uint8 *stream, int len) {
     }
 }
 
-/* boutons : bit0 bas, 1 gauche, 2 droite, 3 haut, 4 A, 5 B, 6 MENU, 7 HOME */
-static uint8_t keyBits(int sym, int down) {
-    uint8_t bit;
+/* boutons : bit0 bas, 1 gauche, 2 droite, 3 haut, 4 A, 5 B, 6 MENU, 7 HOME
+ * (actifs bas : 0 = enfoncé) */
+#define BTN_DOWN   (1u << 0)
+#define BTN_LEFT   (1u << 1)
+#define BTN_RIGHT  (1u << 2)
+#define BTN_UP     (1u << 3)
+#define BTN_A      (1u << 4)
+#define BTN_B      (1u << 5)
+#define BTN_MENU   (1u << 6)
+#define BTN_HOME   (1u << 7)
+#define BTN_DIRMASK (BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_UP)
+
+static uint32_t homeHeld;
+static unsigned machineEpoch; /* incrémenté quand un drop réinitialise la machine */
+
+static uint8_t key_bit(SDL_Keycode sym) {
     switch (sym) {
-        case SDLK_DOWN: case SDLK_s: bit = 0; break;
-        case SDLK_LEFT: case SDLK_q: case SDLK_a: bit = 1; break;
-        case SDLK_RIGHT: case SDLK_d: bit = 2; break;
-        case SDLK_UP: case SDLK_z: case SDLK_w: bit = 3; break;
-        case SDLK_j: bit = 4; break;
-        case SDLK_k: bit = 5; break;
-        case SDLK_u: bit = 6; break;
-        case SDLK_i: bit = 7; break;
+        case SDLK_DOWN: case SDLK_s: return BTN_DOWN;
+        case SDLK_LEFT: case SDLK_q: case SDLK_a: return BTN_LEFT;
+        case SDLK_RIGHT: case SDLK_d: return BTN_RIGHT;
+        case SDLK_UP: case SDLK_z: case SDLK_w: return BTN_UP;
+        case SDLK_j: return BTN_A;
+        case SDLK_k: return BTN_B;
+        case SDLK_u: return BTN_MENU;
+        case SDLK_i: return BTN_HOME;
         default: return 0;
     }
-    return (uint8_t)(1u << bit) & (down ? 0xff : 0); /* 0 = enfoncé (actif bas) */
+}
+
+static void btn_press(uint8_t mask) {
+    buttonData &= (uint8_t)~mask;
+    if (mask & BTN_HOME) homeHeld = SDL_GetTicks();
+}
+
+static void btn_release(uint8_t mask) {
+    buttonData |= mask;
+    if (mask & BTN_HOME) homeHeld = 0;
+}
+
+/* manette (SDL_GameController) */
+static uint8_t pad_button_mask(uint8_t b) {
+    switch (b) {
+        case SDL_CONTROLLER_BUTTON_A: return BTN_A;
+        case SDL_CONTROLLER_BUTTON_B: return BTN_B;
+        case SDL_CONTROLLER_BUTTON_START: return BTN_MENU;
+        case SDL_CONTROLLER_BUTTON_BACK: case SDL_CONTROLLER_BUTTON_GUIDE: return BTN_HOME;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return BTN_DOWN;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return BTN_LEFT;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return BTN_RIGHT;
+        case SDL_CONTROLLER_BUTTON_DPAD_UP: return BTN_UP;
+        default: return 0;
+    }
+}
+
+/* stick gauche -> croix directionnelle (zone morte ~18 %) */
+static uint8_t pad_dir_bits(SDL_GameController *pad) {
+    int16_t ax = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
+    int16_t ay = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+    const int16_t dz = 6000;
+    uint8_t m = 0;
+    if (ax < -dz) m |= BTN_LEFT;
+    if (ax > dz) m |= BTN_RIGHT;
+    if (ay < -dz) m |= BTN_UP;
+    if (ay > dz) m |= BTN_DOWN;
+    return m;
+}
+
+/* joystick sans mapping (boutons 0..3 = A, B, MENU, HOME ; chapeau = croix) */
+static uint8_t joy_button_mask(uint8_t b) {
+    switch (b) {
+        case 0: return BTN_A;
+        case 1: return BTN_B;
+        case 2: return BTN_MENU;
+        case 3: return BTN_HOME;
+        default: return 0;
+    }
+}
+
+static uint8_t joy_hat_bits(SDL_Joystick *joy) {
+    uint8_t h = SDL_JoystickGetHat(joy, 0);
+    uint8_t m = 0;
+    if (h & SDL_HAT_DOWN) m |= BTN_DOWN;
+    if (h & SDL_HAT_LEFT) m |= BTN_LEFT;
+    if (h & SDL_HAT_RIGHT) m |= BTN_RIGHT;
+    if (h & SDL_HAT_UP) m |= BTN_UP;
+    return m;
 }
 
 static char fwPath[1024];
+static const char *fwName = NULL;
 static int fwLoaded;
+static int sd_explicit; /* carte passée explicitement en ligne de commande */
 
-static void load_firmware(const char *p) {
+/* décharge la carte SD courante (image ou image FAT d'un répertoire) */
+static void sd_unload(void) {
+    free(sd_image); sd_image = NULL; sd_size = 0;
+    free(fatImage); fatImage = NULL; fatImageSize = 0;
+    free(fatTable); fatTable = NULL;
+    fatFileCount = 0; fatNext = 2;
+    sd_reset_state();
+    sd_initialized = 0;
+}
+
+/* réinitialise toute la machine (drop d'un nouveau firmware) */
+static void reset_machine(void) {
+    memset(sram, 0xff, SRAM_SIZE);
+    memset(regs, 0, sizeof regs);
+    memset(regD, 0, sizeof regD);
+    fN = fZ = fC = fV = 0;
+    tickCount = 0; sysTickTrigger = 0; sysTickEntries = 0;
+    sysTickVector = dmacVector = tc4Vector = 0;
+    dmacInterrupt = tc4Interrupt = 0;
+    dmac_baseAddr = dmac_wrbAddr = dmac_desc = dmac_chid = 0;
+    portA_out = portB_out = portA_dir = portB_dir = 0;
+    ser4_data = 0x80;
+    tc4Enabled = tc4Armed = 0;
+    tc4Top = tc4Counter = 0; tc4Period = 907;
+    tc4Window = tc4Fires = tc4Writes = 0;
+    lcd_xStart = lcd_xEnd = lcd_yStart = lcd_yEnd = lcd_x = lcd_y = 0;
+    lcd_argIndex = lcd_lastCommand = lcd_tmp = 0;
+    memset(pix, 0, sizeof pix);
+    millisWrites = 0;
+    aq_head = aq_tail = 0; audioHold = 0;
+    sd_unload();
+}
+
+static void load_firmware(const char *p, int rebindCard) {
     FILE *f = fopen(p, "rb");
     if (!f) { fprintf(stderr, "firmware introuvable : %s\n", p); return; }
     memset(flash, 0xff, FLASH_SIZE); /* comme le TS : flash remplie de 0xff */
@@ -1167,10 +1273,14 @@ static void load_firmware(const char *p) {
     }
     fclose(f);
     snprintf(fwPath, sizeof(fwPath), "%s", p);
+    const char *b = strrchr(fwPath, '/');
+    fwName = b ? b + 1 : fwPath;
     fwLoaded = 1;
     printf("firmware : %s\n", p);
-    /* la carte SD est, par défaut, le répertoire du binaire */
-    if (!sd_image && !fatImage) {
+    /* la carte SD est le répertoire contenant le firmware ; une carte
+     * passée en ligne de commande ne rebind pas au premier lancement */
+    if (rebindCard || !sd_explicit) {
+        sd_unload();
         char dirbuf[1024];
         snprintf(dirbuf, sizeof(dirbuf), "%s", p);
         char *slash = strrchr(dirbuf, '/');
@@ -1183,16 +1293,15 @@ static void load_firmware(const char *p) {
 
 static void load_sd_from_path(const char *p) {
     struct stat st;
-    if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) { fat_build_from_dir(p); sd_reset_state(); sd_initialized = 0; return; }
+    if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) { sd_unload(); fat_build_from_dir(p); return; }
     FILE *g = fopen(p, "rb");
     if (!g) { fprintf(stderr, "carte introuvable : %s\n", p); return; }
     fseek(g, 0, SEEK_END); long sz = ftell(g); fseek(g, 0, SEEK_SET);
-    if (sd_image) free(sd_image);
+    sd_unload();
     sd_image = malloc((size_t)sz);
     fread(sd_image, 1, (size_t)sz, g);
     sd_size = (size_t)sz;
     fclose(g);
-    sd_reset_state(); sd_initialized = 0; /* comme loadImage du TS */
     printf("carte SD : image %s (%ld Kio)\n", p, sz / 1024);
 }
 
@@ -1210,10 +1319,9 @@ static void boot_vectors(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "Usage : meta_emu <firmware.bin> [carte.img] [--wav out.wav]\n");
-        return 1;
-    }
+    if (argc < 2)
+        fprintf(stderr, "meta_emu : lancé sans firmware — déposez un .bin "
+                        "dans la fenêtre (carte SD = son répertoire).\n");
     memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
     if (getenv("MILLIS_WATCH")) millisWatchAddr = (uint32_t)strtoul(getenv("MILLIS_WATCH"), NULL, 16);
     if (getenv("WATCH_ADDR")) watchAddr = (uint32_t)strtoul(getenv("WATCH_ADDR"), NULL, 16);
@@ -1233,10 +1341,10 @@ int main(int argc, char **argv) {
         } else {
             const char *ext = strrchr(argv[i], '.');
             struct stat st;
-            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) load_sd_from_path(argv[i]);
-            else if (ext && strcasecmp(ext, ".img") == 0) load_sd_from_path(argv[i]);
-            else if (!fwLoaded) load_firmware(argv[i]);
-            else load_sd_from_path(argv[i]);
+            if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) { load_sd_from_path(argv[i]); sd_explicit = 1; }
+            else if (ext && strcasecmp(ext, ".img") == 0) { load_sd_from_path(argv[i]); sd_explicit = 1; }
+            else if (!fwLoaded) load_firmware(argv[i], 0);
+            else { load_sd_from_path(argv[i]); sd_explicit = 1; }
         }
     }
     if (fwLoaded) boot_vectors();
@@ -1249,17 +1357,43 @@ int main(int argc, char **argv) {
     uint64_t frameStart = SDL_GetPerformanceCounter();
     const uint64_t frameTicks = 334860; /* 16743 µs émulées */
     uint32_t nextFrameTick = 334860;
-    uint32_t homeHeld = 0;
+    uint8_t padDirBits = 0; /* directions tenues par stick/chapeau */
+    unsigned seenEpoch = 0;
+    /* % de vitesse dans la barre de titre : échantillonné toutes les 500 ms */
+    Uint32 titleMs = SDL_GetTicks();
+    uint32_t titleTick = tickCount;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
     SDL_Window *win;
     SDL_Renderer *ren;
-    if (SDL_CreateWindowAndRenderer(SCREEN_W * 2, SCREEN_H * 2, 0, &win, &ren) != 0) {
+    if (SDL_CreateWindowAndRenderer(SCREEN_W * 2, SCREEN_H * 2,
+                                    SDL_WINDOW_RESIZABLE, &win, &ren) != 0) {
         fprintf(stderr, "fenêtre: %s\n", SDL_GetError());
         return 1;
+    }
+    /* échelle logique 160×128 : la fenêtre est redimensionnable, rendu
+     * entier (pixels carrés) et centré */
+    SDL_RenderSetLogicalSize(ren, SCREEN_W, SCREEN_H);
+    SDL_RenderSetIntegerScale(ren, SDL_TRUE);
+
+    /* manette déjà branchée : contrôleur sinon joystick brut */
+    SDL_GameController *pad = NULL;
+    SDL_Joystick *joyFb = NULL;
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) { pad = SDL_GameControllerOpen(i); if (pad) break; }
+        else if (!joyFb) joyFb = SDL_JoystickOpen(i);
+    }
+    if (pad) printf("manette : %s\n", SDL_GameControllerName(pad));
+    else if (joyFb) printf("joystick : %s\n", SDL_JoystickName(joyFb));
+
+    { /* titre initial */
+        char title[1200];
+        if (fwLoaded) snprintf(title, sizeof(title), "META — %.900s", fwName);
+        else snprintf(title, sizeof(title), "META — déposez un firmware .bin");
+        SDL_SetWindowTitle(win, title);
     }
     tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
                             SDL_TEXTUREACCESS_STREAMING, SCREEN_W, SCREEN_H);
@@ -1271,6 +1405,7 @@ int main(int argc, char **argv) {
     audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
     audioOk = audioDev != 0;
     if (!audioOk) fprintf(stderr, "audio indisponible : %s\n", SDL_GetError());
+    if (audioOk && fwLoaded) SDL_PauseAudioDevice(audioDev, 0); /* lancé au boot */
 
     if (wavPathStr[0]) {
         wavFile = fopen(wavPathStr, "wb");
@@ -1300,24 +1435,81 @@ int main(int argc, char **argv) {
                     load_sd_from_path(fp);
                 } else if (ext && strcasecmp(ext, ".img") == 0) {
                     load_sd_from_path(fp);
-                } else if (ext && strcasecmp(ext, ".bin") == 0) {
-                    load_firmware(fp);
-                    boot_vectors();
-                    if (audioOk) SDL_PauseAudioDevice(audioDev, 0);
                 } else {
-                    load_sd_from_path(fp);
+                    /* tout le reste = firmware : la carte SD devient son
+                     * répertoire, la machine repart de zéro */
+                    reset_machine();
+                    load_firmware(fp, 1);
+                    if (fwLoaded) {
+                        boot_vectors();
+                        if (audioOk) SDL_PauseAudioDevice(audioDev, 0);
+                        machineEpoch++;
+                    }
                 }
                 SDL_free(fp);
+                { /* titre immédiat */
+                    char title[1200];
+                    if (fwLoaded) snprintf(title, sizeof(title), "META — %.900s", fwName);
+                    else snprintf(title, sizeof(title), "META — déposez un firmware .bin");
+                    SDL_SetWindowTitle(win, title);
+                }
             }
             else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
-                uint8_t bit = keyBits(ev.key.keysym.sym, ev.type == SDL_KEYDOWN);
-                if (bit) {
-                    if (bit & (1u << 7)) {
-                        homeHeld = ev.type == SDL_KEYDOWN ? SDL_GetTicks() : 0;
-                        if (ev.type == SDL_KEYDOWN) buttonData &= (uint8_t)~bit;
-                        else buttonData |= bit;
-                    } else if (ev.type == SDL_KEYDOWN) buttonData &= (uint8_t)~bit;
-                    else buttonData |= bit;
+                uint8_t m = key_bit(ev.key.keysym.sym);
+                if (m) {
+                    if (ev.type == SDL_KEYDOWN) btn_press(m);
+                    else btn_release(m);
+                }
+            }
+            else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+                if (!pad && SDL_IsGameController(ev.cdevice.which)) {
+                    pad = SDL_GameControllerOpen(ev.cdevice.which);
+                    if (pad) printf("manette : %s\n", SDL_GameControllerName(pad));
+                }
+            }
+            else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+                if (pad && SDL_GameControllerGetAttached(pad) == SDL_FALSE) {
+                    SDL_GameControllerClose(pad); pad = NULL;
+                }
+            }
+            else if (ev.type == SDL_JOYDEVICEADDED) {
+                if (!pad && !joyFb && !SDL_IsGameController(ev.jdevice.which))
+                    joyFb = SDL_JoystickOpen(ev.jdevice.which);
+            }
+            else if (ev.type == SDL_JOYDEVICEREMOVED) {
+                if (joyFb && SDL_JoystickGetAttached(joyFb) == SDL_FALSE) {
+                    SDL_JoystickClose(joyFb); joyFb = NULL;
+                }
+            }
+            else if (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) {
+                uint8_t m = pad ? pad_button_mask(ev.cbutton.button) : 0;
+                if (m) {
+                    if (ev.type == SDL_CONTROLLERBUTTONDOWN) btn_press(m);
+                    else btn_release(m);
+                }
+            }
+            else if (ev.type == SDL_CONTROLLERAXISMOTION) {
+                if (pad && (ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX ||
+                            ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY)) {
+                    uint8_t want = pad_dir_bits(pad) & BTN_DIRMASK;
+                    btn_release(padDirBits & ~want);  /* directions quittées */
+                    btn_press(want & ~padDirBits);    /* directions nouvellement dans la zone */
+                    padDirBits = want;
+                }
+            }
+            else if (ev.type == SDL_JOYBUTTONDOWN || ev.type == SDL_JOYBUTTONUP) {
+                uint8_t m = joyFb ? joy_button_mask(ev.jbutton.button) : 0;
+                if (m) {
+                    if (ev.type == SDL_JOYBUTTONDOWN) btn_press(m);
+                    else btn_release(m);
+                }
+            }
+            else if (ev.type == SDL_JOYHATMOTION) {
+                if (joyFb) {
+                    uint8_t want = joy_hat_bits(joyFb);
+                    btn_release(padDirBits & ~want);
+                    btn_press(want & ~padDirBits);
+                    padDirBits = want;
                 }
             }
         }
@@ -1339,13 +1531,45 @@ int main(int argc, char **argv) {
             nextMark += 2000000;
         }
         if (homeHeld && SDL_GetTicks() - homeHeld > 3000) { /* reset maison */ }
+        if (machineEpoch != seenEpoch) {
+            /* un drop a réinitialisé la machine : resynchronise le pas de
+             * frame et le chronométrage temps réel */
+            seenEpoch = machineEpoch;
+            nextFrameTick = tickCount + frameTicks;
+            frameStart = SDL_GetPerformanceCounter();
+            titleTick = tickCount;
+            titleMs = SDL_GetTicks();
+        }
         if (maxFrames && frame >= maxFrames) break;
 
         /* une frame émulée */
         uint32_t target = nextFrameTick;
-        while (tickCount < target && running) step();
+        if (fwLoaded) {
+            while (tickCount < target && running) step();
+        }
         nextFrameTick += frameTicks;
         frame++;
+
+        /* % de vitesse : ticks émulés / temps mural, dans le titre */
+        {
+            Uint32 nowMs = SDL_GetTicks();
+            if (nowMs - titleMs >= 500) {
+                char title[1200];
+                if (fwLoaded) {
+                    double emuMs = (double)(tickCount - titleTick) / 20000.0;
+                    double wallMs = (double)(nowMs - titleMs);
+                    int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
+                    if (pct < 0) pct = 0;
+                    if (pct > 9999) pct = 9999;
+                    snprintf(title, sizeof(title), "META — %.900s — %d%%", fwName, pct);
+                } else {
+                    snprintf(title, sizeof(title), "META — déposez un firmware .bin");
+                }
+                SDL_SetWindowTitle(win, title);
+                titleMs = nowMs;
+                titleTick = tickCount;
+            }
+        }
 
         blit(ren);
         if (trace) { /* empreinte d'écran périodique */

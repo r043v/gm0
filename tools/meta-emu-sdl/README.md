@@ -11,21 +11,30 @@ périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
 
 ## Usage
 
-    ./meta_emu <firmware.bin> [carte] [--frames N] [--shot out.ppm] [--wav out.wav]
+    ./meta_emu [firmware.bin] [carte] [--frames N] [--shot out.ppm] [--wav out.wav]
 
+- Lancé **sans argument**, la fenêtre s'ouvre vide : **déposez** un
+  **.bin** (le firmware ; la carte SD devient son répertoire), une
+  **image .img** ou un **dossier** (la carte seule).
 - `<carte>` = une **image .img** OU un **répertoire** (construit en FAT16 à
   la volée ; les .SAV écrits par le jeu sont réécrits dans les fichiers).
-- Par défaut, la carte est **le répertoire du .bin** chargé.
-- Lancé sans argument : la fenêtre s'ouvre vide et accepte les **dépôts**
-  (.bin = firmware + carte = son répertoire ; .img ou dossier = carte).
+- **La carte SD est par défaut le répertoire contenant le firmware** ;
+  une carte passée explicitement en ligne de commande reste prioritaire,
+  et tout drop de firmware rebascule la carte sur son répertoire.
+- La fenêtre est **redimensionnable** (échelle entière, pixels carrés) et
+  la **barre de titre** affiche le **% de vitesse** (ticks émulés / temps
+  réel, mis à jour toutes les 500 ms).
 
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu \
       out/<Jeu>/.pio/build/meta/firmware.bin output/sd-card \
       --frames 300 --shot /tmp/shot.ppm
 
 Touches : flèches, ZQSD/WASD, J=A, K=B, U=MENU, I=HOME.
-`FAT_DUMP=/tmp/x.img` : écrit l'image FAT générée depuis un répertoire
-(vérifiable avec mtools).
+
+**Manette** (SDL_GameController ; bascule automatique sur joystick brut) :
+A=A, B=B, Start=MENU, Back/Guide=HOME, croix directionnelle et stick
+gauche = directions.  Joystick sans mapping : boutons 0=A, 1=B, 2=MENU,
+3=HOME, chapeau 0 = directions.  Branchement/débranchement à chaud géré.
 
 ## État
 
@@ -55,6 +64,8 @@ SRAM) ; sans effet observé sur l'écran ni l'audio.
 
 ## Débogage (variables d'environnement)
 
+- `FAT_DUMP=/tmp/x.img` : écrit l'image FAT générée depuis un répertoire
+  (vérifiable avec mtools).
 - `EMU_TRACE=1` : échantillonne le PC tous les 0x40000 ticks.
 - `TRACE_ALL=1` (+ `TRACE_FROM=<tick>`) : trace instruction par
   instruction (pas, tick, pc, inst, sp, r0-r12, lr), même format que le
