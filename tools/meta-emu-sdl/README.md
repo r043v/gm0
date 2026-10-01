@@ -1,15 +1,17 @@
-# meta-emu-sdl — émulateur Gamebuino META en C/SDL2 (expérimental)
+# meta-emu-sdl — émulateur Gamebuino META en C/SDL2 + WebAssembly
 
 Port C du fork TypeScript (`output/gbemu/`) : interpréteur ARMv6-M Thumb,
 périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
 (image brute ou dossier FAT16 construit à la volée) et frontal SDL2
-(fenêtre 160×128, clavier, audio 22 049 Hz).
+(fenêtre 160×128, clavier, audio 22 049 Hz).  Se compile aussi en
+**WebAssembly** (même cœur, navigateur).
 
 ## Compilation
 
-    make        # (SDL2 via pkg-config)
+    make        # natif (SDL2 via pkg-config)
+    make wasm   # navigateur (nécessite emsdk : source ~/emsdk/emsdk_env.sh)
 
-## Usage
+## Usage (natif)
 
     ./meta_emu [firmware.bin] [carte] [--frames N] [--shot out.ppm] [--wav out.wav]
 
@@ -39,6 +41,24 @@ Touches : flèches, ZQSD/WASD, **Entrée**=Start (MENU), **Espace**=A,
 A=A, B=B, Start=MENU, Back/Guide=HOME, croix directionnelle et stick
 gauche = directions.  Joystick sans mapping : boutons 0=A, 1=B, 2=MENU,
 3=HOME, chapeau 0 = directions.  Branchement/débranchement à chaud géré.
+
+## Usage (navigateur)
+
+    cd wasm && python3 -m http.server 8000
+    # ouvrir http://localhost:8000/
+
+- **Déposez** un .bin (firmware), une image .img, ou un **dossier de jeu**
+  (traversé récursivement) — ou cliquez pour choisir un dossier
+  (`webkitdirectory`) : un .bin unique du dossier devient le firmware,
+  les autres fichiers construisent la carte SD en mémoire (comme le fork
+  TS).  Les .SAV écrits en jeu modifient les tampons en mémoire
+  (persistance inter-sessions non exportée pour l'instant).
+- L'audio WebAudio démarre au premier chargement (geste navigateur) ;
+  le % de vitesse s'affiche dans le titre de l'onglet.
+- Les `.GB` streamés depuis la carte fonctionnent (FAT16 virtuelle).
+- `index.html?test` : charge `./test/firmware.bin` + fichiers de
+  `./test/` servis à côté (hook de test local ; `wasm/test/` est
+  ignoré par git — y déposer un firmware et des jeux pour essayer).
 
 ## État
 

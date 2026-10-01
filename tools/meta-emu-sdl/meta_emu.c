@@ -303,9 +303,29 @@ static void to83(const char *name, char used[][12], int nUsed, char out[12]) {
 static int fatTotalSectors;
 static uint8_t *fatImage;
 static size_t   fatImageSize;
-typedef struct { uint32_t lba; size_t bytes; char path[1024]; } FatFile;
+typedef struct { uint32_t lba; size_t bytes; char path[1024]; uint8_t *mem; } FatFile;
 static FatFile  fatFiles[512];
 static int      fatFileCount;
+
+/* liste de fichiers virtuels (navigateur : drop/dossier -> données en
+ * mémoire) ; le natif garde opendir via fat_build_from_dir */
+typedef struct { char path[1024]; uint8_t *data; size_t size; } VFile;
+static VFile vfiles[512];
+static int   nvfiles;
+
+static void vfiles_reset(void) {
+    for (int i = 0; i < nvfiles; i++) free(vfiles[i].data);
+    nvfiles = 0;
+}
+
+static void vfiles_add(const char *path, const uint8_t *data, size_t len) {
+    if (nvfiles >= 512) return;
+    VFile *v = &vfiles[nvfiles++];
+    snprintf(v->path, sizeof(v->path), "%s", path);
+    v->data = malloc(len ? len : 1);
+    memcpy(v->data, data, len);
+    v->size = len;
+}
 
 static int fat_used_find(char used[][12], int n, const char *s) {
     for (int i = 0; i < n; i++) if (!strcmp(used[i], s)) return 1;
@@ -420,13 +440,13 @@ static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
     *outEntries = ents; *outN = n;
 }
 
-static void fat_build_from_dir(const char *dir) {
+/* amorce du volume : secteurs de boot + table FAT vide */
+static void fat_bootstrap(void) {
     fatImageSize = (size_t)FAT_TOTAL * FAT_SECTOR;
     fatImage = calloc(1, fatImageSize);
     fatTable = calloc(65 * FAT_SECTOR, 1);
     fatTable[0] = 0xf8; fatTable[1] = 0xff;
     fatTable[2] = 0xff; fatTable[3] = 0xff;
-    uint16_t fatsz = 65;
     fatImage[0] = 0xeb; fatImage[1] = 0x3c; fatImage[2] = 0x90;
     memcpy(fatImage + 3, "GBREMU", 6);
     fatImage[0x0b] = 0x00; fatImage[0x0c] = 0x02;
@@ -442,32 +462,125 @@ static void fat_build_from_dir(const char *dir) {
     fatImage[0x20] = total & 0xff; fatImage[0x21] = (total >> 8) & 0xff;
     fatImage[0x22] = (total >> 16) & 0xff; fatImage[0x23] = (total >> 24) & 0xff;
     fatImage[510] = 0x55; fatImage[511] = 0xaa;
-    /* racine */
-    FatEnt *root = NULL; int nRoot = 0;
-    fat_walk(dir, 0, 1, &root, &nRoot);
+}
+
+static FatEnt *rootEnts; /* entrées de la racine, consommées par fat_finish */
+static int rootN;
+
+/* écrit la racine puis recopie les 2 FAT (la table a été remplie par les
+ * allocations) */
+static void fat_finish(const char *label) {
+    uint16_t fatsz = 65;
     uint8_t *rootBuf = calloc(FAT_ROOT * 32, 1);
     int off = 0;
-    for (int i = 0; i < nRoot; i++) {
-        memcpy(rootBuf + off, root[i].name83, 11);
-        rootBuf[off + 11] = root[i].isDir ? 0x10 : 0x20;
-        rootBuf[off + 26] = root[i].first & 0xff;
-        rootBuf[off + 27] = root[i].first >> 8;
-        rootBuf[off + 28] = root[i].size & 0xff; rootBuf[off + 29] = (root[i].size >> 8) & 0xff;
-        rootBuf[off + 30] = (root[i].size >> 16) & 0xff; rootBuf[off + 31] = (root[i].size >> 24) & 0xff;
+    for (int i = 0; i < rootN; i++) {
+        memcpy(rootBuf + off, rootEnts[i].name83, 11);
+        rootBuf[off + 11] = rootEnts[i].isDir ? 0x10 : 0x20;
+        rootBuf[off + 26] = rootEnts[i].first & 0xff;
+        rootBuf[off + 27] = rootEnts[i].first >> 8;
+        rootBuf[off + 28] = rootEnts[i].size & 0xff; rootBuf[off + 29] = (rootEnts[i].size >> 8) & 0xff;
+        rootBuf[off + 30] = (rootEnts[i].size >> 16) & 0xff; rootBuf[off + 31] = (rootEnts[i].size >> 24) & 0xff;
         off += 32;
     }
     uint32_t rootLba = 1 + 2 * fatsz;
     memcpy(fatImage + rootLba * FAT_SECTOR, rootBuf, FAT_ROOT * 32);
-    /* les 2 FAT (la table a été remplie par les allocations) */
     memcpy(fatImage + FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
     memcpy(fatImage + (1 + fatsz) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
-    free(rootBuf); free(root);
+    free(rootBuf); free(rootEnts); rootEnts = NULL; rootN = 0;
     if (getenv("FAT_DUMP")) {
         FILE *g = fopen(getenv("FAT_DUMP"), "wb");
         if (g) { fwrite(fatImage, 1, fatImageSize, g); fclose(g);
                  printf("image FAT test : %s\n", getenv("FAT_DUMP")); }
     }
-    printf("carte SD : répertoire %s (%d fichiers)\n", dir, fatFileCount);
+    printf("carte SD : %s (%d fichiers)\n", label, fatFileCount);
+}
+
+static void fat_build_from_dir(const char *dir) {
+    fat_bootstrap();
+    rootEnts = NULL; rootN = 0;
+    fat_walk(dir, 0, 1, &rootEnts, &rootN);
+    fat_finish(dir);
+}
+
+/* ---- construction depuis les fichiers virtuels (navigateur) ---- */
+
+static void fat_walk_vfiles(const char *prefix, uint32_t parentFirst, int isRoot,
+                            FatEnt **outEntries, int *outN) {
+    int prefixLen = (int)strlen(prefix);
+    char used[256][12]; int nUsed = 0;
+    FatEnt *ents = calloc(256, sizeof(FatEnt));
+    int n = 0;
+    /* premier niveau : fichiers du préfixe sans '/', puis dossiers */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < nvfiles && n < 200; i++) {
+            const char *p = vfiles[i].path;
+            if (strncmp(p, prefix, prefixLen) != 0) continue;
+            const char *rest = p + prefixLen;
+            if (!*rest) continue;
+            const char *slash = strchr(rest, '/');
+            int isDir = slash != NULL;
+            if ((pass == 0) != (!isDir)) continue;
+            int nameLen = isDir ? (int)(slash - rest) : (int)strlen(rest);
+            char name[1024];
+            memcpy(name, rest, nameLen); name[nameLen] = 0;
+            /* doublon déjà vu (plusieurs fichiers dans le même dossier) */
+            int seen = 0;
+            for (int j = 0; j < n; j++)
+                if ((int)strlen(ents[j].path) == prefixLen + nameLen &&
+                    strncmp(ents[j].path, p, prefixLen + nameLen) == 0) { seen = 1; break; }
+            if (seen) continue;
+            to83(name, used, nUsed++, ents[n].name83);
+            ents[n].isDir = isDir;
+            ents[n].size = isDir ? 0 : (uint32_t)vfiles[i].size;
+            snprintf(ents[n].path, sizeof(ents[n].path), "%.*s", prefixLen + nameLen, p);
+            n++;
+        }
+    }
+    /* alloue dossiers puis fichiers ; écrit les données */
+    for (int i = 0; i < n; i++) {
+        if (ents[i].isDir) {
+            ents[i].first = fat_alloc_dir_data();
+        } else {
+            int clusters = (int)((ents[i].size + FAT_SPC * FAT_SECTOR - 1) / (FAT_SPC * FAT_SECTOR));
+            if (clusters == 0) clusters = 1;
+            ents[i].first = fat_alloc(clusters);
+            /* retrouve les données du vfile */
+            for (int j = 0; j < nvfiles; j++) {
+                if (strcmp(vfiles[j].path, ents[i].path) == 0) {
+                    uint8_t *dst = fatImage + fat_data_lba(ents[i].first) * FAT_SECTOR;
+                    memset(dst, 0, (size_t)clusters * FAT_SPC * FAT_SECTOR);
+                    memcpy(dst, vfiles[j].data, vfiles[j].size);
+                    if (fatFileCount < 512) {
+                        fatFiles[fatFileCount].lba = fat_data_lba(ents[i].first);
+                        fatFiles[fatFileCount].bytes = ents[i].size;
+                        fatFiles[fatFileCount].mem = vfiles[j].data;
+                        fatFiles[fatFileCount].path[0] = 0;
+                        fatFileCount++;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    /* sous-dossiers (récursif) */
+    for (int i = 0; i < n; i++) {
+        if (ents[i].isDir) {
+            FatEnt *sub = NULL; int nSub = 0;
+            char subPrefix[1024];
+            snprintf(subPrefix, sizeof(subPrefix), "%s/", ents[i].path);
+            fat_walk_vfiles(subPrefix, ents[i].first, 0, &sub, &nSub);
+            fat_write_dir_data(ents[i].first, sub, nSub, ents[i].first, isRoot ? 0 : parentFirst, isRoot);
+            free(sub);
+        }
+    }
+    *outEntries = ents; *outN = n;
+}
+
+static void fat_build_from_vfiles(void) {
+    fat_bootstrap();
+    rootEnts = NULL; rootN = 0;
+    fat_walk_vfiles("", 0, 1, &rootEnts, &rootN);
+    fat_finish("fichiers déposés");
 }
 
 /* écriture CMD24 : répercute dans le fichier local si le secteur appartient
@@ -475,8 +588,14 @@ static void fat_build_from_dir(const char *dir) {
 static void sd_write_persist(uint32_t lba, const uint8_t *data) {
     for (int i = 0; i < fatFileCount; i++) {
         if (lba >= fatFiles[i].lba && (lba - fatFiles[i].lba) * 512 < fatFiles[i].bytes) {
-            FILE *g = fopen(fatFiles[i].path, "r+b");
-            if (g) { fwrite(data, 1, 512, g); fclose(g); }
+            if (fatFiles[i].mem) {
+                /* fichier virtuel (navigateur) : écrit dans le tampon ;
+                 * l'export inter-sessions est géré côté JS */
+                memcpy(fatFiles[i].mem + (lba - fatFiles[i].lba) * 512, data, 512);
+            } else {
+                FILE *g = fopen(fatFiles[i].path, "r+b");
+                if (g) { fwrite(data, 1, 512, g); fclose(g); }
+            }
             return;
         }
     }
@@ -1235,12 +1354,24 @@ static const char *fwName = NULL;
 static int fwLoaded;
 static int sd_explicit; /* carte passée explicitement en ligne de commande */
 
+static SDL_Window *emuWin;
+static SDL_Renderer *emuRen;
+static SDL_GameController *pad;
+static SDL_Joystick *joyFb;
+static uint8_t padDirBits; /* directions tenues par stick/chapeau */
+
+#define EMU_FRAME_TICKS 334860u /* 16743 µs émulées */
+static uint32_t emu_nextFrameTick = EMU_FRAME_TICKS;
+static Uint32 titleMs;
+static uint32_t titleTick;
+
 /* décharge la carte SD courante (image ou image FAT d'un répertoire) */
 static void sd_unload(void) {
     free(sd_image); sd_image = NULL; sd_size = 0;
     free(fatImage); fatImage = NULL; fatImageSize = 0;
     free(fatTable); fatTable = NULL;
     fatFileCount = 0; fatNext = 2;
+    vfiles_reset();
     sd_reset_state();
     sd_initialized = 0;
 }
@@ -1265,25 +1396,36 @@ static void reset_machine(void) {
     memset(pix, 0, sizeof pix);
     millisWrites = 0;
     aq_head = aq_tail = 0; audioHold = 0;
+    emu_nextFrameTick = tickCount + EMU_FRAME_TICKS;
     sd_unload();
+}
+
+static void load_firmware_data(const uint8_t *data, size_t len, const char *display) {
+    memset(flash, 0xff, FLASH_SIZE); /* comme le TS : flash remplie de 0xff */
+    size_t n = len < (FLASH_SIZE - 0x4000) ? len : (FLASH_SIZE - 0x4000);
+    if (n == 0) { fprintf(stderr, "firmware vide\n"); return; }
+    memcpy(flash + 0x4000, data, n);
+    snprintf(fwPath, sizeof(fwPath), "%s", display);
+    const char *b = strrchr(fwPath, '/');
+    fwName = b ? b + 1 : fwPath;
+    fwLoaded = 1;
+    printf("firmware : %s (%zu Ko)\n", display, len / 1024);
 }
 
 static void load_firmware(const char *p, int rebindCard) {
     FILE *f = fopen(p, "rb");
     if (!f) { fprintf(stderr, "firmware introuvable : %s\n", p); return; }
-    memset(flash, 0xff, FLASH_SIZE); /* comme le TS : flash remplie de 0xff */
-    if (fread(flash + 0x4000, 1, FLASH_SIZE - 0x4000, f) == 0) {
-        fprintf(stderr, "firmware vide\n"); fclose(f); return;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *data = malloc((size_t)sz);
+    if (fread(data, 1, (size_t)sz, f) == 0) {
+        fprintf(stderr, "firmware vide\n"); free(data); fclose(f); return;
     }
     fclose(f);
-    snprintf(fwPath, sizeof(fwPath), "%s", p);
-    const char *b = strrchr(fwPath, '/');
-    fwName = b ? b + 1 : fwPath;
-    fwLoaded = 1;
-    printf("firmware : %s\n", p);
+    load_firmware_data(data, (size_t)sz, p);
+    free(data);
     /* la carte SD est le répertoire contenant le firmware ; une carte
      * passée en ligne de commande ne rebind pas au premier lancement */
-    if (rebindCard || !sd_explicit) {
+    if (fwLoaded && (rebindCard || !sd_explicit)) {
         sd_unload();
         char dirbuf[1024];
         snprintf(dirbuf, sizeof(dirbuf), "%s", p);
@@ -1321,6 +1463,203 @@ static void boot_vectors(void) {
     fprintf(stderr, "SP=%08x PC=%08x systick=%08x dmac=%08x tc4=%08x\n",
             regs[13], regs[15], sysTickVector, dmacVector, tc4Vector);
 }
+
+static void refresh_title(void) {
+    char title[1200];
+    if (fwLoaded) snprintf(title, sizeof(title), "META — %.900s", fwName);
+    else snprintf(title, sizeof(title), "META — déposez un firmware .bin");
+    SDL_SetWindowTitle(emuWin, title);
+}
+
+static void audio_start(void) {
+    if (audioOk) SDL_PauseAudioDevice(audioDev, 0);
+}
+
+/* ------------------------------------------------ SDL/HTML5 ------------ */
+
+static int sdl_init_all(void) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
+        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+        return 1;
+    }
+    if (SDL_CreateWindowAndRenderer(SCREEN_W * 2, SCREEN_H * 2,
+                                    SDL_WINDOW_RESIZABLE, &emuWin, &emuRen) != 0) {
+        fprintf(stderr, "fenêtre: %s\n", SDL_GetError());
+        return 1;
+    }
+    /* échelle logique 160×128 : redimensionnable, rendu entier, centré */
+    SDL_RenderSetLogicalSize(emuRen, SCREEN_W, SCREEN_H);
+    SDL_RenderSetIntegerScale(emuRen, SDL_TRUE);
+
+    /* manette déjà branchée : contrôleur sinon joystick brut */
+    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+        if (SDL_IsGameController(i)) { pad = SDL_GameControllerOpen(i); if (pad) break; }
+        else if (!joyFb) joyFb = SDL_JoystickOpen(i);
+    }
+    if (pad) printf("manette : %s\n", SDL_GameControllerName(pad));
+    else if (joyFb) printf("joystick : %s\n", SDL_JoystickName(joyFb));
+
+    refresh_title();
+    tex = SDL_CreateTexture(emuRen, SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STREAMING, SCREEN_W, SCREEN_H);
+
+    SDL_AudioSpec want, got;
+    memset(&want, 0, sizeof(want));
+    want.freq = 22049; want.format = AUDIO_S16SYS; want.channels = 1;
+    want.samples = 2048; want.callback = audio_cb;
+    audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+    audioOk = audioDev != 0;
+    if (!audioOk) fprintf(stderr, "audio indisponible : %s\n", SDL_GetError());
+    if (audioOk && fwLoaded) audio_start();
+    return 0;
+}
+
+/* boucle d'événements ; renvoie 0 pour quitter */
+static int poll_events(void) {
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT) return 0;
+#ifndef __EMSCRIPTEN__
+        else if (ev.type == SDL_DROPFILE) { /* le navigateur gère ses drops */
+            char *fp = ev.drop.file;
+            const char *ext = strrchr(fp, '.');
+            struct stat st;
+            printf("déposé : %s\n", fp);
+            if (stat(fp, &st) == 0 && S_ISDIR(st.st_mode)) {
+                load_sd_from_path(fp);
+            } else if (ext && strcasecmp(ext, ".img") == 0) {
+                load_sd_from_path(fp);
+            } else {
+                /* tout le reste = firmware : la carte SD devient son
+                 * répertoire, la machine repart de zéro */
+                reset_machine();
+                load_firmware(fp, 1);
+                if (fwLoaded) {
+                    boot_vectors();
+                    audio_start();
+                    machineEpoch++;
+                }
+            }
+            SDL_free(fp);
+            refresh_title();
+        }
+#endif
+        else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+            uint8_t m = key_bit(ev.key.keysym.sym);
+            if (m) {
+                if (ev.type == SDL_KEYDOWN) btn_press(m);
+                else btn_release(m);
+            }
+        }
+        else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+            if (!pad && SDL_IsGameController(ev.cdevice.which)) {
+                pad = SDL_GameControllerOpen(ev.cdevice.which);
+                if (pad) printf("manette : %s\n", SDL_GameControllerName(pad));
+            }
+        }
+        else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+            if (pad && SDL_GameControllerGetAttached(pad) == SDL_FALSE) {
+                SDL_GameControllerClose(pad); pad = NULL;
+            }
+        }
+        else if (ev.type == SDL_JOYDEVICEADDED) {
+            if (!pad && !joyFb && !SDL_IsGameController(ev.jdevice.which))
+                joyFb = SDL_JoystickOpen(ev.jdevice.which);
+        }
+        else if (ev.type == SDL_JOYDEVICEREMOVED) {
+            if (joyFb && SDL_JoystickGetAttached(joyFb) == SDL_FALSE) {
+                SDL_JoystickClose(joyFb); joyFb = NULL;
+            }
+        }
+        else if (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) {
+            uint8_t m = pad ? pad_button_mask(ev.cbutton.button) : 0;
+            if (m) {
+                if (ev.type == SDL_CONTROLLERBUTTONDOWN) btn_press(m);
+                else btn_release(m);
+            }
+        }
+        else if (ev.type == SDL_CONTROLLERAXISMOTION) {
+            if (pad && (ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX ||
+                        ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY)) {
+                uint8_t want = pad_dir_bits(pad) & BTN_DIRMASK;
+                btn_release(padDirBits & ~want);  /* directions quittées */
+                btn_press(want & ~padDirBits);    /* directions nouvellement dans la zone */
+                padDirBits = want;
+            }
+        }
+        else if (ev.type == SDL_JOYBUTTONDOWN || ev.type == SDL_JOYBUTTONUP) {
+            uint8_t m = joyFb ? joy_button_mask(ev.jbutton.button) : 0;
+            if (m) {
+                if (ev.type == SDL_JOYBUTTONDOWN) btn_press(m);
+                else btn_release(m);
+            }
+        }
+        else if (ev.type == SDL_JOYHATMOTION) {
+            if (joyFb) {
+                uint8_t want = joy_hat_bits(joyFb);
+                btn_release(padDirBits & ~want);
+                btn_press(want & ~padDirBits);
+                padDirBits = want;
+            }
+        }
+    }
+    return 1;
+}
+
+/* remontées console (512 frames) + marqueurs EMU_TRACE */
+static void update_diagnostics(Uint32 frame) {
+    if ((frame & 511) == 0) { /* remontée console toutes les 512 frames */
+        static int maInit = -1;
+        static uint32_t ma;
+        if (maInit < 0) {
+            maInit = 0;
+            ma = getenv("MILLIS_ADDR") ? (uint32_t)strtoul(getenv("MILLIS_ADDR"), NULL, 16) : 0x20002c48u;
+        }
+        uint32_t millisVal = fetchWord(ma);
+        fprintf(stderr, "[f%u] tick=%u pc=%08x millis=%u sysT=%ld stWr=%ld tc4f=%u tc4w=%u msWr=%ld\n",
+                frame, tickCount, regs[15], millisVal, sysTickEntries,
+                stWrites, tc4Fires, tc4Writes, millisWrites);
+    }
+    /* marqueurs toutes les 2M ticks, comparable au traceur TS */
+    static uint32_t nextMark = 2000000;
+    static int markTrace = -1;
+    if (markTrace < 0) markTrace = getenv("EMU_TRACE") ? 1 : 0;
+    if (markTrace && tickCount >= nextMark) {
+        uint32_t ma = getenv("MILLIS_ADDR") ? (uint32_t)strtoul(getenv("MILLIS_ADDR"), NULL, 16) : 0x20002c48u;
+        fprintf(stderr, "T %u M %u PC %x SYST %ld DACW %u FIRE %u\n",
+                nextMark, fetchWord(ma), regs[15], sysTickEntries, tc4Writes, tc4Fires);
+        nextMark += 2000000;
+    }
+}
+
+/* % de vitesse dans la barre de titre (échantillonné toutes les 500 ms) */
+static void update_title_pct(void) {
+    Uint32 nowMs = SDL_GetTicks();
+    if (nowMs - titleMs < 500) return;
+    char title[1200];
+    if (fwLoaded) {
+        double emuMs = (double)(tickCount - titleTick) / 20000.0;
+        double wallMs = (double)(nowMs - titleMs);
+        int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
+        snprintf(title, sizeof(title), "META — %.900s — %d%%", fwName, pct);
+    } else {
+        snprintf(title, sizeof(title), "META — déposez un firmware .bin");
+    }
+    SDL_SetWindowTitle(emuWin, title);
+    titleMs = nowMs;
+    titleTick = tickCount;
+}
+
+static void run_emulated_frame(void) {
+    uint32_t target = emu_nextFrameTick;
+    while (tickCount < target) step();
+    emu_nextFrameTick += EMU_FRAME_TICKS;
+}
+
+#ifndef __EMSCRIPTEN__
+/* ------------------------------------------------------------ natif --- */
 
 int main(int argc, char **argv) {
     if (argc < 2)
@@ -1360,57 +1699,12 @@ int main(int argc, char **argv) {
     uint64_t perfFreq = SDL_GetPerformanceFrequency();
     const uint64_t frameDur = (uint64_t)((double)perfFreq / 59.7275 + 0.5); /* 1/59,7 s */
     uint64_t nextPace = 0; /* échéance temps réel de la prochaine frame */
-    const uint64_t frameTicks = 334860; /* 16743 µs émulées */
-    uint32_t nextFrameTick = 334860;
-    uint8_t padDirBits = 0; /* directions tenues par stick/chapeau */
     unsigned seenEpoch = 0;
-    /* % de vitesse dans la barre de titre : échantillonné toutes les 500 ms */
-    Uint32 titleMs = SDL_GetTicks();
-    uint32_t titleTick = tickCount;
+    titleMs = SDL_GetTicks();
+    titleTick = tickCount;
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
-        fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
-        return 1;
-    }
-    SDL_Window *win;
-    SDL_Renderer *ren;
-    if (SDL_CreateWindowAndRenderer(SCREEN_W * 2, SCREEN_H * 2,
-                                    SDL_WINDOW_RESIZABLE, &win, &ren) != 0) {
-        fprintf(stderr, "fenêtre: %s\n", SDL_GetError());
-        return 1;
-    }
-    /* échelle logique 160×128 : la fenêtre est redimensionnable, rendu
-     * entier (pixels carrés) et centré */
-    SDL_RenderSetLogicalSize(ren, SCREEN_W, SCREEN_H);
-    SDL_RenderSetIntegerScale(ren, SDL_TRUE);
-
-    /* manette déjà branchée : contrôleur sinon joystick brut */
-    SDL_GameController *pad = NULL;
-    SDL_Joystick *joyFb = NULL;
-    for (int i = 0; i < SDL_NumJoysticks(); i++) {
-        if (SDL_IsGameController(i)) { pad = SDL_GameControllerOpen(i); if (pad) break; }
-        else if (!joyFb) joyFb = SDL_JoystickOpen(i);
-    }
-    if (pad) printf("manette : %s\n", SDL_GameControllerName(pad));
-    else if (joyFb) printf("joystick : %s\n", SDL_JoystickName(joyFb));
-
-    { /* titre initial */
-        char title[1200];
-        if (fwLoaded) snprintf(title, sizeof(title), "META — %.900s", fwName);
-        else snprintf(title, sizeof(title), "META — déposez un firmware .bin");
-        SDL_SetWindowTitle(win, title);
-    }
-    tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
-                            SDL_TEXTUREACCESS_STREAMING, SCREEN_W, SCREEN_H);
-
-    SDL_AudioSpec want, got;
-    memset(&want, 0, sizeof(want));
-    want.freq = 22049; want.format = AUDIO_S16SYS; want.channels = 1;
-    want.samples = 2048; want.callback = audio_cb;
-    audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
-    audioOk = audioDev != 0;
-    if (!audioOk) fprintf(stderr, "audio indisponible : %s\n", SDL_GetError());
-    if (audioOk && fwLoaded) SDL_PauseAudioDevice(audioDev, 0); /* lancé au boot */
+    if (sdl_init_all() != 0) return 1;
+    if (audioOk && fwLoaded) audio_start(); /* lancé au boot */
 
     if (wavPathStr[0]) {
         wavFile = fopen(wavPathStr, "wb");
@@ -1428,159 +1722,25 @@ int main(int argc, char **argv) {
         }
     }
     while (running) {
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) running = 0;
-            else if (ev.type == SDL_DROPFILE) {
-                char *fp = ev.drop.file;
-                const char *ext = strrchr(fp, '.');
-                struct stat st;
-                printf("déposé : %s\n", fp);
-                if (stat(fp, &st) == 0 && S_ISDIR(st.st_mode)) {
-                    load_sd_from_path(fp);
-                } else if (ext && strcasecmp(ext, ".img") == 0) {
-                    load_sd_from_path(fp);
-                } else {
-                    /* tout le reste = firmware : la carte SD devient son
-                     * répertoire, la machine repart de zéro */
-                    reset_machine();
-                    load_firmware(fp, 1);
-                    if (fwLoaded) {
-                        boot_vectors();
-                        if (audioOk) SDL_PauseAudioDevice(audioDev, 0);
-                        machineEpoch++;
-                    }
-                }
-                SDL_free(fp);
-                { /* titre immédiat */
-                    char title[1200];
-                    if (fwLoaded) snprintf(title, sizeof(title), "META — %.900s", fwName);
-                    else snprintf(title, sizeof(title), "META — déposez un firmware .bin");
-                    SDL_SetWindowTitle(win, title);
-                }
-            }
-            else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
-                uint8_t m = key_bit(ev.key.keysym.sym);
-                if (m) {
-                    if (ev.type == SDL_KEYDOWN) btn_press(m);
-                    else btn_release(m);
-                }
-            }
-            else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
-                if (!pad && SDL_IsGameController(ev.cdevice.which)) {
-                    pad = SDL_GameControllerOpen(ev.cdevice.which);
-                    if (pad) printf("manette : %s\n", SDL_GameControllerName(pad));
-                }
-            }
-            else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-                if (pad && SDL_GameControllerGetAttached(pad) == SDL_FALSE) {
-                    SDL_GameControllerClose(pad); pad = NULL;
-                }
-            }
-            else if (ev.type == SDL_JOYDEVICEADDED) {
-                if (!pad && !joyFb && !SDL_IsGameController(ev.jdevice.which))
-                    joyFb = SDL_JoystickOpen(ev.jdevice.which);
-            }
-            else if (ev.type == SDL_JOYDEVICEREMOVED) {
-                if (joyFb && SDL_JoystickGetAttached(joyFb) == SDL_FALSE) {
-                    SDL_JoystickClose(joyFb); joyFb = NULL;
-                }
-            }
-            else if (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) {
-                uint8_t m = pad ? pad_button_mask(ev.cbutton.button) : 0;
-                if (m) {
-                    if (ev.type == SDL_CONTROLLERBUTTONDOWN) btn_press(m);
-                    else btn_release(m);
-                }
-            }
-            else if (ev.type == SDL_CONTROLLERAXISMOTION) {
-                if (pad && (ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX ||
-                            ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY)) {
-                    uint8_t want = pad_dir_bits(pad) & BTN_DIRMASK;
-                    btn_release(padDirBits & ~want);  /* directions quittées */
-                    btn_press(want & ~padDirBits);    /* directions nouvellement dans la zone */
-                    padDirBits = want;
-                }
-            }
-            else if (ev.type == SDL_JOYBUTTONDOWN || ev.type == SDL_JOYBUTTONUP) {
-                uint8_t m = joyFb ? joy_button_mask(ev.jbutton.button) : 0;
-                if (m) {
-                    if (ev.type == SDL_JOYBUTTONDOWN) btn_press(m);
-                    else btn_release(m);
-                }
-            }
-            else if (ev.type == SDL_JOYHATMOTION) {
-                if (joyFb) {
-                    uint8_t want = joy_hat_bits(joyFb);
-                    btn_release(padDirBits & ~want);
-                    btn_press(want & ~padDirBits);
-                    padDirBits = want;
-                }
-            }
-        }
-        if ((frame & 511) == 0) { /* remontée console toutes les 512 frames */
-            static int maInit = -1;
-            static uint32_t ma;
-            if (maInit < 0) {
-                maInit = 0;
-                ma = getenv("MILLIS_ADDR") ? (uint32_t)strtoul(getenv("MILLIS_ADDR"), NULL, 16) : 0x20002c48u;
-            }
-            uint32_t millisVal = fetchWord(ma);
-            fprintf(stderr, "[f%u] tick=%u pc=%08x millis=%u sysT=%ld stWr=%ld tc4f=%u tc4w=%u msWr=%ld\n",
-                    frame, tickCount, regs[15], millisVal, sysTickEntries,
-                    stWrites, tc4Fires, tc4Writes, millisWrites);
-        }
-        /* marqueurs toutes les 2M ticks, comparable au traceur TS */
-        static uint32_t nextMark = 2000000;
-        static int markTrace = -1;
-        if (markTrace < 0) markTrace = getenv("EMU_TRACE") ? 1 : 0;
-        if (markTrace && tickCount >= nextMark) {
-            uint32_t ma = getenv("MILLIS_ADDR") ? (uint32_t)strtoul(getenv("MILLIS_ADDR"), NULL, 16) : 0x20002c48u;
-            fprintf(stderr, "T %u M %u PC %x SYST %ld DACW %u FIRE %u\n",
-                    nextMark, fetchWord(ma), regs[15], sysTickEntries, tc4Writes, tc4Fires);
-            nextMark += 2000000;
-        }
+        running = poll_events();
+        update_diagnostics(frame);
         if (homeHeld && SDL_GetTicks() - homeHeld > 3000) { /* reset maison */ }
         if (machineEpoch != seenEpoch) {
             /* un drop a réinitialisé la machine : resynchronise le pas de
-             * frame et le chronométrage temps réel */
+             * frame et le chronométrage du titre */
             seenEpoch = machineEpoch;
-            nextFrameTick = tickCount + frameTicks;
+            emu_nextFrameTick = tickCount + EMU_FRAME_TICKS;
             titleTick = tickCount;
             titleMs = SDL_GetTicks();
         }
         if (maxFrames && frame >= maxFrames) break;
 
-        /* une frame émulée */
-        uint32_t target = nextFrameTick;
-        if (fwLoaded) {
-            while (tickCount < target && running) step();
-        }
-        nextFrameTick += frameTicks;
+        if (fwLoaded) run_emulated_frame();
         frame++;
 
-        /* % de vitesse : ticks émulés / temps mural, dans le titre */
-        {
-            Uint32 nowMs = SDL_GetTicks();
-            if (nowMs - titleMs >= 500) {
-                char title[1200];
-                if (fwLoaded) {
-                    double emuMs = (double)(tickCount - titleTick) / 20000.0;
-                    double wallMs = (double)(nowMs - titleMs);
-                    int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
-                    if (pct < 0) pct = 0;
-                    if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
-                    snprintf(title, sizeof(title), "META — %.900s — %d%%", fwName, pct);
-                } else {
-                    snprintf(title, sizeof(title), "META — déposez un firmware .bin");
-                }
-                SDL_SetWindowTitle(win, title);
-                titleMs = nowMs;
-                titleTick = tickCount;
-            }
-        }
+        update_title_pct();
 
-        blit(ren);
+        blit(emuRen);
         if (trace) { /* empreinte d'écran périodique */
             static uint32_t lastPrint = 0;
             if (frame - lastPrint >= 60) {
@@ -1631,7 +1791,92 @@ int main(int argc, char **argv) {
     }
     wav_finish();
     if (audioDev) SDL_CloseAudioDevice(audioDev);
-    SDL_DestroyRenderer(ren); SDL_DestroyTexture(tex); SDL_DestroyWindow(win);
+    SDL_DestroyRenderer(emuRen); SDL_DestroyTexture(tex); SDL_DestroyWindow(emuWin);
     SDL_Quit();
     return 0;
 }
+
+#else
+/* ------------------------------------------------------------ wasm ---- */
+
+#include <emscripten.h>
+
+/* points d'entrée JS -> C (drop / sélection de dossier) */
+
+EMSCRIPTEN_KEEPALIVE
+int emu_firmware(uint8_t *data, int len, const char *name) {
+    reset_machine();
+    load_firmware_data(data, (size_t)len, name);
+    if (!fwLoaded) return 0;
+    boot_vectors();
+    audio_start();
+    machineEpoch++;
+    refresh_title();
+    return 1;
+}
+
+EMSCRIPTEN_KEEPALIVE
+void emu_card_file(const char *path, uint8_t *data, int len) {
+    vfiles_add(path, data, (size_t)len);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void emu_card_image(uint8_t *data, int len) {
+    sd_unload();
+    sd_image = malloc(len ? (size_t)len : 1);
+    memcpy(sd_image, data, (size_t)len);
+    sd_size = (size_t)len;
+    printf("carte SD : image (%d Kio)\n", len / 1024);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void emu_card_finish(void) {
+    if (nvfiles == 0) return;
+    sd_unload();
+    fat_build_from_vfiles();
+}
+
+static Uint32 wasmFrame = 0;
+static unsigned seenEpoch = 0;
+static double wasmLastFrame = 0;
+
+static void wasm_loop(void) {
+    if (!poll_events()) emscripten_cancel_main_loop();
+    update_diagnostics(wasmFrame);
+    if ((wasmFrame & 63) == 0) /* battement visible dans l'onglet */
+        EM_ASM({ document.title = 'META f=' + $0; }, wasmFrame);
+    if (machineEpoch != seenEpoch) {
+        /* un drop a réinitialisé la machine : resynchronise le pas de frame */
+        seenEpoch = machineEpoch;
+        emu_nextFrameTick = tickCount + EMU_FRAME_TICKS;
+        titleTick = tickCount;
+        titleMs = (Uint32)emscripten_get_now();
+    }
+    /* une frame émulée par rAF (59,94 Hz ≈ 59,73) ; en retard de plus de
+     * 4 frames (onglet caché, stall) : pas de rattrapage */
+    double now = emscripten_get_now();
+    const double frameMs = 16.743;
+    if (wasmLastFrame == 0) wasmLastFrame = now;
+    int due = (int)((now - wasmLastFrame) / frameMs);
+    if (due > 4) { due = 1; wasmLastFrame = now; }
+    if (fwLoaded) {
+        for (int i = 0; i < due; i++) run_emulated_frame();
+        wasmFrame += (Uint32)due;
+    }
+    wasmLastFrame += due * frameMs;
+    if (now - wasmLastFrame > frameMs) wasmLastFrame = now;
+    update_title_pct();
+    blit(emuRen);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int main(void) {
+    memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
+    hashMode = 0; /* diagnostics natifs hors wasm (getenv y est muet) */
+    titleMs = (Uint32)emscripten_get_now();
+    titleTick = tickCount;
+    if (sdl_init_all() != 0) return 1;
+    emscripten_set_main_loop(wasm_loop, 0, 1);
+    return 0;
+}
+#endif
