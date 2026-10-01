@@ -75,6 +75,8 @@ static int16_t audioHold = 0;
 
 static SDL_AudioDeviceID audioDev;
 static int audioOk;
+static int watchCount;
+static long millisWrites;
 static FILE *wavFile;
 static uint32_t wavSamples;
 static char wavPathStr[512];
@@ -467,8 +469,12 @@ static void sd_write_persist(uint32_t lba, const uint8_t *data) {
 
 /* --------------------------------------------------- ST7735 -> pixels */
 
+static long stWrites = 0, ramwrTotal = 0;
 static uint8_t st7735_byte(uint8_t v) {
     if (portB_out & (1u << 22)) return 0xff; /* CS écran haut */
+    stWrites++;
+    if (!(portB_out & (1u << 23))) { lcd_lastCommand = v; if (v == 0x2c) ramwrTotal++; return 0xff; }
+    if (lcd_lastCommand == 0x2c) ramwrTotal += 0; /* déjà compté ci-dessus */
     if (portB_out & (1u << 23)) { /* données */
         switch (lcd_lastCommand) {
             case 0x2c: /* RAMWR */
@@ -489,10 +495,6 @@ static uint8_t st7735_byte(uint8_t v) {
                 break;
         }
         lcd_argIndex++;
-    } else {
-        lcd_lastCommand = v;
-        lcd_argIndex = 0;
-        if (v == 0x2c) ramwrCount++;
     }
     return 0xff;
 }
@@ -535,6 +537,7 @@ static uint32_t fetchWord(uint32_t a) {
                ((uint32_t)sram[a+2] << 16) | ((uint32_t)sram[a+3] << 24); }
     if (a < 0x60000000u) {
         if (a == 0x40000c00u) return 0;           /* GCLK STATUS */
+        if (a == 0x4000080cu) return 0b11010010;  /* SYSCTRL PCLKSR: tout prêt */
         if (a == 0x4200401au) return 0x1234;      /* ADC RESULT */
         if (a == 0x42004018u) return 1;           /* ADC INTFLAG RESRDY */
         if (a == 0x4100484eu) return 0x02;        /* DMAC CHINTFLAG TCMPL */
@@ -569,6 +572,10 @@ static void writeByte(uint32_t a, uint8_t v);
 
 static int dbgTc4Cfg = 0, dbgDac = 0, dbgTc4Fire = 0;
 static void writeWord(uint32_t a, uint32_t v) {
+    if (a == 0x20001fbcu && watchCount < 24) {
+        fprintf(stderr, "[écriture Millis #%d]\n", watchCount); watchCount++;
+    }
+    if (a == 0x20001fbcu) millisWrites++;
     if (a < 0x20000000u) return;
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 4 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff;
@@ -680,7 +687,7 @@ static void step(void) {
         dmacInterrupt = 0;
         irq_inject(dmacVector);
     }
-    if (++sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
+    if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
         sysTickTrigger = 0;
         irq_inject(sysTickVector);
     }
@@ -949,14 +956,14 @@ static void step(void) {
         if (off1 & 0x400) off1 |= ~0x7ff;
         int32_t off2 = nextInst & 0x7ff;
         setReg(14, regs[15] + ((uint32_t)off1 << 12));
-        setReg(15, regs[15] + ((uint32_t)(off2 << 1)) + 2);
+        setReg(15, regs[14] + ((uint32_t)(off2 << 1)));
         incrementPc();
     }
     else if (op == 0xf3bf || (op & 0xffe0) == 0xf3e0) { /* DMB/MRS : no-op */ }
     else {
         /* instruction non décodée : comme le TS, on continue */
     }
-    if (trace && (tickCount & 127) == 0)
+    if (trace && tickCount >= 19990 && tickCount <= 21600)
         fprintf(stderr, "%u pc=%x r0=%x r1=%x r2=%x r3=%x r4=%x r5=%x r6=%x r7=%x sp=%x\n",
                 tickCount, instAddr, regs[0], regs[1], regs[2], regs[3],
                 regs[4], regs[5], regs[6], regs[7], regs[13]);
@@ -1164,6 +1171,11 @@ int main(int argc, char **argv) {
                     else buttonData |= bit;
                 }
             }
+        }
+        if ((frame & 31) == 0) {
+            uint32_t millisVal = sram[0x1fbc] | (sram[0x1fbd] << 8) | (sram[0x1fbe] << 16) | (sram[0x1fbf] << 24);
+            fprintf(stderr, "[f%u] tick=%u millis=%u stWr=%ld tc4f=%u tc4w=%u msWr=%ld\n",
+                    frame, tickCount, millisVal, stWrites, tc4Fires, tc4Writes, millisWrites);
         }
         if (homeHeld && SDL_GetTicks() - homeHeld > 3000) { /* reset maison */ }
         if (maxFrames && frame >= maxFrames) break;
