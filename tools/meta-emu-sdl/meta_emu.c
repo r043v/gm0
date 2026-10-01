@@ -731,6 +731,11 @@ static void writeHalf(uint32_t a, uint16_t v);
 static void writeByte(uint32_t a, uint8_t v);
 
 static int dbgTc4Cfg = 0, dbgDac = 0;
+static int dbgEnabled = -1; /* EMU_DEBUG=1 : traces de config périphériques */
+static int dbg(void) {
+    if (dbgEnabled < 0) dbgEnabled = getenv("EMU_DEBUG") ? 1 : 0;
+    return dbgEnabled;
+}
 static uint32_t millisWatchAddr = 0x20001fbcu; /* surchargé par MILLIS_WATCH */
 static long millisWrites;
 /* montre générique d'écriture (WATCH_ADDR), pour le débogage */
@@ -748,7 +753,7 @@ static void writeWord(uint32_t a, uint32_t v) {
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     if (a == 0x42001828u) { sercom4_write((uint8_t)v); return; } /* SERCOM4 DATA */
     if (a == 0x42004808u) { dac_write((uint16_t)v); return; }    /* DAC DATA */
-    if (a == 0x42003000u) { if (dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
     if (a == 0x42003018u) { tc4Top = v; return; }                /* TC4 CC0 */
     if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; }/* TC4 INTENSET */
     if (a == 0x41004834u) { dmac_baseAddr = v; return; }
@@ -774,8 +779,8 @@ static void writeHalf(uint32_t a, uint16_t v) {
     if (a < 0x20000000u) return;
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff; return; }
-    if (a == 0x42004808u) { if (dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
-    if (a == 0x42003000u) { if (dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42004808u) { if (dbg() && dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
     if (a == 0x42003018u) { tc4Top = v; return; }
     if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; }
     if (a == 0x40000c02u) return;                                /* GCLK CLKCTRL */
@@ -1466,8 +1471,8 @@ static void boot_vectors(void) {
 
 static void refresh_title(void) {
     char title[1200];
-    if (fwLoaded) snprintf(title, sizeof(title), "META — %.900s", fwName);
-    else snprintf(title, sizeof(title), "META — déposez un firmware .bin");
+    if (fwLoaded) snprintf(title, sizeof(title), "Gamebuino META — %.900s", fwName);
+    else snprintf(title, sizeof(title), "Gamebuino META — déposez un firmware .bin");
     SDL_SetWindowTitle(emuWin, title);
 }
 
@@ -1606,9 +1611,11 @@ static int poll_events(void) {
     return 1;
 }
 
-/* remontées console (512 frames) + marqueurs EMU_TRACE */
+/* remontées console (512 frames, mode EMU_TRACE) + marqueurs 2M ticks */
 static void update_diagnostics(Uint32 frame) {
-    if ((frame & 511) == 0) { /* remontée console toutes les 512 frames */
+    static int traceDiag = -1;
+    if (traceDiag < 0) traceDiag = getenv("EMU_TRACE") ? 1 : 0;
+    if ((frame & 511) == 0 && traceDiag) { /* remontée console toutes les 512 frames */
         static int maInit = -1;
         static uint32_t ma;
         if (maInit < 0) {
@@ -1643,9 +1650,9 @@ static void update_title_pct(void) {
         int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
-        snprintf(title, sizeof(title), "META — %.900s — %d%%", fwName, pct);
+        snprintf(title, sizeof(title), "Gamebuino META — %.900s — %d%%", fwName, pct);
     } else {
-        snprintf(title, sizeof(title), "META — déposez un firmware .bin");
+        snprintf(title, sizeof(title), "Gamebuino META — déposez un firmware .bin");
     }
     SDL_SetWindowTitle(emuWin, title);
     titleMs = nowMs;
@@ -1843,7 +1850,7 @@ static double wasmLastFrame = 0;
 static void wasm_loop(void) {
     if (!poll_events()) emscripten_cancel_main_loop();
     update_diagnostics(wasmFrame);
-    if ((wasmFrame & 63) == 0) /* battement visible dans l'onglet */
+    if (wasmFrame && (wasmFrame & 63) == 0) /* battement (pas à l'arrêt) */
         EM_ASM({ document.title = 'META f=' + $0; }, wasmFrame);
     if (machineEpoch != seenEpoch) {
         /* un drop a réinitialisé la machine : resynchronise le pas de frame */

@@ -185,26 +185,6 @@ filesInput.addEventListener('change', async () => {
   filesInput.value = '';
 });
 
-/* hook de test local : index.html?test=1 charge ./test/firmware.bin et les
- * fichiers de ./test/ comme carte (servis par le même serveur HTTP) */
-(async () => {
-  if (!location.search.includes('test=')) return;
-  const mk = (path, buf) => ({ path, file: new File([buf], path.split('/').pop()) });
-  const items = [];
-  try {
-    const fw = await (await fetch('test/firmware.bin')).arrayBuffer();
-    items.push(mk('firmware.bin', fw));
-    const idx = await (await fetch('test/')).text();
-    for (const m of idx.matchAll(/href="([^"?/][^"]*)"/g)) {
-      if (/\.(bin|gb|ini|sav|txt)$/i.test(m[1])) {
-        const buf = await (await fetch('test/' + encodeURIComponent(m[1]))).arrayBuffer();
-        items.push(mk(m[1], buf));
-      }
-    }
-  } catch (e) { setStatus('test : ' + e.message);
-    document.title = 'ERR test ' + e.message; return; }
-  await loadSet(items);
-})();
 
 </script>
 <script>
