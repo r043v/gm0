@@ -47,6 +47,14 @@ gauche = directions.  Joystick sans mapping : boutons 0=A, 1=B, 2=MENU,
     cd wasm && python3 -m http.server 8000
     # ouvrir http://localhost:8000/
 
+**Version mono fichier distribuable** :
+
+    make single      # produit wasm/meta-emu-standalone.html (~1,1 Mo)
+
+Un unique `.html` avec le wasm embarqué en base64 (`-sSINGLE_FILE=1`) :
+à ouvrir directement (file:// compris), à envoyer tel quel — mêmes
+fonctionnalités que la version servie.
+
 - **Déposez** un .bin (firmware), une image .img, ou un **dossier de jeu**
   (traversé récursivement) — ou cliquez pour choisir un dossier
   (`webkitdirectory`) : un .bin unique du dossier devient le firmware,

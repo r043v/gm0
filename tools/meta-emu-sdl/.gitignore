@@ -2,3 +2,6 @@ meta_emu
 wasm/test/
 wasm/meta_emu.js
 wasm/meta_emu.wasm
+wasm/meta_emu_single.js
+wasm/meta-emu-standalone.html
+meta-emu-sdl.zip

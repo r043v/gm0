@@ -201,7 +201,8 @@ filesInput.addEventListener('change', async () => {
         items.push(mk(m[1], buf));
       }
     }
-  } catch (e) { setStatus('test : ' + e.message); return; }
+  } catch (e) { setStatus('test : ' + e.message);
+    document.title = 'ERR test ' + e.message; return; }
   await loadSet(items);
 })();
 
@@ -219,8 +220,10 @@ var Module = {
   printErr: (s) => __show('· ' + s),
   onAbort: (s) => __show('ABORT : ' + s),
 };
-window.addEventListener('error', e => __show('ERREUR : ' + e.message));
-window.addEventListener('unhandledrejection', e => __show('ERREUR (p) : ' + e.reason));
+window.addEventListener('error', e => { __show('ERREUR : ' + e.message);
+  document.title = 'ERR ' + e.message; });
+window.addEventListener('unhandledrejection', e => { __show('ERREUR (p) : ' + e.reason);
+  document.title = 'ERR(p) ' + e.reason; });
 </script>
 <script async src="meta_emu.js"></script>
 </body>
