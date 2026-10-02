@@ -1578,6 +1578,7 @@ static uint32_t emu_nextFrameTick = EMU_FRAME_TICKS;
 static Uint32 titleMs;
 static uint32_t titleTick;
 static char titleBuf[1200]; /* dernier titre construit (HUD wasm) */
+static int titlePct;      /* dernier % (HUD wasm) */
 
 /* décharge la carte SD courante (image ou image FAT d'un répertoire) */
 static void sd_unload(void) {
@@ -1891,6 +1892,7 @@ static void update_title_pct(void) {
         int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
+        titlePct = pct;
         snprintf(titleBuf, sizeof(titleBuf), "Gamebuino META — %.900s — %d%%", fwName, pct);
     } else {
         snprintf(titleBuf, sizeof(titleBuf), "Gamebuino META — déposez un firmware .bin");
@@ -2246,12 +2248,16 @@ static void wasm_loop(void) {
     wasmLastFrame += due * frameMs;
     if (now - wasmLastFrame > frameMs) wasmLastFrame = now;
     update_title_pct();
-    /* titre + % visibles dans la page (mise à jour au rythme du %) */
+    /* % en haut à droite (derrière le canvas, visible dans les bandes) et
+     * titre du jeu dans le texte du bas (mise à jour au rythme du %) */
     if (fwLoaded && titleMs != hudMs && titleBuf[0]) {
         hudMs = titleMs;
-        EM_ASM({ const el = document.getElementById('hud');
-                 if (el) { el.textContent = UTF8ToString($0);
-                           el.style.display = 'block'; } }, titleBuf);
+        EM_ASM({ const p = document.getElementById('pct');
+                 if (p) { p.textContent = $0 + ' %';   /* $0 = int */
+                          p.style.display = 'block'; }
+                 const g = document.getElementById('gamename');
+                 if (g) g.textContent = 'Gamebuino META — ' + UTF8ToString($1);
+               }, titlePct, fwName);
     }
     blit(emuRen);
 }

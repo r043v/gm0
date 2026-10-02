@@ -5,7 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>META — déposez un firmware .bin</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #101418; overflow: hidden; }
+  /* fond sur html seulement : propagé au viewport, peint sous les éléments
+   * z-index négatifs (le % derrière le canvas reste visible) */
+  html { background: #101418; }
+  body { margin: 0; height: 100%; overflow: hidden; }
   #canvas { width: 100vw; height: 100vh; display: block; object-fit: contain;
             image-rendering: pixelated; }
   #overlay {
@@ -24,11 +27,12 @@
     border-radius: 14px; cursor: pointer; padding: 0;
   }
   .btns button:hover { background: #26313f; border-color: #78909c; }
-  #hud { position: fixed; top: 8px; left: 8px; z-index: 15; display: none;
-         background: rgba(16, 20, 24, .75); color: #9ccc65;
-         border: 1px solid #2e7d32; border-radius: 6px; padding: 3px 10px;
-         font: 12px/1.4 ui-monospace, monospace; max-width: 70vw;
-         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* % : coin haut droit, dans la bande noire à côté du jeu (le canvas y
+   * peint un fond opaque : un z-index négatif serait invisible) */
+  #pct { position: fixed; top: 44px; right: 10px; z-index: 15; display: none;
+         color: #78909c; font: 12px/1.4 ui-monospace, monospace; }
+  #gamename { color: #9ccc65; padding-right: 8px; border-right: 1px solid #263238;
+             margin-right: 8px; }
   #status { position: fixed; left: 8px; bottom: 6px; color: #546e7a;
             font: 12px monospace; }
   #gamesBtn { position: fixed; top: 10px; right: 10px; z-index: 20;
@@ -68,16 +72,16 @@
          (son premier .bin lance le jeu — bouton « 🎮 Jeux » pour changer).
          Flèches/ZQSD, Entrée=MENU, Espace=A, Ctrl=B, *=HOME — ou manette.</small>
 </div>
-<div id="hud"></div>
+<div id="pct"></div>
 <div id="gamesBtn">🎮 Jeux</div>
 <div id="lightbox"><span id="closeLb">✕</span><h2>Jeux sur la carte</h2><div class="grid" id="gameGrid"></div></div>
-<div id="status"></div>
+<div id="status"><span id="gamename"></span><span id="msg"></span></div>
 <input id="folder" type="file" webkitdirectory multiple hidden>
 <input id="files" type="file" multiple hidden>
 
 <script>
 const overlay = document.getElementById('overlay');
-const statusEl = document.getElementById('status');
+const statusEl = document.getElementById('msg');
 const folderInput = document.getElementById('folder');
 const filesInput = document.getElementById('files');
 
@@ -343,7 +347,7 @@ filesInput.addEventListener('change', async () => {
 const __log = [];
 function __show(s) {
   __log.push(s); if (__log.length > 4) __log.shift();
-  document.getElementById('status').textContent = __log.join(' | ');
+  document.getElementById('msg').textContent = __log.join(' | ');
 }
 var Module = {
   canvas: document.getElementById('canvas'),
