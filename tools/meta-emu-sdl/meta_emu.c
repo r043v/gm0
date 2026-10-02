@@ -185,6 +185,17 @@ static void sd_reset_state(void) {
     sd_writing = 0;
 }
 
+/* carte courante : image brute (.img) ou image FAT construite d'un dossier
+ * (fatImage/fatImageSize sont définis avec le constructeur FAT plus bas) */
+static uint8_t *fatImage;
+static size_t   fatImageSize;
+static uint8_t *sd_card_data(void) {
+    return sd_image ? sd_image : fatImage;
+}
+static size_t sd_card_size(void) {
+    return sd_image ? sd_size : (fatImage ? fatImageSize : 0);
+}
+
 static void sd_command(uint8_t cmd, uint32_t arg) {
     switch (cmd) {
         case 0:  sd_out[sd_outLen++] = sd_initialized ? 0x00 : 0x01; break; /* idle */
@@ -199,10 +210,11 @@ static void sd_command(uint8_t cmd, uint32_t arg) {
         case 16: sd_out[sd_outLen++] = 0x00; break;
         case 17: { /* lecture d'un secteur */
             size_t base = (size_t)arg * 512;
-            if (sd_image && base + 512 <= sd_size) {
+            uint8_t *card = sd_card_data();
+            if (card && base + 512 <= sd_card_size()) {
                 sd_out[sd_outLen++] = 0x00;
                 sd_out[sd_outLen++] = 0xfe;
-                memcpy(sd_out + sd_outLen, sd_image + base, 512);
+                memcpy(sd_out + sd_outLen, card + base, 512);
                 sd_outLen += 512;
                 sd_out[sd_outLen++] = 0xff; sd_out[sd_outLen++] = 0xff;
             } else {
@@ -228,9 +240,10 @@ static void sd_process(uint8_t v) {
         sd_writeBuf[sd_writeIdx++] = v;
         if (sd_writeIdx >= 515) {
             sd_writing = 0;
-            if (sd_image && sd_writeBuf[0] == 0xfe) {
-                memcpy(sd_image + (size_t)sd_writeLba * 512, sd_writeBuf + 1, 512);
-                sd_write_persist(sd_writeLba, sd_image + (size_t)sd_writeLba * 512);
+            uint8_t *card = sd_card_data();
+            if (card && sd_writeBuf[0] == 0xfe) {
+                memcpy(card + (size_t)sd_writeLba * 512, sd_writeBuf + 1, 512);
+                sd_write_persist(sd_writeLba, card + (size_t)sd_writeLba * 512);
             }
             /* accepté, puis busy (comme sdcard.ts) */
             sd_out[sd_outLen++] = 0x05; sd_out[sd_outLen++] = 0x00;
@@ -1221,11 +1234,13 @@ static void step(void) {
         /* instruction non décodée : comme le TS, on continue */
     }
     if (hashMode && (tickCount % hashInterval) == 0)
-        fprintf(stderr, "H %u %08x sp=%08x R %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
+        fprintf(stderr, "H %u %08x sp=%08x R %x %x %x %x %x %x %x %x %x %x %x %x %x %x TC4 %d %d %u %u %u %u %u\n",
                 tickCount, state_hash(), regs[13],
                 regs[0], regs[1], regs[2], regs[3], regs[4], regs[5],
                 regs[6], regs[7], regs[8], regs[9], regs[10], regs[11],
-                regs[12], regs[14], regs[15]);
+                regs[12], regs[14], regs[15],
+                tc4Enabled, tc4Armed, tc4Period, tc4Top, tc4Counter,
+                tc4Window, tc4Fires - tc4Writes);
     if (sramDumpAt && tickCount >= sramDumpAt) {
         const char *p = getenv("SRAM_DUMP");
         FILE *df = fopen(p ? p : "/tmp/sram_c.bin", "wb");
@@ -1682,6 +1697,23 @@ int main(int argc, char **argv) {
     if (dumpAt) sramDumpAt = (uint32_t)strtoul(dumpAt, NULL, 10);
 
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--build-vcard") == 0 && i + 3 < argc) {
+            /* debug : --build-vcard out.img fichier1 fichier2 ... */
+            for (int j = i + 2; j < argc; j++) {
+                FILE *g = fopen(argv[j], "rb");
+                if (!g) { fprintf(stderr, "vcard: %s illisible\n", argv[j]); continue; }
+                fseek(g, 0, SEEK_END); long sz = ftell(g); fseek(g, 0, SEEK_SET);
+                uint8_t *data = malloc((size_t)sz);
+                fread(data, 1, (size_t)sz, g); fclose(g);
+                vfiles_add(argv[j], data, (size_t)sz);
+                free(data);
+            }
+            fat_build_from_vfiles();
+            FILE *out = fopen(argv[i + 1], "wb");
+            if (out) { fwrite(fatImage, 1, fatImageSize, out); fclose(out); }
+            printf("vcard écrite : %s\n", argv[i + 1]);
+            return 0;
+        }
         if (strcmp(argv[i], "--wav") == 0 && i + 1 < argc) {
             snprintf(wavPathStr, sizeof(wavPathStr), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
@@ -1741,6 +1773,14 @@ int main(int argc, char **argv) {
             titleMs = SDL_GetTicks();
         }
         if (maxFrames && frame >= maxFrames) break;
+#ifdef __EMSCRIPTEN__
+#else
+        /* test headless : EMU_PRESS_A=<frame> appuie sur A 6 frames */
+        static int pressA = -1;
+        if (pressA < 0) pressA = getenv("EMU_PRESS_A") ? atoi(getenv("EMU_PRESS_A")) : 0;
+        if (pressA && (frame == pressA)) btn_press(BTN_A);
+        if (pressA && (frame == pressA + 6)) btn_release(BTN_A);
+#endif
 
         if (fwLoaded) run_emulated_frame();
         frame++;
@@ -1879,7 +1919,11 @@ static void wasm_loop(void) {
 EMSCRIPTEN_KEEPALIVE
 int main(void) {
     memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
+#ifdef WASM_DEBUG
+    hashMode = 1; /* diagnostic : hachages d'état sur stderr */
+#else
     hashMode = 0; /* diagnostics natifs hors wasm (getenv y est muet) */
+#endif
     titleMs = (Uint32)emscripten_get_now();
     titleTick = tickCount;
     if (sdl_init_all() != 0) return 1;
