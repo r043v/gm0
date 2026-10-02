@@ -7,3 +7,6 @@ wasm/meta-emu-standalone.html
 meta-emu-sdl.zip
 wasm/devtest/
 wasm/meta_emu_debug.js
+wasm/meta_emu_debug2.js
+wasm/meta_emu_node.js
+wasm/meta_emu_node.wasm

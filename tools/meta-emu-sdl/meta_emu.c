@@ -870,6 +870,8 @@ static uint32_t state_hash(void) {
 }
 static int hashMode = -1;
 static uint32_t hashInterval = 250000;
+static uint32_t ihash; /* hachage par instruction (EMU_IHASH / WASM_DEBUG) */
+static int ihashOn;
 static uint32_t sramDumpAt = 0;
 
 static void setReg(int i, uint32_t v) { regs[i] = v; regD[i] = (double)v; }
@@ -1233,9 +1235,18 @@ static void step(void) {
     else {
         /* instruction non décodée : comme le TS, on continue */
     }
+#if defined(EMU_IHASH) || defined(WASM_DEBUG)
+    if (ihashOn)
+    {
+        ihash = (ihash ^ (instAddr * 2654435761u)) * 16777619u;
+        ihash = (ihash ^ inst) * 16777619u;
+        for (int ri = 0; ri < 8; ri++) ihash = (ihash ^ regs[ri]) * 16777619u;
+        ihash = (ihash ^ regs[13]) * 16777619u;
+    }
+#endif
     if (hashMode && (tickCount % hashInterval) == 0)
-        fprintf(stderr, "H %u %08x sp=%08x R %x %x %x %x %x %x %x %x %x %x %x %x %x %x TC4 %d %d %u %u %u %u %u\n",
-                tickCount, state_hash(), regs[13],
+        fprintf(stderr, "H %u %08x sp=%08x I %08x R %x %x %x %x %x %x %x %x %x %x %x %x %x %x TC4 %d %d %u %u %u %u %u\n",
+                tickCount, state_hash(), regs[13], ihash,
                 regs[0], regs[1], regs[2], regs[3], regs[4], regs[5],
                 regs[6], regs[7], regs[8], regs[9], regs[10], regs[11],
                 regs[12], regs[14], regs[15],
@@ -1680,7 +1691,24 @@ static void run_emulated_frame(void) {
     emu_nextFrameTick += EMU_FRAME_TICKS;
 }
 
-#ifndef __EMSCRIPTEN__
+#if defined(EMU_NODE_HEADLESS)
+/* ------------------------------------------- node headless (debug) --- */
+
+int main(int argc, char **argv) {
+    memset(sram, 0xff, SRAM_SIZE);
+    hashMode = 1;
+    hashInterval = 5000000;
+    ihashOn = 1;
+    if (argc < 3) { fprintf(stderr, "usage: prog firmware.bin carte_dir [frames]\n"); return 1; }
+    load_firmware(argv[1], 0);
+    if (fwLoaded) boot_vectors();
+    int frames = argc > 3 ? atoi(argv[3]) : 700;
+    for (int f = 0; f < frames; f++) run_emulated_frame();
+    fprintf(stderr, "FINAL %u %08x\n", tickCount, state_hash());
+    return 0;
+}
+
+#elif !defined(__EMSCRIPTEN__)
 /* ------------------------------------------------------------ natif --- */
 
 int main(int argc, char **argv) {
@@ -1692,6 +1720,9 @@ int main(int argc, char **argv) {
     if (getenv("WATCH_ADDR")) watchAddr = (uint32_t)strtoul(getenv("WATCH_ADDR"), NULL, 16);
     if (getenv("TRACE_FROM")) traceFrom = (uint32_t)strtoul(getenv("TRACE_FROM"), NULL, 10);
     hashMode = getenv("STATE_HASH") ? 1 : 0;
+#ifdef EMU_IHASH
+    ihashOn = 1;
+#endif
     if (getenv("HASH_INTERVAL")) hashInterval = (uint32_t)strtoul(getenv("HASH_INTERVAL"), NULL, 10);
     const char *dumpAt = getenv("SRAM_DUMP_AT");
     if (dumpAt) sramDumpAt = (uint32_t)strtoul(dumpAt, NULL, 10);
@@ -1921,6 +1952,8 @@ int main(void) {
     memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
 #ifdef WASM_DEBUG
     hashMode = 1; /* diagnostic : hachages d'état sur stderr */
+    hashInterval = 5000000; /* 1 marque / 5 s murales à pleine vitesse */
+    ihashOn = 1;
 #else
     hashMode = 0; /* diagnostics natifs hors wasm (getenv y est muet) */
 #endif
