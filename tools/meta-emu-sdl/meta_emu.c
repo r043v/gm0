@@ -317,6 +317,8 @@ static void to83(const char *name, char used[][12], int nUsed, char out[12]) {
 static int fatTotalSectors;
 static uint8_t *fatImage;
 static size_t   fatImageSize;
+static uint32_t fatSpc = 8;         /* secteurs / cluster (dynamique) */
+static uint32_t fatFatsz = 65;      /* secteurs / FAT (dynamique) */
 typedef struct { uint32_t lba; size_t bytes; char path[1024]; uint8_t *mem; } FatFile;
 static FatFile  fatFiles[512];
 static int      fatFileCount;
@@ -341,6 +343,24 @@ static void vfiles_add(const char *path, const uint8_t *data, size_t len) {
     v->size = len;
 }
 
+/* nombre de dossiers distincts hébergeant les vfiles (pour dimensionner
+ * la carte : chaque dossier = 1 cluster d'entrées) */
+static int vfile_dir_count(void) {
+    static char dirs[600][512];
+    int n = 0;
+    for (int i = 0; i < nvfiles; i++) {
+        const char *p = vfiles[i].path;
+        const char *sl = strrchr(p, '/');
+        if (!sl) continue; /* racine : zone fixe */
+        int dl = (int)(sl - p);
+        int seen = 0;
+        for (int j = 0; j < n; j++)
+            if ((int)strlen(dirs[j]) == dl && strncmp(dirs[j], p, dl) == 0) { seen = 1; break; }
+        if (!seen && n < 600) { memcpy(dirs[n], p, dl); dirs[n][dl] = 0; n++; }
+    }
+    return n;
+}
+
 static int fat_used_find(char used[][12], int n, const char *s) {
     for (int i = 0; i < n; i++) if (!strcmp(used[i], s)) return 1;
     return 0;
@@ -362,7 +382,7 @@ static uint32_t fat_alloc(int clusters) {
 }
 
 static uint32_t fat_data_lba(uint32_t first) {
-    return 1 + 2 * 65 + (FAT_ROOT * 32 + 511) / 512 + (first - 2) * FAT_SPC;
+    return 1 + 2 * fatFatsz + (FAT_ROOT * 32 + 511) / 512 + (first - 2) * fatSpc;
 }
 
 static void fat_place(const char *dir, uint32_t parentFirst, int isRoot,
@@ -371,8 +391,10 @@ static void fat_place(const char *dir, uint32_t parentFirst, int isRoot,
 static uint32_t fat_alloc_dir_data(void) { return fat_alloc(1); }
 
 static void fat_write_dir_data(uint32_t first, FatEnt *entries, int n, uint32_t selfFirst, uint32_t parentFirst, int isRoot) {
-    uint8_t buf[FAT_SPC * FAT_SECTOR];
-    memset(buf, 0, sizeof(buf));
+    uint8_t buf[64 * FAT_SECTOR];
+    uint32_t csz = fatSpc * FAT_SECTOR;
+    if (csz > sizeof(buf)) csz = sizeof(buf);
+    memset(buf, 0, csz);
     uint32_t lba = fat_data_lba(first);
     if (!isRoot) {
         memcpy(buf, ".          ", 11); buf[11] = 0x10;
@@ -390,7 +412,7 @@ static void fat_write_dir_data(uint32_t first, FatEnt *entries, int n, uint32_t 
         buf[off + 30] = (entries[i].size >> 16) & 0xff; buf[off + 31] = (entries[i].size >> 24) & 0xff;
         off += 32;
     }
-    memcpy(fatImage + lba * FAT_SECTOR, buf, FAT_SPC * FAT_SECTOR);
+    memcpy(fatImage + lba * FAT_SECTOR, buf, csz);
 }
 
 /* place le contenu du répertoire ; renvoie les entrées allouées */
@@ -420,13 +442,13 @@ static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
         if (ents[i].isDir) {
             ents[i].first = fat_alloc_dir_data();
         } else {
-            int clusters = (int)((ents[i].size + FAT_SPC * FAT_SECTOR - 1) / (FAT_SPC * FAT_SECTOR));
+            int clusters = (int)((ents[i].size + fatSpc * FAT_SECTOR - 1) / (fatSpc * FAT_SECTOR));
             if (clusters == 0) clusters = 1;
             ents[i].first = fat_alloc(clusters);
             FILE *g = fopen(ents[i].path, "rb");
             if (g) {
-                uint8_t *data = malloc((size_t)clusters * FAT_SPC * FAT_SECTOR);
-                memset(data, 0, (size_t)clusters * FAT_SPC * FAT_SECTOR);
+                uint8_t *data = malloc((size_t)clusters * fatSpc * FAT_SECTOR);
+                memset(data, 0, (size_t)clusters * fatSpc * FAT_SECTOR);
                 size_t got = fread(data, 1, ents[i].size, g);
                 (void)got;
                 memcpy(fatImage + fat_data_lba(ents[i].first) * FAT_SECTOR, data,
@@ -454,25 +476,47 @@ static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
     *outEntries = ents; *outN = n;
 }
 
-/* amorce du volume : secteurs de boot + table FAT vide */
-static void fat_bootstrap(void) {
-    fatImageSize = (size_t)FAT_TOTAL * FAT_SECTOR;
+/* amorce du volume : géométrie calculée pour contenir `bytes` de données
+ * (FAT16, clusters 4-32 Ko, volume borné à ~511 Mo) */
+static void fat_bootstrap_for(size_t bytes, int ndirs) {
+    uint32_t spc = 8; /* 4 Ko */
+    double cl;
+    for (;;) {
+        cl = (double)bytes / (spc * FAT_SECTOR) + 8 + ndirs;
+        if (cl <= 65000.0 || spc >= 64) break;
+        spc *= 2;
+    }
+    uint32_t clusters = (uint32_t)cl + 1;
+    uint32_t fatsz = (uint32_t)(((clusters + 2) * 2 + FAT_SECTOR - 1) / FAT_SECTOR);
+    uint32_t total = 1 + 2 * fatsz + 32 + clusters * spc;
+    if (fatsz < 65) { /* plancher compat : le driver FAT16 du firmware
+                       * refuse les petites tables (écran bleu) */
+        fatsz = 65;
+        uint32_t totalMin = 1 + 2 * fatsz + 32 + clusters * spc;
+        if (total < totalMin) total = totalMin;
+        clusters = (total - 1 - 2 * fatsz - 32) / spc;
+    }
+    fatSpc = spc;
+    fatFatsz = fatsz;
+    fatTotalSectors = (int)total;
+    fatImageSize = (size_t)total * FAT_SECTOR;
     fatImage = calloc(1, fatImageSize);
-    fatTable = calloc(65 * FAT_SECTOR, 1);
+    fatTable = calloc((size_t)fatsz * FAT_SECTOR, 1);
     fatTable[0] = 0xf8; fatTable[1] = 0xff;
     fatTable[2] = 0xff; fatTable[3] = 0xff;
     fatImage[0] = 0xeb; fatImage[1] = 0x3c; fatImage[2] = 0x90;
     memcpy(fatImage + 3, "GBREMU", 6);
-    fatImage[0x0b] = 0x00; fatImage[0x0c] = 0x02;
-    fatImage[0x0d] = FAT_SPC;
+    fprintf(stderr, "[boot] spc=%u fatsz=%u total=%u clusters=%u ndirs=%d bytes=%zu\n",
+            spc, fatsz, total, clusters, ndirs, bytes);
+    fatImage[0x0b] = 0x00; fatImage[0x0c] = 0x02; /* 512 octets/secteur */
+    fatImage[0x0d] = (uint8_t)spc;
     fatImage[0x0e] = 0x01; fatImage[0x0f] = 0x00;
     fatImage[0x10] = 0x02;
     fatImage[0x11] = FAT_ROOT & 0xff; fatImage[0x12] = FAT_ROOT >> 8;
     fatImage[0x15] = 0xf8;
-    fatImage[0x16] = 65 & 0xff; fatImage[0x17] = 0;  /* 65 secteurs/FAT */
+    fatImage[0x16] = fatsz & 0xff; fatImage[0x17] = (fatsz >> 8) & 0xff;
     fatImage[0x18] = 32; fatImage[0x19] = 0;   /* secteurs/piste */
     fatImage[0x1a] = 8; fatImage[0x1b] = 0;    /* têtes */
-    uint32_t total = FAT_TOTAL;
     fatImage[0x20] = total & 0xff; fatImage[0x21] = (total >> 8) & 0xff;
     fatImage[0x22] = (total >> 16) & 0xff; fatImage[0x23] = (total >> 24) & 0xff;
     fatImage[510] = 0x55; fatImage[511] = 0xaa;
@@ -510,7 +554,7 @@ static void fat_finish(const char *label) {
 }
 
 static void fat_build_from_dir(const char *dir) {
-    fat_bootstrap();
+    fat_bootstrap_for(64u * 1024 * 1024, 16);
     rootEnts = NULL; rootN = 0;
     fat_walk(dir, 0, 1, &rootEnts, &rootN);
     fat_finish(dir);
@@ -555,14 +599,14 @@ static void fat_walk_vfiles(const char *prefix, uint32_t parentFirst, int isRoot
         if (ents[i].isDir) {
             ents[i].first = fat_alloc_dir_data();
         } else {
-            int clusters = (int)((ents[i].size + FAT_SPC * FAT_SECTOR - 1) / (FAT_SPC * FAT_SECTOR));
+            int clusters = (int)((ents[i].size + fatSpc * FAT_SECTOR - 1) / (fatSpc * FAT_SECTOR));
             if (clusters == 0) clusters = 1;
             ents[i].first = fat_alloc(clusters);
             /* retrouve les données du vfile */
             for (int j = 0; j < nvfiles; j++) {
                 if (strcmp(vfiles[j].path, ents[i].path) == 0) {
                     uint8_t *dst = fatImage + fat_data_lba(ents[i].first) * FAT_SECTOR;
-                    memset(dst, 0, (size_t)clusters * FAT_SPC * FAT_SECTOR);
+                    memset(dst, 0, (size_t)clusters * fatSpc * FAT_SECTOR);
                     memcpy(dst, vfiles[j].data, vfiles[j].size);
                     if (fatFileCount < 512) {
                         fatFiles[fatFileCount].lba = fat_data_lba(ents[i].first);
@@ -591,7 +635,10 @@ static void fat_walk_vfiles(const char *prefix, uint32_t parentFirst, int isRoot
 }
 
 static void fat_build_from_vfiles(void) {
-    fat_bootstrap();
+    size_t total = 0;
+    for (int i = 0; i < nvfiles; i++) total += vfiles[i].size + 128;
+    if (total < 4u * 1024 * 1024) total = 4u * 1024 * 1024; /* plancher 4 Mo */
+    fat_bootstrap_for(total, vfile_dir_count());
     rootEnts = NULL; rootN = 0;
     fat_walk_vfiles("", 0, 1, &rootEnts, &rootN);
     fat_finish("fichiers déposés");
@@ -1526,8 +1573,9 @@ static void sd_unload(void) {
     sd_initialized = 0;
 }
 
-/* réinitialise toute la machine (drop d'un nouveau firmware) */
-static void reset_machine(void) {
+/* réinitialise la machine en conservant la carte SD montée
+ * (changement de jeu depuis le sélecteur) */
+static void reset_core(void) {
     memset(sram, 0xff, SRAM_SIZE);
     memset(regs, 0, sizeof regs);
     memset(regD, 0, sizeof regD);
@@ -1547,6 +1595,11 @@ static void reset_machine(void) {
     millisWrites = 0;
     aq_head = aq_tail = 0; audioHold = 0;
     emu_nextFrameTick = tickCount + EMU_FRAME_TICKS;
+}
+
+/* réinitialise toute la machine (drop d'un nouveau firmware) */
+static void reset_machine(void) {
+    reset_core();
     sd_unload();
 }
 
@@ -1638,7 +1691,8 @@ static void audio_start(void) {
 /* ------------------------------------------------ SDL/HTML5 ------------ */
 
 static int sdl_init_all(void) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO |
+                 (noPad() ? 0 : SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK)) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
@@ -1652,7 +1706,7 @@ static int sdl_init_all(void) {
     SDL_RenderSetIntegerScale(emuRen, SDL_TRUE);
 
     /* manette déjà branchée : contrôleur sinon joystick brut */
-    for (int i = 0; i < SDL_NumJoysticks(); i++) {
+    for (int i = 0; !noPad() && i < SDL_NumJoysticks(); i++) {
         if (SDL_IsGameController(i)) { pad = SDL_GameControllerOpen(i); if (pad) break; }
         else if (!joyFb) joyFb = SDL_JoystickOpen(i);
     }
@@ -1847,6 +1901,12 @@ int main(int argc, char **argv) {
 #elif !defined(__EMSCRIPTEN__)
 /* ------------------------------------------------------------ natif --- */
 
+static int noPad(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("EMU_NO_PAD") ? 1 : 0;
+    return v;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         fprintf(stderr, "meta_emu : lancé sans firmware — déposez un .bin "
@@ -2020,6 +2080,73 @@ int main(int argc, char **argv) {
 #include <emscripten.h>
 
 /* points d'entrée JS -> C (drop / sélection de dossier) */
+
+/* ---- sélecteur de jeux : énumération + changement à chaud ---- */
+
+static int vfile_is_game(const VFile *v) {
+    size_t l = strlen(v->name);
+    return l > 4 && strcasecmp(v->name + l - 4, ".bin") == 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int emu_games_count(void) {
+    int n = 0;
+    for (int i = 0; i < nvfiles; i++) if (vfile_is_game(&vfiles[i])) n++;
+    return n;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int emu_game_name(int idx, char *out, int outlen) {
+    for (int i = 0, k = 0; i < nvfiles; i++) {
+        if (!vfile_is_game(&vfiles[i])) continue;
+        if (k++ == idx) {
+            snprintf(out, outlen, "%s", vfiles[i].name);
+            return (int)strlen(vfiles[i].name);
+        }
+    }
+    return 0;
+}
+
+/* l'icône du jeu = ICON.BMP du même dossier ; renvoie la taille copiée */
+EMSCRIPTEN_KEEPALIVE
+int emu_game_icon(int idx, char *out, int outlen) {
+    char bin[1024];
+    if (emu_game_name(idx, bin, sizeof(bin)) == 0) return 0;
+    char dir[1024] = "";
+    char *sl = strrchr(bin, '/');
+    if (sl) snprintf(dir, sizeof(dir), "%.*s", (int)(sl - bin), bin);
+    char icon[1100];
+    snprintf(icon, sizeof(icon), "%s%sICON.BMP", dir, dir[0] ? "/" : "");
+    for (int i = 0; i < nvfiles; i++) {
+        if (strcasecmp(vfiles[i].name, icon) == 0) {
+            int n = vfiles[i].size < outlen ? (int)vfiles[i].size : outlen;
+            memcpy(out, vfiles[i].data, n);
+            return n;
+        }
+    }
+    return 0;
+}
+
+/* change de jeu : la carte reste montée, seul le firmware change */
+EMSCRIPTEN_KEEPALIVE
+int emu_select_game(const char *name) {
+    for (int i = 0; i < nvfiles; i++) {
+        if (strcasecmp(vfiles[i].name, name) != 0) continue;
+        if (!vfile_is_game(&vfiles[i])) return 0;
+        reset_core();
+        char base[1024];
+        const char *sl = strrchr(name, '/');
+        snprintf(base, sizeof(base), "%s", sl ? sl + 1 : name);
+        load_firmware_data(vfiles[i].data, vfiles[i].size, base);
+        if (!fwLoaded) return 0;
+        boot_vectors();
+        audio_start();
+        machineEpoch++;
+        refresh_title();
+        return 1;
+    }
+    return 0;
+}
 
 EMSCRIPTEN_KEEPALIVE
 int emu_firmware(uint8_t *data, int len, const char *name) {

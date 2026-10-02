@@ -44,6 +44,10 @@ A=A, B=B, Start=MENU, Back/Guide=HOME, croix directionnelle et stick
 gauche = directions.  Joystick sans mapping : boutons 0=A, 1=B, 2=MENU,
 3=HOME, chapeau 0 = directions.  Branchement/débranchement à chaud géré.
 
+- Carte SD à **taille dynamique** : la géométrie FAT16 (clusters 4-32 Ko,
+  volume jusqu'à ~511 Mo) est calculée depuis le contenu — une
+  bibliothèque complète tient sur la carte virtuelle.
+
 ## Usage (navigateur)
 
     cd wasm && python3 -m http.server 8000

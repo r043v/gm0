@@ -19,6 +19,25 @@
   #overlay.hidden { display: none; }
   #status { position: fixed; left: 8px; bottom: 6px; color: #546e7a;
             font: 12px monospace; }
+  #gamesBtn { position: fixed; top: 10px; right: 10px; z-index: 20;
+              background: #1b5e20cc; color: #c8e6c9; border: 1px solid #2e7d32;
+              border-radius: 6px; padding: 6px 12px; font: 14px system-ui;
+              cursor: pointer; display: none; }
+  #gamesBtn:hover { background: #2e7d32cc; }
+  #lightbox { position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,.85);
+              display: none; overflow-y: auto; padding: 24px; }
+  #lightbox.open { display: block; }
+  #lightbox h2 { color: #9ccc65; font: 18px system-ui; margin: 0 0 16px; }
+  #lightbox .grid { display: flex; flex-wrap: wrap; gap: 14px; }
+  #lightbox .game { width: 120px; cursor: pointer; text-align: center;
+                    color: #cfd8dc; font: 12px system-ui; }
+  #lightbox .game:hover { color: #9ccc65; }
+  #lightbox .game img { width: 80px; height: 64px; object-fit: contain;
+                        background: #000; border: 1px solid #333;
+                        image-rendering: pixelated; }
+  #lightbox .game .nm { margin-top: 4px; word-break: break-word; }
+  #lightbox #closeLb { position: fixed; top: 10px; right: 10px; color: #cfd8dc;
+                       font: 20px system-ui; cursor: pointer; }
 </style>
 </head>
 <body>
@@ -31,6 +50,8 @@
          fichiers) sont chargés ensemble. Flèches/ZQSD, Entrée=MENU,
          Espace=A, Ctrl=B, *=HOME — ou manette.</small>
 </div>
+<div id="gamesBtn">🎮 Jeux</div>
+<div id="lightbox"><span id="closeLb">✕</span><h2>Jeux sur la carte</h2><div class="grid" id="gameGrid"></div></div>
 <div id="status"></div>
 <input id="folder" type="file" webkitdirectory multiple hidden>
 <input id="files" type="file" multiple hidden>
@@ -111,6 +132,7 @@ async function loadSet(items) {
     if (r === 2) {
       overlay.classList.add('hidden');
       setStatus('zip chargé : firmware + carte');
+      if (gamesCount() > 1) gamesBtn.style.display = 'block';
     } else setStatus('zip inexploitable');
     return;
   }
@@ -188,6 +210,69 @@ document.addEventListener('drop', async e => {
   setStatus(`${out.length} élément(s) reçu(s)…`);
   await loadSet(out);
 });
+
+/* ---- sélecteur de jeux (carte multi-jeux) ---- */
+const gamesBtn = document.getElementById('gamesBtn');
+const lightbox = document.getElementById('lightbox');
+const gameGrid = document.getElementById('gameGrid');
+
+function gamesCount() {
+  const f = cfunc('emu_games_count');
+  return f ? f() : 0;
+}
+
+async function openLightbox() {
+  const n = gamesCount();
+  if (!n) { setStatus('aucun jeu .bin sur la carte'); return; }
+  gameGrid.innerHTML = '';
+  const names = [];
+  for (let i = 0; i < n; i++) {
+    const f = cfunc('emu_game_name');
+    if (!f) break;
+    const buf = Module._malloc(1024);
+    f(i, buf, 1024);
+    names.push(Module.HEAPU8.slice(buf, buf + 1024));
+    Module._free(buf);
+  }
+  for (let i = 0; i < names.length; i++) {
+    const fullPath = new TextDecoder().decode(names[i]).replace(/\0.*$/, '');
+    const base = fullPath.split('/').pop().replace(/\.bin$/i, '');
+    const folder = fullPath.includes('/') ? fullPath.split('/')[0] : base;
+    const div = document.createElement('div');
+    div.className = 'game';
+    div.innerHTML = '<img alt=""><div class="nm"></div>';
+    div.querySelector('.nm').textContent = folder;
+    div.onclick = async () => {
+      lightbox.classList.remove('open');
+      setStatus('chargement de ' + folder + '…');
+      const sel = cfunc('emu_select_game');
+      const nb = Module._malloc(1024);
+      Module.stringToUTF8(fullPath, nb, 1024);
+      const ok = sel(nb);
+      Module._free(nb);
+      if (ok) setStatus('jeu : ' + folder);
+      else setStatus('échec du changement de jeu');
+    };
+    // l'icône si elle existe
+    const gi = cfunc('emu_game_icon');
+    const ib = Module._malloc(65536);
+    const ilen = gi ? gi(i, ib, 65536) : 0;
+    if (ilen > 0) {
+      const bmp = new Blob([Module.HEAPU8.slice(ib, ib + ilen)], { type: 'image/bmp' });
+      div.querySelector('img').src = URL.createObjectURL(bmp);
+    }
+    Module._free(ib);
+    gameGrid.appendChild(div);
+  }
+  lightbox.classList.add('open');
+}
+
+gamesBtn.addEventListener('click', () => {
+  if (lightbox.classList.contains('open')) lightbox.classList.remove('open');
+  else openLightbox();
+});
+document.getElementById('closeLb').addEventListener('click', () => lightbox.classList.remove('open'));
+window.addEventListener('keydown', e => { if (e.key === 'Escape') lightbox.classList.remove('open'); });
 
 /* ---- sélecteurs de fichiers ---- */
 overlay.addEventListener('click', () => folderInput.click());
