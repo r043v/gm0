@@ -77,6 +77,10 @@ static uint8_t  sd_writeBuf[515];
 
 /* audio SDL : anneau producteur (ISR) -> consommateur (callback) */
 #define AQ_SIZE 65536
+/* plafond de latence son/image : au-delà, on jette le plus ancien.  Sans
+ * ça, chaque burst du rAF (onglet réveillé, stall) accumule un retard
+ * définitif — l'anneau ne se corrige jamais tout seul (3 s = 65536). */
+#define AQ_LATENCY 900
 static int16_t aq[AQ_SIZE];
 static volatile int aq_head, aq_tail; /* tail = écrit, head = lu */
 static int16_t audioHold = 0;
@@ -136,9 +140,12 @@ static uint32_t port_read(int group, uint32_t off) {
 
 static void audio_push(int16_t s) {
     int next = (aq_tail + 1) % AQ_SIZE;
-    if (next == aq_head) return; /* plein : on jette (l'onglet est caché) */
+    if (next == aq_head) aq_head = (aq_head + 1) % AQ_SIZE; /* plein : jette le plus ancien */
     aq[aq_tail] = s;
     aq_tail = next;
+    int ahead = aq_tail - aq_head;
+    if (ahead < 0) ahead += AQ_SIZE;
+    if (ahead > AQ_LATENCY) aq_head = (aq_head + ahead - AQ_LATENCY) % AQ_SIZE;
 }
 
 static void wav_put(int16_t s) {
@@ -1570,6 +1577,7 @@ static uint8_t padDirBits; /* directions tenues par stick/chapeau */
 static uint32_t emu_nextFrameTick = EMU_FRAME_TICKS;
 static Uint32 titleMs;
 static uint32_t titleTick;
+static char titleBuf[1200]; /* dernier titre construit (HUD wasm) */
 
 /* décharge la carte SD courante (image ou image FAT d'un répertoire) */
 static void sd_unload(void) {
@@ -1738,7 +1746,7 @@ static int sdl_init_all(void) {
     SDL_AudioSpec want, got;
     memset(&want, 0, sizeof(want));
     want.freq = 22049; want.format = AUDIO_S16SYS; want.channels = 1;
-    want.samples = 2048; want.callback = audio_cb;
+    want.samples = 1024; want.callback = audio_cb;
     audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
     audioOk = audioDev != 0;
     if (!audioOk) fprintf(stderr, "audio indisponible : %s\n", SDL_GetError());
@@ -1877,18 +1885,17 @@ static void update_diagnostics(Uint32 frame) {
 static void update_title_pct(void) {
     Uint32 nowMs = SDL_GetTicks();
     if (nowMs - titleMs < 500) return;
-    char title[1200];
     if (fwLoaded) {
         double emuMs = (double)(tickCount - titleTick) / 20000.0;
         double wallMs = (double)(nowMs - titleMs);
         int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
-        snprintf(title, sizeof(title), "Gamebuino META — %.900s — %d%%", fwName, pct);
+        snprintf(titleBuf, sizeof(titleBuf), "Gamebuino META — %.900s — %d%%", fwName, pct);
     } else {
-        snprintf(title, sizeof(title), "Gamebuino META — déposez un firmware .bin");
+        snprintf(titleBuf, sizeof(titleBuf), "Gamebuino META — déposez un firmware .bin");
     }
-    SDL_SetWindowTitle(emuWin, title);
+    SDL_SetWindowTitle(emuWin, titleBuf);
     titleMs = nowMs;
     titleTick = tickCount;
 }
@@ -2213,12 +2220,11 @@ void emu_card_finish(void) {
 static Uint32 wasmFrame = 0;
 static unsigned seenEpoch = 0;
 static double wasmLastFrame = 0;
+static Uint32 hudMs; /* dernier push du HUD dans la page */
 
 static void wasm_loop(void) {
     if (!poll_events()) emscripten_cancel_main_loop();
     update_diagnostics(wasmFrame);
-    if (wasmFrame && (wasmFrame & 63) == 0) /* battement (pas à l'arrêt) */
-        EM_ASM({ document.title = 'META f=' + $0; }, wasmFrame);
     if (machineEpoch != seenEpoch) {
         /* un drop a réinitialisé la machine : resynchronise le pas de frame */
         seenEpoch = machineEpoch;
@@ -2240,6 +2246,13 @@ static void wasm_loop(void) {
     wasmLastFrame += due * frameMs;
     if (now - wasmLastFrame > frameMs) wasmLastFrame = now;
     update_title_pct();
+    /* titre + % visibles dans la page (mise à jour au rythme du %) */
+    if (fwLoaded && titleMs != hudMs && titleBuf[0]) {
+        hudMs = titleMs;
+        EM_ASM({ const el = document.getElementById('hud');
+                 if (el) { el.textContent = UTF8ToString($0);
+                           el.style.display = 'block'; } }, titleBuf);
+    }
     blit(emuRen);
 }
 

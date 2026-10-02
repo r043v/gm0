@@ -24,6 +24,11 @@
     border-radius: 14px; cursor: pointer; padding: 0;
   }
   .btns button:hover { background: #26313f; border-color: #78909c; }
+  #hud { position: fixed; top: 8px; left: 8px; z-index: 15; display: none;
+         background: rgba(16, 20, 24, .75); color: #9ccc65;
+         border: 1px solid #2e7d32; border-radius: 6px; padding: 3px 10px;
+         font: 12px/1.4 ui-monospace, monospace; max-width: 70vw;
+         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   #status { position: fixed; left: 8px; bottom: 6px; color: #546e7a;
             font: 12px monospace; }
   #gamesBtn { position: fixed; top: 10px; right: 10px; z-index: 20;
@@ -63,6 +68,7 @@
          (son premier .bin lance le jeu — bouton « 🎮 Jeux » pour changer).
          Flèches/ZQSD, Entrée=MENU, Espace=A, Ctrl=B, *=HOME — ou manette.</small>
 </div>
+<div id="hud"></div>
 <div id="gamesBtn">🎮 Jeux</div>
 <div id="lightbox"><span id="closeLb">✕</span><h2>Jeux sur la carte</h2><div class="grid" id="gameGrid"></div></div>
 <div id="status"></div>
