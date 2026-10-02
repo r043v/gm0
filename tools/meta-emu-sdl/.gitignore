@@ -10,3 +10,5 @@ wasm/meta_emu_debug.js
 wasm/meta_emu_debug2.js
 wasm/meta_emu_node.js
 wasm/meta_emu_node.wasm
+wasm/solotest/
+wasm/ziptest/
