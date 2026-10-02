@@ -479,23 +479,20 @@ static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
 /* amorce du volume : géométrie calculée pour contenir `bytes` de données
  * (FAT16, clusters 4-32 Ko, volume borné à ~511 Mo) */
 static void fat_bootstrap_for(size_t bytes, int ndirs) {
+    /* FAT16 impose 4085..65000 clusters : choisit le spc en conséquence */
     uint32_t spc = 8; /* 4 Ko */
     double cl;
     for (;;) {
         cl = (double)bytes / (spc * FAT_SECTOR) + 8 + ndirs;
-        if (cl <= 65000.0 || spc >= 64) break;
-        spc *= 2;
+        if (cl > 65000.0 && spc < 64) { spc *= 2; continue; }
+        if (cl < 4085.0 && spc > 1) { spc /= 2; continue; }
+        break;
     }
     uint32_t clusters = (uint32_t)cl + 1;
+    if (clusters < 4085u) clusters = 4085u; /* plancher FAT16 */
+    if (clusters > 65000u) clusters = 65000u;
     uint32_t fatsz = (uint32_t)(((clusters + 2) * 2 + FAT_SECTOR - 1) / FAT_SECTOR);
     uint32_t total = 1 + 2 * fatsz + 32 + clusters * spc;
-    if (fatsz < 65) { /* plancher compat : le driver FAT16 du firmware
-                       * refuse les petites tables (écran bleu) */
-        fatsz = 65;
-        uint32_t totalMin = 1 + 2 * fatsz + 32 + clusters * spc;
-        if (total < totalMin) total = totalMin;
-        clusters = (total - 1 - 2 * fatsz - 32) / spc;
-    }
     fatSpc = spc;
     fatFatsz = fatsz;
     fatTotalSectors = (int)total;
@@ -506,8 +503,6 @@ static void fat_bootstrap_for(size_t bytes, int ndirs) {
     fatTable[2] = 0xff; fatTable[3] = 0xff;
     fatImage[0] = 0xeb; fatImage[1] = 0x3c; fatImage[2] = 0x90;
     memcpy(fatImage + 3, "GBREMU", 6);
-    fprintf(stderr, "[boot] spc=%u fatsz=%u total=%u clusters=%u ndirs=%d bytes=%zu\n",
-            spc, fatsz, total, clusters, ndirs, bytes);
     fatImage[0x0b] = 0x00; fatImage[0x0c] = 0x02; /* 512 octets/secteur */
     fatImage[0x0d] = (uint8_t)spc;
     fatImage[0x0e] = 0x01; fatImage[0x0f] = 0x00;
@@ -517,8 +512,14 @@ static void fat_bootstrap_for(size_t bytes, int ndirs) {
     fatImage[0x16] = fatsz & 0xff; fatImage[0x17] = (fatsz >> 8) & 0xff;
     fatImage[0x18] = 32; fatImage[0x19] = 0;   /* secteurs/piste */
     fatImage[0x1a] = 8; fatImage[0x1b] = 0;    /* têtes */
-    fatImage[0x20] = total & 0xff; fatImage[0x21] = (total >> 8) & 0xff;
-    fatImage[0x22] = (total >> 16) & 0xff; fatImage[0x23] = (total >> 24) & 0xff;
+    /* FAT16 : total en 16 bits (0x13) sous 65536 secteurs, sinon en 32
+     * (0x20) — le driver du firmware ne lit que le champ 16 bits */
+    if (total < 65536u) {
+        fatImage[0x13] = total & 0xff; fatImage[0x14] = (total >> 8) & 0xff;
+    } else {
+        fatImage[0x20] = total & 0xff; fatImage[0x21] = (total >> 8) & 0xff;
+        fatImage[0x22] = (total >> 16) & 0xff; fatImage[0x23] = (total >> 24) & 0xff;
+    }
     fatImage[510] = 0x55; fatImage[511] = 0xaa;
 }
 
@@ -528,7 +529,9 @@ static int rootN;
 /* écrit la racine puis recopie les 2 FAT (la table a été remplie par les
  * allocations) */
 static void fat_finish(const char *label) {
-    uint16_t fatsz = 65;
+    uint32_t fatsz = fatFatsz; /* dynamique (l'ancien 65 figé écrivait la
+                                * racine au mauvais endroit et lisait
+                                * hors-tampon pour les cartes réduites) */
     uint8_t *rootBuf = calloc(FAT_ROOT * 32, 1);
     int off = 0;
     for (int i = 0; i < rootN; i++) {
@@ -637,6 +640,8 @@ static void fat_walk_vfiles(const char *prefix, uint32_t parentFirst, int isRoot
 static void fat_build_from_vfiles(void) {
     size_t total = 0;
     for (int i = 0; i < nvfiles; i++) total += vfiles[i].size + 128;
+    /* marge : arrondi au cluster de chaque fichier + dossiers + slack */
+    total += (size_t)(nvfiles + vfile_dir_count() + 16) * 32768;
     if (total < 4u * 1024 * 1024) total = 4u * 1024 * 1024; /* plancher 4 Mo */
     fat_bootstrap_for(total, vfile_dir_count());
     rootEnts = NULL; rootN = 0;
@@ -1690,6 +1695,12 @@ static void audio_start(void) {
 
 /* ------------------------------------------------ SDL/HTML5 ------------ */
 
+static int noPad(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("EMU_NO_PAD") ? 1 : 0;
+    return v;
+}
+
 static int sdl_init_all(void) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO |
                  (noPad() ? 0 : SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK)) != 0) {
@@ -1901,12 +1912,6 @@ int main(int argc, char **argv) {
 #elif !defined(__EMSCRIPTEN__)
 /* ------------------------------------------------------------ natif --- */
 
-static int noPad(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("EMU_NO_PAD") ? 1 : 0;
-    return v;
-}
-
 int main(int argc, char **argv) {
     if (argc < 2)
         fprintf(stderr, "meta_emu : lancé sans firmware — déposez un .bin "
@@ -2084,8 +2089,8 @@ int main(int argc, char **argv) {
 /* ---- sélecteur de jeux : énumération + changement à chaud ---- */
 
 static int vfile_is_game(const VFile *v) {
-    size_t l = strlen(v->name);
-    return l > 4 && strcasecmp(v->name + l - 4, ".bin") == 0;
+    size_t l = strlen(v->path);
+    return l > 4 && strcasecmp(v->path + l - 4, ".bin") == 0;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -2100,8 +2105,8 @@ int emu_game_name(int idx, char *out, int outlen) {
     for (int i = 0, k = 0; i < nvfiles; i++) {
         if (!vfile_is_game(&vfiles[i])) continue;
         if (k++ == idx) {
-            snprintf(out, outlen, "%s", vfiles[i].name);
-            return (int)strlen(vfiles[i].name);
+            snprintf(out, outlen, "%s", vfiles[i].path);
+            return (int)strlen(vfiles[i].path);
         }
     }
     return 0;
@@ -2118,7 +2123,7 @@ int emu_game_icon(int idx, char *out, int outlen) {
     char icon[1100];
     snprintf(icon, sizeof(icon), "%s%sICON.BMP", dir, dir[0] ? "/" : "");
     for (int i = 0; i < nvfiles; i++) {
-        if (strcasecmp(vfiles[i].name, icon) == 0) {
+        if (strcasecmp(vfiles[i].path, icon) == 0) {
             int n = vfiles[i].size < outlen ? (int)vfiles[i].size : outlen;
             memcpy(out, vfiles[i].data, n);
             return n;
@@ -2131,7 +2136,7 @@ int emu_game_icon(int idx, char *out, int outlen) {
 EMSCRIPTEN_KEEPALIVE
 int emu_select_game(const char *name) {
     for (int i = 0; i < nvfiles; i++) {
-        if (strcasecmp(vfiles[i].name, name) != 0) continue;
+        if (strcasecmp(vfiles[i].path, name) != 0) continue;
         if (!vfile_is_game(&vfiles[i])) return 0;
         reset_core();
         char base[1024];
