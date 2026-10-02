@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>META — déposez un firmware .bin</title>
+<title>META / Pokitto — déposez un firmware .bin</title>
 <style>
   /* fond sur html seulement : propagé au viewport, peint sous les éléments
    * z-index négatifs (le % derrière le canvas reste visible) */
@@ -59,7 +59,7 @@
 <body>
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
 <div id="overlay">
-  <h1>Gamebuino META — émulateur (wasm)</h1>
+  <h1>Gamebuino META / Pokitto — émulateur (wasm)</h1>
   <div class="btns">
     <button id="pickFiles" aria-label="Choisir un fichier : .zip (carte) ou .bin (jeu)"
             title="Un fichier : .zip (carte SD) ou .bin (jeu)">📄</button>
@@ -67,10 +67,11 @@
             title="Un répertoire de jeu (bin + rom + sauvegarde)">📁</button>
   </div>
   <div>… ou déposez-les directement ici.</div>
-  <small>Un dossier avec un seul .bin : le firmware et la carte (les autres
-         fichiers) sont chargés ensemble. Un .zip = carte SD complète
-         (son premier .bin lance le jeu — bouton « 🎮 Jeux » pour changer).
-         Flèches/ZQSD, Entrée=MENU, Espace=A, Ctrl=B, *=HOME — ou manette.</small>
+  <small>La cible (META ou Pokitto) est détectée automatiquement — .bin,
+         .pop (loader Pokitto), .zip ou dossier acceptés. Un .zip = carte SD
+         complète (son premier .bin lance le jeu — bouton « 🎮 Jeux » pour
+         changer). META : flèches/ZQSD, Entrée=MENU, Espace=A, Ctrl=B,
+         *=HOME. Pokitto : IJKL/flèches, A=« a », B=« s », C=« d » — ou manette.</small>
 </div>
 <div id="pct"></div>
 <div id="gamesBtn">🎮 Jeux</div>

@@ -1,10 +1,22 @@
-# meta-emu-sdl — émulateur Gamebuino META en C/SDL2 + WebAssembly
+# meta-emu-sdl — émulateur Gamebuino META **et Pokitto** en C/SDL2 + WebAssembly
 
 Port C du fork TypeScript (`output/gbemu/`) : interpréteur ARMv6-M Thumb,
 périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
 (image brute ou dossier FAT16 construit à la volée) et frontal SDL2
 (fenêtre 160×128, clavier, audio 22 049 Hz).  Se compile aussi en
 **WebAssembly** (même cœur, navigateur).
+
+Depuis l'ajout Pokitto, le même binaire émule aussi la **Pokitto**
+(LPC11U68, Cortex-M0 — port C fidèle du PokittoEmu de felipemanga) :
+périphériques LPC (SYSCON, IOCON, CT32B0/1, SysTick, SCT, SSP0/1, ADC,
+RTC, USART0, GPIO 4 banques), écran 220×176 bit-bang GPIO, audio R2R 8
+bits sur les ports (+ audio HLE si la signature du firmware stock est
+reconnue), carte SD SPI sur SSP0, EEPROM 4 Ko persistée (`<jeu>.eeprom`),
+API ROM (IAP + division).  La cible est **détectée automatiquement** au
+chargement (mot 0 = SP initial dans la SRAM LPC 0x1000xxxx → Pokitto),
+ou forcée par `--target meta|pokitto` (env `EMU_TARGET`).  Le conteneur
+**.pop** du loader Pokitto est lu nativement (les enregistrements
+métadonnées sont ignorés, le programme est flashé).
 
 ## Compilation
 
@@ -36,8 +48,22 @@ périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
       out/<Jeu>/.pio/build/meta/firmware.bin output/sd-card \
       --frames 300 --shot /tmp/shot.ppm
 
-Touches : flèches, ZQSD/WASD, **Entrée**=Start (MENU), **Espace**=A,
+Exemple Pokitto (détection automatique ; la carte est un argument
+explicite — image .img ou dossier —, jamais le répertoire du .bin) :
+
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu \
+      jeu.bin carte --frames 300 --shot /tmp/shot.ppm
+    # .pop accepté tel quel ; --out-img out.img exporte la carte modifiée ;
+    # -w/-W ignorent les écritures flash fautives (comme la référence)
+
+Options : `--target meta|pokitto`, `--out-img <fichier>`, `-w [n]`, `-W`
+en plus des options META existantes (`--wav`, `--frames`, `--shot`).
+
+Touches META : flèches, ZQSD/WASD, **Entrée**=Start (MENU), **Espace**=A,
 **Ctrl**=B, **\***=Select (HOME), ou J=A, K=B, U=MENU, I=HOME.
+Touches Pokitto : **I/K/J/L** ou flèches = directions, **A**=A,
+**S/B**=B, **D/C**=C, **F**=D (éclairage).  **F5** redémarre le jeu
+(les deux cibles ; la carte SD et l'EEPROM Pokitto sont conservées).
 
 **Manette** (SDL_GameController ; bascule automatique sur joystick brut) :
 A=A, B=B, Start=MENU, Back/Guide=HOME, croix directionnelle et stick
@@ -73,6 +99,32 @@ fonctionnalités que la version servie.
 - `index.html?test` : charge `./test/firmware.bin` + fichiers de
   `./test/` servis à côté (hook de test local ; `wasm/test/` est
   ignoré par git — y déposer un firmware et des jeux pour essayer).
+
+## État Pokitto
+
+- Boot complet validé sur le binaire de test du dépôt PokittoEmu
+  (`HelloWorld`) : écran LCD bit-bang, timers (SysTick + CT32B1 à
+  625 kHz), constructeurs C++ (itération `.init_array`), attentes
+  `wait_us` — le texte « Pokitto » s'affiche ; la sortie d'écran est
+  stable et l'audio R2R est câblé sur les écritures GPIO.
+- Régressions META : **sortie d'écran bit-à-bit identique** à l'émulateur
+  d'avant l'ajout (firmware de test, 400 frames, hachages identiques) ;
+  deux bogues préexistants corrigés au passage (débordement de la table
+  FAT sur les gros répertoires ; surlecture `FAT_SPC` vs `fatSpc`).
+- `Pandemic` (PokittoLib récent, fourni en `.bin` et `.pop`) : écran
+  titre complet rendu (nom, auteur, menu) — boot, init horloges 72 MHz,
+  timers, constructeurs C++, IAP et API ROM (division) opérationnels.
+  L'émulateur de référence C++ ne bootait pas ce fichier dans le même
+  environnement.
+- Quirks CPU divergents par cible (volontaire) : la META garde la
+  sémantique exacte du TS (MUL non masqué via ombres flottantes,
+  décalages par registre au compteur, ROR absent, CPS no-op) ; la
+  Pokitto suit la sémantique ARM réelle de la référence C++ (MUL 32
+  bits, ROR, shifts, CPSIE/CPSID, xPSR aux positions ARM, BLX rm avec
+  lien + API ROM 0x1fff1ffx = IAP/division à 42 ticks).
+- Débogage Pokitto : `EMU_PK_DEBUG=1` (compteurs d'interruptions + état
+  timers/SysTick à la sortie) ; `EMU_FIXED_RTC=<s>` rend le RTC
+  déterministe (les traces deviennent reproductibles).
 
 ## État
 

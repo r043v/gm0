@@ -20,9 +20,9 @@ assert tag in h, 'balise du module introuvable dans index.html'
 h = h.replace(tag, '<script>\n' + js + '\n</script>')
 
 build = time.strftime('%d/%m %H:%M')
-h1 = '<h1>Gamebuino META — émulateur (wasm)</h1>'
+h1 = '<h1>Gamebuino META / Pokitto — émulateur (wasm)</h1>'
 assert h1 in h, 'titre de l\'overlay introuvable'
-h = h.replace(h1, f'<h1>Gamebuino META — émulateur (wasm) <small>build {build}</small></h1>')
+h = h.replace(h1, f'<h1>Gamebuino META / Pokitto — émulateur (wasm) <small>build {build}</small></h1>')
 
 out = d / 'meta-emu-standalone.html'
 out.write_text(h)
