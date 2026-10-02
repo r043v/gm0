@@ -44,11 +44,15 @@
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
 <div id="overlay">
   <h1>Gamebuino META — émulateur (wasm)</h1>
-  <div>Déposez ici un <b>.bin</b> (firmware), une <b>image .img</b> (carte SD)
-       ou un <b>dossier de jeu</b> — ou cliquez pour choisir.</div>
+  <div class="btns">
+    <button id="pickFiles">🗂 Choisir UN fichier<br><small>.zip (carte) / .bin (jeu)</small></button>
+    <button id="pickFolder">📁 Choisir un RÉPERTOIRE<br><small>de jeu (bin + rom + sauvegarde)</small></button>
+  </div>
+  <div>… ou déposez-les directement ici.</div>
   <small>Un dossier avec un seul .bin : le firmware et la carte (les autres
-         fichiers) sont chargés ensemble. Flèches/ZQSD, Entrée=MENU,
-         Espace=A, Ctrl=B, *=HOME — ou manette.</small>
+         fichiers) sont chargés ensemble. Un .zip = carte SD complète
+         (son premier .bin lance le jeu — bouton « 🎮 Jeux » pour changer).
+         Flèches/ZQSD, Entrée=MENU, Espace=A, Ctrl=B, *=HOME — ou manette.</small>
 </div>
 <div id="gamesBtn">🎮 Jeux</div>
 <div id="lightbox"><span id="closeLb">✕</span><h2>Jeux sur la carte</h2><div class="grid" id="gameGrid"></div></div>
@@ -275,7 +279,8 @@ document.getElementById('closeLb').addEventListener('click', () => lightbox.clas
 window.addEventListener('keydown', e => { if (e.key === 'Escape') lightbox.classList.remove('open'); });
 
 /* ---- sélecteurs de fichiers ---- */
-overlay.addEventListener('click', () => folderInput.click());
+document.getElementById('pickFiles').addEventListener('click', () => filesInput.click());
+document.getElementById('pickFolder').addEventListener('click', () => folderInput.click());
 folderInput.addEventListener('change', async () => {
   const items = [...folderInput.files].map(f => {
     const rel = (f.webkitRelativePath || f.name).split('/').slice(1).join('/') || f.name;

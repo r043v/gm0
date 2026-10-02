@@ -1600,6 +1600,7 @@ static void reset_core(void) {
     millisWrites = 0;
     aq_head = aq_tail = 0; audioHold = 0;
     emu_nextFrameTick = tickCount + EMU_FRAME_TICKS;
+    sd_reset_state(); /* pas de transaction SD résiduelle pour le jeu suivant */
 }
 
 /* réinitialise toute la machine (drop d'un nouveau firmware) */
