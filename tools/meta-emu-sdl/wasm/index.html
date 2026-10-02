@@ -129,6 +129,7 @@ function cZip(bytes) {
 /* charge un ensemble de fichiers {path, file} : le .bin unique devient le
  * firmware, le reste la carte SD (comme le fork TS) */
 async function loadSet(items) {
+  if (!items.length) { setStatus('aucun fichier reçu'); return; }
   // le module wasm doit être prêt (les drops peuvent arriver pendant le chargement)
   await new Promise(res => {
     if (Module.calledRun || Module._malloc) res();
@@ -187,16 +188,16 @@ async function loadSet(items) {
 }
 
 /* ---- glisser-déposer (récursif) ---- */
-function collectEntry(entry, path, out) {
+function collectEntry(entry, path, out, fails) {
   return new Promise(resolve => {
     if (entry.isFile) {
       entry.file(f => { out.push({ path: path + f.name, file: f }); resolve(); },
-                 () => resolve());
+                 () => { fails.push(entry.name); resolve(); });
     } else if (entry.isDirectory) {
       const reader = entry.createReader();
       const readBatch = () => reader.readEntries(async batch => {
         if (!batch.length) { resolve(); return; }
-        for (const e of batch) await collectEntry(e, path + entry.name + '/', out);
+        for (const e of batch) await collectEntry(e, path + entry.name + '/', out, fails);
         readBatch();
       }, () => resolve());
       readBatch();
@@ -213,23 +214,36 @@ document.addEventListener('drop', async e => {
             `${dt.files ? dt.files.length : '?'} fichier(s)…`);
   const out = [];
   const entries = [];
+  const fails = [];
   if (dt.items && dt.items.length && dt.items[0].webkitGetAsEntry) {
     for (const item of dt.items) {
       const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
-      if (entry) entries.push(entry);
+      if (entry) entries.push({ entry, item });
       else { const f = item.getAsFile && item.getAsFile(); if (f) out.push({ path: f.name, file: f }); }
     }
   } else if (dt.files) {
     for (const f of dt.files) out.push({ path: f.name, file: f });
   }
-  for (const entry of entries) {
-    if (entry.isFile) await collectEntry(entry, '', out);
-    else await collectEntry(entry, '', out); // dossier : ses enfants sous "nom/"
+  for (const { entry, item } of entries) {
+    if (entry.isFile) {
+      /* getAsFile() d'abord : synchrone et fiable ; entry.file() peut échouer
+       * une fois l'événement terminé (Firefox) — l'entrée ne sert qu'en
+       * secours, la récursion reste pour les dossiers */
+      const f = item.getAsFile ? item.getAsFile() : null;
+      if (f) out.push({ path: entry.name, file: f });
+      else await collectEntry(entry, '', out, fails);
+    } else await collectEntry(entry, '', out, fails);
   }
   // un seul dossier déposé : on prend ses enfants comme racine de la carte
-  if (entries.length === 1 && entries[0].isDirectory) {
-    const prefix = entries[0].name + '/';
+  if (entries.length === 1 && entries[0].entry.isDirectory) {
+    const prefix = entries[0].entry.name + '/';
     for (const it of out) if (it.path.startsWith(prefix)) it.path = it.path.slice(prefix.length);
+  }
+  if (!out.length) {
+    setStatus(`drop : ${dt.items ? dt.items.length : '?'} item(s) mais aucun fichier ` +
+              `lisible${fails.length ? ` (${fails.length} échec(s))` : ''} — ` +
+              'passez par les boutons 📄/📁');
+    return;
   }
   setStatus(`${out.length} élément(s) reçu(s)…`);
   await loadSet(out);
