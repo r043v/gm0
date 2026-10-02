@@ -78,6 +78,15 @@ function cCardImage(bytes) {
   Module._free(ptr);
 }
 function cCardFinish() { const f = cfunc('emu_card_finish'); if (f) f(); }
+function cZip(bytes) {
+  const f = cfunc('emu_zip_load');
+  if (!f) { setStatus('export emu_zip_load manquant'); return 0; }
+  const ptr = Module._malloc(bytes.length);
+  Module.HEAPU8.set(bytes, ptr);
+  const r = f(ptr, bytes.length);
+  Module._free(ptr);
+  return r;
+}
 
 /* charge un ensemble de fichiers {path, file} : le .bin unique devient le
  * firmware, le reste la carte SD (comme le fork TS) */
@@ -94,6 +103,17 @@ async function loadSet(items) {
   }
   const bins = items.filter(it => /\.bin$/i.test(it.path));
   const rest = items.filter(it => !/\.bin$/i.test(it.path) || !bins.includes(it));
+  // un .zip = carte SD complète (son premier .bin devient le firmware)
+  const zips = items.filter(it => /\.zip$/i.test(it.path));
+  if (zips.length) {
+    setStatus('lecture du zip…');
+    const r = cZip(new Uint8Array(await zips[0].file.arrayBuffer()));
+    if (r === 2) {
+      overlay.classList.add('hidden');
+      setStatus('zip chargé : firmware + carte');
+    } else setStatus('zip inexploitable');
+    return;
+  }
   const firmwareBin = bins.length === 1 ? bins[0] : bins.find(b => !b.path.includes('/'));
 
   if (!firmwareBin && bins.length === 0) {

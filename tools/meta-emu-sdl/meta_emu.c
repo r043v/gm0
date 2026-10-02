@@ -15,6 +15,7 @@
  * Usage : meta_emu <firmware.bin> [carte.img] [--wav out.wav]
  */
 #include <SDL.h>
+#include <zlib.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -612,6 +613,123 @@ static void sd_write_persist(uint32_t lba, const uint8_t *data) {
             return;
         }
     }
+}
+
+
+/* ------------------------------------------------ zip = carte SD ------- */
+
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static uint32_t rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static uint8_t *zip_inflate_raw(const uint8_t *src, size_t csize, size_t usize) {
+    z_stream s;
+    memset(&s, 0, sizeof(s));
+    if (inflateInit2(&s, -15) != Z_OK) return NULL;
+    uint8_t *out = malloc(usize ? usize : 1);
+    s.next_in = (const uint8_t *)src; s.avail_in = (uInt)csize;
+    s.next_out = out; s.avail_out = (uInt)usize;
+    int r = inflate(&s, Z_FINISH);
+    inflateEnd(&s);
+    if (r != Z_STREAM_END || s.avail_out != 0) { free(out); return NULL; }
+    return out;
+}
+
+
+typedef struct { char name[1024]; const uint8_t *cdata; size_t csize; size_t usize; int method; } ZipEnt;
+
+static void reset_machine(void);
+static void load_firmware_data(const uint8_t *data, size_t len, const char *display);
+static int fwLoaded;
+static const char *fwName;
+
+/* parse le central directory ; renvoie le nombre d'entrées (fichiers) */
+static int zip_parse(const uint8_t *data, size_t len, ZipEnt *ents, int max) {
+    if (len < 22) return 0;
+    long eocd = -1;
+    for (long i = (long)len - 22; i >= 0; i--) {
+        if (data[i] == 'P' && data[i+1] == 'K' && data[i+2] == 5 && data[i+3] == 6) { eocd = i; break; }
+    }
+    if (eocd < 0) return 0;
+    int nents = rd16(data + eocd + 10);
+    uint32_t cd = rd32(data + eocd + 16);
+    size_t p = cd;
+    int n = 0;
+    for (int k = 0; k < nents && n < max; k++) {
+        if (p + 46 > len || rd32(data + p) != 0x02014b50u) break;
+        int method = rd16(data + p + 10);
+        size_t csize = rd32(data + p + 20);
+        size_t usize = rd32(data + p + 24);
+        int nlen = rd16(data + p + 28), elen = rd16(data + p + 30), clen = rd16(data + p + 32);
+        uint32_t lho = rd32(data + p + 42);
+        int isdir = (data[p + p ? 0 : 0] == 0); /* sans objet : test réel plus bas */
+        (void)isdir;
+        if (p + 46 + nlen + elen + clen > len) break;
+        const uint8_t *nm = data + p + 46;
+        /* entrée répertoire : nom fini par '/' */
+        if (nlen > 0 && nm[nlen - 1] == '/') { p += 46 + nlen + elen + clen; continue; }
+        if (method != 0 && method != 8) { p += 46 + nlen + elen + clen; continue; }
+        /* local header : nom+extra après les 30 octets */
+        if (lho + 30 > len || rd32(data + lho) != 0x04034b50u) { p += 46 + nlen + elen + clen; break; }
+        int l_nlen = rd16(data + lho + 26), l_elen = rd16(data + lho + 28);
+        size_t doff = lho + 30 + l_nlen + l_elen;
+        if (doff + csize > len) { p += 46 + nlen + elen + clen; break; }
+        ZipEnt *e = &ents[n++];
+        size_t nl = nlen < 1023 ? nlen : 1023;
+        memcpy(e->name, nm, nl); e->name[nl] = 0;
+        e->cdata = data + doff; e->csize = csize; e->usize = usize; e->method = method;
+        p += 46 + nlen + elen + clen;
+    }
+    return n;
+}
+
+/* décompresse une entrée dans un tampon neuf (libéré par l'appelant) */
+static uint8_t *zip_entry_data(const ZipEnt *e) {
+    if (e->method == 0) {
+        uint8_t *out = malloc(e->usize ? e->usize : 1);
+        memcpy(out, e->cdata, e->usize);
+        return out;
+    }
+    return zip_inflate_raw(e->cdata, e->csize, e->usize);
+}
+
+/* le contenu du zip = carte SD complète ; s'il contient un (unique) .bin à
+ * la racine ou dans un sous-dossier, il devient le firmware (le loader
+ * listera tous les jeux de la carte, comme sur la vraie console) */
+static int zip_load_card(const uint8_t *data, size_t len) {
+    ZipEnt ents[256];
+    int n = zip_parse(data, len, ents, 256);
+    if (n == 0) return 0;
+    /* décompresse TOUT d'abord : les pointeurs cdata pointent dans `data`,
+     * que reset_machine va libérer (sd_unload) */
+    uint8_t *datas[256];
+    int fwb = -1;
+    for (int i = 0; i < n; i++) {
+        datas[i] = zip_entry_data(&ents[i]);
+        if (!datas[i]) { /* entrée illisible : retirée de la liste */
+            memmove(ents + i, ents + i + 1, sizeof(ZipEnt) * (size_t)(n - i - 1));
+            n--; i--; continue;
+        }
+        size_t l = strlen(ents[i].name);
+        if (fwb < 0 && l > 4 && strcasecmp(ents[i].name + l - 4, ".bin") == 0) fwb = i;
+    }
+    reset_machine();
+    if (fwb >= 0) {
+        char base[1024];
+        const char *slash = strrchr(ents[fwb].name, '/');
+        snprintf(base, sizeof(base), "%s", slash ? slash + 1 : ents[fwb].name);
+        load_firmware_data(datas[fwb], ents[fwb].usize, base);
+    }
+    for (int i = 0; i < n; i++) {
+        vfiles_add(ents[i].name, datas[i], ents[i].usize);
+        free(datas[i]);
+    }
+    if (nvfiles > 0) fat_build_from_vfiles();
+    printf("carte SD : zip (%d fichiers)", n);
+    if (fwLoaded) printf(" + firmware %s", fwName);
+    printf("\n");
+    return fwLoaded ? 2 : 1;
 }
 
 /* --------------------------------------------------- ST7735 -> pixels */
@@ -1384,6 +1502,7 @@ static char fwPath[1024];
 static const char *fwName = NULL;
 static int fwLoaded;
 static int sd_explicit; /* carte passée explicitement en ligne de commande */
+static int fwNeedsBoot; /* un zip a chargé un firmware : vecteurs à remettre */
 
 static SDL_Window *emuWin;
 static SDL_Renderer *emuRen;
@@ -1468,6 +1587,8 @@ static void load_firmware(const char *p, int rebindCard) {
     }
 }
 
+static int zip_load_card(const uint8_t *data, size_t len);
+
 static void load_sd_from_path(const char *p) {
     struct stat st;
     if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) { sd_unload(); fat_build_from_dir(p); return; }
@@ -1477,8 +1598,16 @@ static void load_sd_from_path(const char *p) {
     sd_unload();
     sd_image = malloc((size_t)sz);
     fread(sd_image, 1, (size_t)sz, g);
-    sd_size = (size_t)sz;
     fclose(g);
+    /* un .zip (ou tout fichier signé PK) = carte SD complète ; s'il
+     * contient un .bin, il devient le firmware */
+    if (sz > 4 && sd_image[0] == 'P' && sd_image[1] == 'K') {
+        int r = zip_load_card(sd_image, (size_t)sz);
+        free(sd_image); sd_image = NULL; sd_size = 0;
+        if (r == 2) fwNeedsBoot = 1;
+        return;
+    }
+    sd_size = (size_t)sz;
     printf("carte SD : image %s (%ld Kio)\n", p, sz / 1024);
 }
 
@@ -1558,8 +1687,15 @@ static int poll_events(void) {
             printf("déposé : %s\n", fp);
             if (stat(fp, &st) == 0 && S_ISDIR(st.st_mode)) {
                 load_sd_from_path(fp);
-            } else if (ext && strcasecmp(ext, ".img") == 0) {
+            } else if (ext && (strcasecmp(ext, ".img") == 0 || strcasecmp(ext, ".zip") == 0)) {
                 load_sd_from_path(fp);
+                if (fwNeedsBoot) {
+                    fwNeedsBoot = 0;
+                    boot_vectors();
+                    audio_start();
+                    machineEpoch++;
+                    refresh_title();
+                }
             } else {
                 /* tout le reste = firmware : la carte SD devient son
                  * répertoire, la machine repart de zéro */
@@ -1755,12 +1891,16 @@ int main(int argc, char **argv) {
             const char *ext = strrchr(argv[i], '.');
             struct stat st;
             if (stat(argv[i], &st) == 0 && S_ISDIR(st.st_mode)) { load_sd_from_path(argv[i]); sd_explicit = 1; }
-            else if (ext && strcasecmp(ext, ".img") == 0) { load_sd_from_path(argv[i]); sd_explicit = 1; }
+            else if (ext && (strcasecmp(ext, ".img") == 0 || strcasecmp(ext, ".zip") == 0)) {
+                load_sd_from_path(argv[i]); sd_explicit = 1;
+                fwNeedsBoot = 0; /* le boot se fait après le parsing */
+            }
             else if (!fwLoaded) load_firmware(argv[i], 0);
             else { load_sd_from_path(argv[i]); sd_explicit = 1; }
         }
     }
     if (fwLoaded) boot_vectors();
+    fwNeedsBoot = 0;
 
     static int trace = -1;
     if (trace < 0) trace = getenv("EMU_TRACE") ? 1 : 0;
@@ -1905,6 +2045,18 @@ void emu_card_image(uint8_t *data, int len) {
     memcpy(sd_image, data, (size_t)len);
     sd_size = (size_t)len;
     printf("carte SD : image (%d Kio)\n", len / 1024);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int emu_zip_load(uint8_t *data, int len) {
+    int r = zip_load_card(data, (size_t)len);
+    if (r == 2) {
+        boot_vectors();
+        audio_start();
+        machineEpoch++;
+        refresh_title();
+    }
+    return r;
 }
 
 EMSCRIPTEN_KEEPALIVE

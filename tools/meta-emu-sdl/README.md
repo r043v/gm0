@@ -17,7 +17,9 @@ périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
 
 - Lancé **sans argument**, la fenêtre s'ouvre vide : **déposez** un
   **.bin** (le firmware ; la carte SD devient son répertoire), une
-  **image .img** ou un **dossier** (la carte seule).
+  **image .img**, un **.zip** (le contenu devient la carte SD
+  complète ; son premier .bin devient le firmware) ou un **dossier**
+  (la carte seule).
 - `<carte>` = une **image .img** OU un **répertoire** (construit en FAT16 à
   la volée ; les .SAV écrits par le jeu sont réécrits dans les fichiers).
 - **La carte SD est par défaut le répertoire contenant le firmware** ;
