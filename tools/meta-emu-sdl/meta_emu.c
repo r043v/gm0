@@ -84,6 +84,7 @@ static uint8_t  sd_writeBuf[515];
 static int16_t aq[AQ_SIZE];
 static volatile int aq_head, aq_tail; /* tail = écrit, head = lu */
 static int16_t audioHold = 0;
+static int audioPending; /* device armé en pause : attend le pré-buffer */
 
 static SDL_AudioDeviceID audioDev;
 static int audioOk;
@@ -146,6 +147,15 @@ static void audio_push(int16_t s) {
     int ahead = aq_tail - aq_head;
     if (ahead < 0) ahead += AQ_SIZE;
     if (ahead > AQ_LATENCY) aq_head = (aq_head + ahead - AQ_LATENCY) % AQ_SIZE;
+}
+
+/* à appeler chaque itération de boucle : ouvre le gate quand le
+ * pré-buffer est atteint (aucun appel SDL : tout passe par le callback) */
+static void audio_resume_when_ready(void) {
+    if (!audioPending) return;
+    int ahead = aq_tail - aq_head;
+    if (ahead < 0) ahead += AQ_SIZE;
+    if (ahead >= 600) audioPending = 0;
 }
 
 static void wav_put(int16_t s) {
@@ -1465,9 +1475,12 @@ static void audio_cb(void *ud, Uint8 *stream, int len) {
     (void)ud;
     int16_t *out = (int16_t *)stream;
     for (int i = 0; i < len / 2; i++) {
+        if (audioPending) { out[i] = 0; continue; } /* pré-buffer : silence */
         if (aq_head != aq_tail) {
             audioHold = aq[aq_head];
             aq_head = (aq_head + 1) % AQ_SIZE;
+        } else {
+            audioHold /= 2; /* sous-débit : relâche vers le silence */
         }
         out[i] = audioHold;
     }
@@ -1700,13 +1713,13 @@ static void boot_vectors(void) {
 
 static void refresh_title(void) {
     char title[1200];
-    if (fwLoaded) snprintf(title, sizeof(title), "Gamebuino META — %.900s", fwName);
-    else snprintf(title, sizeof(title), "Gamebuino META — déposez un firmware .bin");
+    if (fwLoaded) snprintf(title, sizeof(title), "%.900s", fwName);
+    else snprintf(title, sizeof(title), "déposez un firmware .bin");
     SDL_SetWindowTitle(emuWin, title);
 }
 
 static void audio_start(void) {
-    if (audioOk) SDL_PauseAudioDevice(audioDev, 0);
+    audioPending = 1; /* gate fermé : audio_resume_when_ready l'ouvrira */
 }
 
 /* ------------------------------------------------ SDL/HTML5 ------------ */
@@ -1747,9 +1760,12 @@ static int sdl_init_all(void) {
     SDL_AudioSpec want, got;
     memset(&want, 0, sizeof(want));
     want.freq = 22049; want.format = AUDIO_S16SYS; want.channels = 1;
+    /* 512 fige l'émulateur sur emscripten (SPN audio) : ne pas descendre */
     want.samples = 1024; want.callback = audio_cb;
     audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
     audioOk = audioDev != 0;
+    if (audioOk) SDL_PauseAudioDevice(audioDev, 0); /* tourne en silence ;
+        le pré-buffer est géré par audioPending dans le callback */
     if (!audioOk) fprintf(stderr, "audio indisponible : %s\n", SDL_GetError());
     if (audioOk && fwLoaded) audio_start();
     return 0;
@@ -1893,9 +1909,9 @@ static void update_title_pct(void) {
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
         titlePct = pct;
-        snprintf(titleBuf, sizeof(titleBuf), "Gamebuino META — %.900s — %d%%", fwName, pct);
+        snprintf(titleBuf, sizeof(titleBuf), "%.900s", fwName);
     } else {
-        snprintf(titleBuf, sizeof(titleBuf), "Gamebuino META — déposez un firmware .bin");
+        snprintf(titleBuf, sizeof(titleBuf), "déposez un firmware .bin");
     }
     SDL_SetWindowTitle(emuWin, titleBuf);
     titleMs = nowMs;
@@ -2038,6 +2054,7 @@ int main(int argc, char **argv) {
         frame++;
 
         update_title_pct();
+        audio_resume_when_ready();
 
         blit(emuRen);
         if (trace) { /* empreinte d'écran périodique */
@@ -2248,15 +2265,16 @@ static void wasm_loop(void) {
     wasmLastFrame += due * frameMs;
     if (now - wasmLastFrame > frameMs) wasmLastFrame = now;
     update_title_pct();
+    audio_resume_when_ready();
     /* % en haut à droite (derrière le canvas, visible dans les bandes) et
      * titre du jeu dans le texte du bas (mise à jour au rythme du %) */
     if (fwLoaded && titleMs != hudMs && titleBuf[0]) {
         hudMs = titleMs;
         EM_ASM({ const p = document.getElementById('pct');
-                 if (p) { p.textContent = $0 + ' %';   /* $0 = int */
+                 if (p) { p.textContent = $0;   /* $0 = int */
                           p.style.display = 'block'; }
                  const g = document.getElementById('gamename');
-                 if (g) g.textContent = 'Gamebuino META — ' + UTF8ToString($1);
+                 if (g) g.textContent = UTF8ToString($1);
                }, titlePct, fwName);
     }
     blit(emuRen);
