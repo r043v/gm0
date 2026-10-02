@@ -310,7 +310,11 @@ static void to83(const char *name, char used[][12], int nUsed, char out[12]) {
     }
     snprintf(used[nUsed < 1000 ? nUsed : 999], 12, "%s", final);
     memset(out, ' ', 11);
-    memcpy(out, final, strlen(final) > 8 ? 8 : strlen(final));
+    /* le champ 8.3 ne contient jamais de point : base et extension sont
+     * copiées séparément (final les réunit, mais tronqué à 8 caractères il
+     * laissait le point dans le nom — « ICON.BMP » devenait ICON.BMP.BMP,
+     * entrée invalide qui faisait rejeter toute la carte par le firmware) */
+    memcpy(out, base, strlen(base) > 8 ? 8 : strlen(base));
     if (ext[0]) memcpy(out + 8, ext, strlen(ext) > 3 ? 3 : strlen(ext));
 }
 
@@ -1601,6 +1605,8 @@ static void reset_core(void) {
     aq_head = aq_tail = 0; audioHold = 0;
     emu_nextFrameTick = tickCount + EMU_FRAME_TICKS;
     sd_reset_state(); /* pas de transaction SD résiduelle pour le jeu suivant */
+    sd_initialized = 0; /* le firmware suivant rejoue toute l'init (CMD0 doit
+                         * répondre « idle ») */
 }
 
 /* réinitialise toute la machine (drop d'un nouveau firmware) */
@@ -2133,6 +2139,20 @@ int emu_game_icon(int idx, char *out, int outlen) {
     return 0;
 }
 
+/* boot différé : le firmware est préparé (emu_firmware) mais la machine ne
+ * démarre qu'une fois la carte SD montée (emu_card_finish), sinon le guest
+ * rate l'init SD et reste sur son écran d'erreur */
+static int booted;
+
+static void emu_boot(void) {
+    if (!fwLoaded || booted) return;
+    booted = 1;
+    boot_vectors();
+    audio_start();
+    machineEpoch++;
+    refresh_title();
+}
+
 /* change de jeu : la carte reste montée, seul le firmware change */
 EMSCRIPTEN_KEEPALIVE
 int emu_select_game(const char *name) {
@@ -2140,15 +2160,13 @@ int emu_select_game(const char *name) {
         if (strcasecmp(vfiles[i].path, name) != 0) continue;
         if (!vfile_is_game(&vfiles[i])) return 0;
         reset_core();
+        booted = 0;
         char base[1024];
         const char *sl = strrchr(name, '/');
         snprintf(base, sizeof(base), "%s", sl ? sl + 1 : name);
         load_firmware_data(vfiles[i].data, vfiles[i].size, base);
         if (!fwLoaded) return 0;
-        boot_vectors();
-        audio_start();
-        machineEpoch++;
-        refresh_title();
+        emu_boot();
         return 1;
     }
     return 0;
@@ -2157,13 +2175,10 @@ int emu_select_game(const char *name) {
 EMSCRIPTEN_KEEPALIVE
 int emu_firmware(uint8_t *data, int len, const char *name) {
     reset_machine();
+    booted = 0;
     load_firmware_data(data, (size_t)len, name);
     if (!fwLoaded) return 0;
-    boot_vectors();
-    audio_start();
-    machineEpoch++;
-    refresh_title();
-    return 1;
+    return 1; /* le boot attend emu_card_finish (carte) — éventuellement vide */
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -2183,20 +2198,16 @@ void emu_card_image(uint8_t *data, int len) {
 EMSCRIPTEN_KEEPALIVE
 int emu_zip_load(uint8_t *data, int len) {
     int r = zip_load_card(data, (size_t)len);
-    if (r == 2) {
-        boot_vectors();
-        audio_start();
-        machineEpoch++;
-        refresh_title();
-    }
+    if (r == 2) emu_boot();
     return r;
 }
 
 EMSCRIPTEN_KEEPALIVE
 void emu_card_finish(void) {
-    if (nvfiles == 0) return;
-    sd_unload();
-    fat_build_from_vfiles();
+    /* les vfiles viennent d'être ajoutées après le reset_machine() de
+     * emu_firmware : sd_unload() les viderait juste avant la construction */
+    if (nvfiles > 0) fat_build_from_vfiles();
+    emu_boot();
 }
 
 static Uint32 wasmFrame = 0;
@@ -2222,7 +2233,7 @@ static void wasm_loop(void) {
     if (wasmLastFrame == 0) wasmLastFrame = now;
     int due = (int)((now - wasmLastFrame) / frameMs);
     if (due > 4) { due = 1; wasmLastFrame = now; }
-    if (fwLoaded) {
+    if (fwLoaded && booted) {
         for (int i = 0; i < due; i++) run_emulated_frame();
         wasmFrame += (Uint32)due;
     }

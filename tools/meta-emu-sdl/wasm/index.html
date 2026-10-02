@@ -17,6 +17,13 @@
   #overlay h1 { font-size: 22px; margin: 0; color: #9ccc65; }
   #overlay small { color: #78909c; }
   #overlay.hidden { display: none; }
+  .btns { display: flex; gap: 26px; }
+  .btns button {
+    width: 120px; height: 120px; font-size: 72px; line-height: 1;
+    background: #1b2430; color: #cfd8dc; border: 1px solid #37474f;
+    border-radius: 14px; cursor: pointer; padding: 0;
+  }
+  .btns button:hover { background: #26313f; border-color: #78909c; }
   #status { position: fixed; left: 8px; bottom: 6px; color: #546e7a;
             font: 12px monospace; }
   #gamesBtn { position: fixed; top: 10px; right: 10px; z-index: 20;
@@ -45,8 +52,10 @@
 <div id="overlay">
   <h1>Gamebuino META — émulateur (wasm)</h1>
   <div class="btns">
-    <button id="pickFiles">🗂 Choisir UN fichier<br><small>.zip (carte) / .bin (jeu)</small></button>
-    <button id="pickFolder">📁 Choisir un RÉPERTOIRE<br><small>de jeu (bin + rom + sauvegarde)</small></button>
+    <button id="pickFiles" aria-label="Choisir un fichier : .zip (carte) ou .bin (jeu)"
+            title="Un fichier : .zip (carte SD) ou .bin (jeu)">📄</button>
+    <button id="pickFolder" aria-label="Choisir un répertoire de jeu"
+            title="Un répertoire de jeu (bin + rom + sauvegarde)">📁</button>
   </div>
   <div>… ou déposez-les directement ici.</div>
   <small>Un dossier avec un seul .bin : le firmware et la carte (les autres
@@ -91,8 +100,12 @@ function cCardFile(path, bytes) {
   if (!f) return;
   const ptr = Module._malloc(bytes.length);
   Module.HEAPU8.set(bytes, ptr);
-  f(ptr, bytes.length, path);
-  Module._free(ptr);
+  /* un paramètre i32 wasm ne reçoit PAS une chaîne JS : le chemin est
+   * converti explicitement ; ordre C = (path, data, len) */
+  const pathPtr = Module._malloc(1024);
+  Module.stringToUTF8(path, pathPtr, 1024);
+  f(pathPtr, ptr, bytes.length);
+  Module._free(ptr); Module._free(pathPtr);
 }
 function cCardImage(bytes) {
   const f = cfunc('emu_card_image');
@@ -137,6 +150,8 @@ async function loadSet(items) {
       overlay.classList.add('hidden');
       setStatus('zip chargé : firmware + carte');
       if (gamesCount() > 1) gamesBtn.style.display = 'block';
+    } else if (r === 1) {
+      setStatus('carte du zip montée, mais aucun firmware .bin dedans — déposez un .bin');
     } else setStatus('zip inexploitable');
     return;
   }
@@ -156,13 +171,16 @@ async function loadSet(items) {
   }
   setStatus('lecture du firmware…');
   const fwBytes = new Uint8Array(await firmwareBin.file.arrayBuffer());
-  cFirmware(fwBytes, firmwareBin.path.split('/').pop());
+  if (!cFirmware(fwBytes, firmwareBin.path.split('/').pop())) {
+    setStatus(`${firmwareBin.path.split('/').pop()} : firmware refusé (vide ou invalide)`);
+    return;
+  }
   // la carte : tous les autres fichiers, chemin relatif
   for (const it of rest) {
     if (it === firmwareBin) continue;
     cCardFile(it.path, new Uint8Array(await it.file.arrayBuffer()));
   }
-  if (rest.length) cCardFinish();
+  cCardFinish(); /* construit la carte (même vide) puis démarre la machine */
   overlay.classList.add('hidden');
   setStatus(`firmware : ${firmwareBin.path.split('/').pop()}` +
             (rest.length ? ` + ${rest.length} fichier(s) de carte` : ''));
