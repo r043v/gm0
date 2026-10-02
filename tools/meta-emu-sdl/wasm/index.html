@@ -208,7 +208,9 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', async e => {
   e.preventDefault();
   const dt = e.dataTransfer;
-  if (!dt) return;
+  if (!dt) { setStatus('drop sans dataTransfer'); return; }
+  setStatus(`drop : ${dt.items ? dt.items.length : '?'} item(s), ` +
+            `${dt.files ? dt.files.length : '?'} fichier(s)…`);
   const out = [];
   const entries = [];
   if (dt.items && dt.items.length && dt.items[0].webkitGetAsEntry) {
