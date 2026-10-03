@@ -2342,9 +2342,13 @@ static void dma_beat(uint32_t ch) {
     else if (size == 2) writeHalf(dst, fetchHalf(src));
     else writeWord(dst, fetchWord(src));
     if (++dmaIdx[ch] >= dmaCnt[ch]) {
-        dmacIntFlag[ch] |= 0x02; /* TCMPL */
+        /* TCMPL PAR DESCRIPTEUR : le matériel lève l'interruption à chaque
+         * fin de bloc (chaîné ou pas) — les libs comptent les descripteurs
+         * libres via les callbacks de l'ISR (dma_desc_free_count) */
+        dmacIntFlag[ch] |= 0x02;
         dma_wrb_write(ch);
-        dma_load(ch, dmaNext[ch]);
+        dmacInterrupt = 1;
+        dma_load(ch, dmaNext[ch]); /* suit la chaîne, ou suspend si invalide */
     }
 }
 
@@ -2415,8 +2419,13 @@ static uint32_t periph_read(uint32_t a, int *handled) {
     return 0;
 }
 
+/* alias physique de la flash (0x00400000) : certaines libs y accèdent
+ * directement pour leurs données (images embarquées streamees en DMA) */
+#define FLASH_PHYS_BASE 0x00400000u
+
 static uint32_t fetchWord(uint32_t a) {
     if (emuTarget == TGT_POKITTO) return pk_read_word(a);
+    if (a >= FLASH_PHYS_BASE && a < FLASH_PHYS_BASE + FLASH_SIZE) a -= FLASH_PHYS_BASE;
     if (a < 0x20000000u) { if (a + 4 > FLASH_SIZE) return 0;
         return (uint32_t)flash[a] | ((uint32_t)flash[a+1] << 8) |
                ((uint32_t)flash[a+2] << 16) | ((uint32_t)flash[a+3] << 24); }
@@ -2433,6 +2442,7 @@ static uint32_t fetchWord(uint32_t a) {
 
 static uint16_t fetchHalf(uint32_t a) {
     if (emuTarget == TGT_POKITTO) return pk_read_half(a);
+    if (a >= FLASH_PHYS_BASE && a < FLASH_PHYS_BASE + FLASH_SIZE) a -= FLASH_PHYS_BASE;
     if (a < 0x20000000u) { if (a + 2 > FLASH_SIZE) return 0;
         return (uint16_t)(flash[a] | (flash[a+1] << 8)); }
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return 0;
@@ -2444,6 +2454,7 @@ static uint16_t fetchHalf(uint32_t a) {
 
 static uint8_t fetchByte(uint32_t a) {
     if (emuTarget == TGT_POKITTO) return pk_read_byte(a);
+    if (a >= FLASH_PHYS_BASE && a < FLASH_PHYS_BASE + FLASH_SIZE) a -= FLASH_PHYS_BASE;
     if (a < 0x20000000u) return RD8(a);
     if (a < 0x40000000u) return RD8S(a - 0x20000000u);
     if (a == 0x40000c00u) return 0;           /* GCLK CTRL : pas de reset en cours */
@@ -2496,32 +2507,12 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == 0x41004838u) { dmac_wrbAddr = v; return; }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
     if (a == 0x41004844u && dmac_chid < DMAC_CHANNELS) { /* CHCTRLB */
-        uint32_t cmd = (v >> 24) & 3u;
-        if (cmd == 2) { /* RESUME/retrigger : (re)charge et (re)lance le bloc */
-            uint32_t desc = dmac_baseAddr + dmac_chid * 0x10;
-            dmacIntFlag[dmac_chid] &= (uint8_t)~0x04u; /* reprise : SUSP effacé */
-            dma_load(dmac_chid, desc);
-            { static int n; if (n++ < 8)
-                fprintf(stderr, "[retrig] ch=%u ctrl=%04x dst=%x n=%u on=%d spiBaud=%u\n",
-                        (unsigned)dmac_chid, dmaCtrl[dmac_chid], dmaDst[dmac_chid],
-                        dmaCnt[dmac_chid], dmaOn[dmac_chid], spiBaud); }
-            if (dmaOn[dmac_chid]) {
-                if (dmaDst[dmac_chid] == 0x42001828u ||
-                    dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX) {
-                    spiDmaCh = (int)dmac_chid; spiBeatAcc = 0; /* beats SPI cadencés */
-                } else { /* vers SRAM : bloc instantané puis TCMPL */
-                    while (dmaOn[dmac_chid]) dma_beat(dmac_chid);
-                    dmacInterrupt = 1;
-                }
-            }
-        } else {
-            dmaTrig[dmac_chid] = (uint8_t)((v >> 8) & 0x3fu); /* TRIGSRC */
-        }
+        /* comme le TS : seul TRIGSRC est retenu ; CMD (RESUME/retigger) est
+         * ignoré — le transfert part de l'écriture CHCTRLA=ENABLE, le
+         * curseur de descripteurs tournant (anneau de la lib) fait le reste */
+        dmaTrig[dmac_chid] = (uint8_t)((v >> 8) & 0x3fu);
         return;
     }
-    if (a == 0x41004840u) { static int n; if (n++ < 14)
-        fprintf(stderr, "[chctrla?] v=%02x ch=%u trig=%02x tc4=%d spiCh=%d\n",
-                v, (unsigned)dmac_chid, dmaTrig[dmac_chid], dma_is_tc4(dmac_chid), spiDmaCh); }
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) { /* canal audio (TC4) */
         if ((v & 0x03u) == 0x02u) { if (!dmaOn[dmac_chid]) dma_load(dmac_chid, dmac_baseAddr + dmac_chid * 0x10); }
         else dmaOn[dmac_chid] = 0; /* SWRST ou désactivation */
@@ -2536,10 +2527,6 @@ static void writeWord(uint32_t a, uint32_t v) {
             if (!dmac_desc) dmac_desc = dmac_baseAddr + dmac_chid * 0x10;
             uint16_t pctrl = fetchHalf(dmac_desc);
             uint32_t pdst = fetchWord(dmac_desc + 0x08);
-            { static int n; if (n++ < 12)
-                fprintf(stderr, "[chctrla] ch=%u trig=%02x desc=%x ctrl=%04x dst=%x n=%u\n",
-                        (unsigned)dmac_chid, dmaTrig[dmac_chid], dmac_desc, pctrl, pdst,
-                        fetchHalf(dmac_desc + 0x02)); }
             if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX || pdst == 0x42001828u) {
                 /* écran : beats cadencés par le baud SPI, le CPU vit pendant */
                 dma_load(dmac_chid, dmac_desc);
@@ -2819,7 +2806,10 @@ static void step(void) {
             dmacInterrupt = 0;
             irq_inject(dmacVector);
         }
-        else if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
+        /* SysTick indépendant du DMAC : la chaîne `else if` du TS affamait
+         * Millis dès qu'une lib streame l'écran en DMA continu (dmacInterrupt
+         * posé à chaque pas) — gb.update() ne s'ouvrait plus jamais */
+        if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
             sysTickTrigger = 0;
             sysTickEntries++;
             irq_inject(sysTickVector);
@@ -4089,10 +4079,9 @@ int main(int argc, char **argv) {
                 }
                 uint32_t nz = 0;
                 for (unsigned q = 0; q < SCR_W * SCR_H; q += 7) if (srcp[q]) nz++;
-                if (getenv("EMU_DMA_DEBUG"))
-                    fprintf(stderr, "  derniers octets SPI: %02x %02x %02x %02x %02x %02x %02x %02x (nz=%ld/%ld)\n",
-                            serLast[0], serLast[1], serLast[2], serLast[3],
-                            serLast[4], serLast[5], serLast[6], serLast[7], serNz, stWrites);
+                            fprintf(stderr, "  derniers octets SPI: %02x %02x %02x %02x %02x %02x %02x %02x (nz=%ld/%ld)\n",
+                        serLast[0], serLast[1], serLast[2], serLast[3],
+                        serLast[4], serLast[5], serLast[6], serLast[7], serNz, stWrites);
                 fprintf(stderr, "[frame %u] hash=%08x distinct<=%d nz=%u stWr=%ld ramwr=%ld x=%u y=%u cmd=%02x\n",
                         frame, h, distinct, nz, stWrites, ramwrTotal, lcd_x, lcd_y, lcd_lastCommand);
             }

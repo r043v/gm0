@@ -187,17 +187,16 @@ transfert immédiat hérité du TS (firmwares 0.1.0 : sortie identique).
 ## État
 
 **Jeux du site META (lib récente, cf. github.com/Gamebuino/Gamebuino-META)**
-: la couche display tourne (DMA chaîné par retrigger CHCTRLB.CMD=RESUME,
-write-back WRB, INTFLAG par canal, ~47 fps) et pousse des frames
-entières, mais le **contenu est noir** : la boucle de conversion du flip
-(0xae08 chez cats-and-coins, borne relue dans [r7+0x24]) tourne en
-continu pendant que la couche applicative n'exécute plus rien.  État du
-diagnostic : objet service en SRAM 0x20000b04 (drapeaux +0x140=1,
-+0x141=0 — le service 0x9120 sort tôt), Millis OK (0x20001870), palette
-en flash (colorIndex direct).  Suspects : champ de ligne de l'objet
-display jamais mis à jour par la chaîne ISR/callbacks, ou appel
-applicatif manquant dans la queue SysTick.  Outils : EMU_DMA_DEBUG
-(derniers octets SPI + nz), EMU_LCD_DEBUG, compteurs dans [frame].
+: la couche display tourne (DMA chaîné, INTFLAG par canal, SysTick
+indépendant du DMAC, ~47 fps) et pousse des frames entières, mais le
+**contenu est noir** : le flip lit son framebuffer via un pointeur vers
+la **flash physique (0x00400000 + offset, au-delà de l'image chargée)**
+— l'alias est maintenant mappé, mais l'objet visé vit au-delà de
+l'image du jeu (zone 0xFF) : la couche applicative ne démarre pas
+(open item : sémantique complète Adafruit_ZeroDMA / init lib 2.x).  Le
+fork TS de référence (output/gbemu) fait tourner ces jeux avec un
+modèle DMAC plus simple — le pas suivant est donc de comparer
+l'exécution TS vs C pas à pas sur le même .bin (node headless.js).
 
 Le boot est **paritairement validé contre le fork TypeScript** : mêmes
 hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,
