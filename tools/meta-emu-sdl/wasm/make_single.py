@@ -15,6 +15,26 @@ js = (d / 'meta_emu_single.js').read_text()
 js = js.replace('</script', '<\\/script')
 
 h = (d / 'index.html').read_text()
+
+# jeux offline du manifeste games.js : embarqués en base64 (file:// sans réseau)
+import base64, re
+games_tag = '<script src="games.js"></script>'
+assert games_tag in h, 'balise games.js introuvable dans index.html'
+gjs = (d / 'games.js').read_text()
+embed = {}
+for m in re.finditer(r"f:\s*'([^']+)'", gjs):
+    f = d / m.group(1)
+    if f.exists():
+        embed[m.group(1)] = base64.b64encode(f.read_bytes()).decode()
+inline = 'window.OFFLINE_EMBED = {' + ', '.join(
+    f'"{k}": "{v}"' for k, v in embed.items()) + '};\n' + gjs
+inline = inline.replace('</script', '<\\/script')
+h = h.replace(games_tag, '<script>\n' + inline + '\n</script>')
+manquants = [m.group(1) for m in re.finditer(r"f:\s*'([^']+)'", gjs)
+             if m.group(1) not in embed]
+if manquants:
+    print('attention : fichiers absents, non embarqués :', ', '.join(manquants))
+
 tag = '<script async src="meta_emu.js"></script>'
 assert tag in h, 'balise du module introuvable dans index.html'
 h = h.replace(tag, '<script>\n' + js + '\n</script>')

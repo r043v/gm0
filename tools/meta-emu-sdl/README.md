@@ -124,12 +124,14 @@ Un unique `.html` avec le wasm embarqué en base64 (`-sSINGLE_FILE=1`) :
 fonctionnalités que la version servie.
 
 **Dock de droite** (toujours visible) : 📄/📁 ouverture, ⏸ pause /
-▶ reprise, ⏹ redémarrage du jeu, 🐰 Lapinou chargé en un clic (fetch de
-`lapinou.bin` à côté de la page), jeux du site META et champ slug/URL
-(`https://gamebuino.com/games/<slug>/download`) — selon le serveur, CORS
-peut refuser le fetch depuis une autre origine : dans ce cas téléchargez
-le fichier et déposez-le.  Pause/stop appellent les exports C
-`emu_pause`/`emu_restart`.
+▶ reprise, ⏹ redémarrage du jeu, puis la **liste offline des jeux**
+(`wasm/games.js` — une entrée `{ n: 'Nom', f: 'fichier.bin' }` par jeu,
+fichier posé à côté de la page, .bin ou .zip).  Pause/stop appellent les
+exports C `emu_pause_toggle`/`emu_restart` (l'état de pause vient du C).
+Le **standalone embarque tous ces jeux en base64** (`make single`) — il
+fonctionne en file:// sans aucun réseau ; les téléchargements
+gamebuino.com étant derrière login (pas de fetch direct possible), la
+liste offline est le chemin recommandé.
 
 - **Déposez** un .bin (firmware), une image .img, ou un **dossier de jeu**
   (traversé récursivement) — ou cliquez pour choisir un dossier

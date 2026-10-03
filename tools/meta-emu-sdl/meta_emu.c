@@ -4205,6 +4205,9 @@ EMSCRIPTEN_KEEPALIVE
 void emu_pause(int on) { wasmPaused = on ? 1 : 0; }
 
 EMSCRIPTEN_KEEPALIVE
+void emu_pause_toggle(void) { wasmPaused = !wasmPaused; } /* source de vérité unique : la page relit emu_paused() */
+
+EMSCRIPTEN_KEEPALIVE
 int emu_paused(void) { return wasmPaused; }
 
 EMSCRIPTEN_KEEPALIVE

@@ -94,21 +94,15 @@
   <button id="pauseBtn" title="Pause / reprise" disabled>⏸</button>
   <button id="stopBtn" title="Revenir au premier écran du jeu" disabled>⏹</button>
   <div class="sep"></div>
-  <span class="lab">direct</span>
-  <button id="lapBtn" title="Lapinou (démo technique, servie à côté de la page)">🐰</button>
-  <button class="metaGame" data-slug="qtron" title="QTRON — gamebuino.com">🕹</button>
-  <button class="metaGame" data-slug="border" title="Border — gamebuino.com">🚢</button>
-  <button class="metaGame" data-slug="caverns-of-khron" title="Caverns of Khron — gamebuino.com">🕯</button>
-  <div class="sep"></div>
-  <span class="lab">URL</span>
-  <input id="urlSlug" placeholder="slug" title="Slug gamebuino.com (https://gamebuino.com/games/<slug>/download)">
-  <button id="urlGo" title="Charger https://gamebuino.com/games/<slug>/download">⤓</button>
+  <span class="lab">jeux</span>
+  <div id="directGames" style="display:contents"></div>
 </div>
 <div id="gamesBtn">🎮 Jeux</div>
 <div id="lightbox"><span id="closeLb">✕</span><h2>Jeux sur la carte</h2><div class="grid" id="gameGrid"></div></div>
 <div id="status"><span id="gamename"></span><span id="msg"></span></div>
 <input id="folder" type="file" webkitdirectory multiple hidden>
 <input id="files" type="file" multiple hidden>
+<script src="games.js"></script>
 
 <script>
 const overlay = document.getElementById('overlay');
@@ -406,26 +400,46 @@ async function loadDirect(bytes, name) {
   } else setStatus(name + ' : firmware refusé');
 }
 
-async function loadUrl(url, label) {
-  setStatus('téléchargement : ' + url + ' …');
-  try {
-    const r = await fetch(url, { mode: 'cors' });
-    if (!r.ok) { setStatus(label + ' : HTTP ' + r.status + ' — ' + url); return; }
-    const buf = await r.arrayBuffer();
-    const name = decodeURIComponent(url.split('/').pop().split('?')[0]) || label;
-    setStatus(label + ' : ' + buf.byteLength + ' octets reçus');
-    await loadDirect(new Uint8Array(buf), name);
-  } catch (e) {
-    setStatus(label + ' : échec réseau (CORS ?) — ' + e.message +
-              ' — téléchargez le fichier puis déposez-le ici');
+/* jeux offline : window.OFFLINE_GAMES (games.js) ; le standalone embarque
+ * ces fichiers en base64 (window.OFFLINE_EMBED, construit par
+ * make_single.py) — pas de réseau, file:// compris */
+function offlineBytes(f) {
+  if (window.OFFLINE_EMBED && window.OFFLINE_EMBED[f]) {
+    const b64 = window.OFFLINE_EMBED[f];
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return Promise.resolve(u8);
   }
+  return fetch(encodeURI(f)).then(r => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.arrayBuffer();
+  }).then(b => new Uint8Array(b));
 }
 
-pauseBtn.addEventListener('click', () => {
+function renderDirectGames() {
+  const host = document.getElementById('directGames');
+  const list = (window.OFFLINE_GAMES || []).slice(0, 6);
+  for (const g of list) {
+    const b = document.createElement('button');
+    b.textContent = g.n;
+    b.title = 'Charger ' + g.f + ' (offline)';
+    b.addEventListener('click', async () => {
+      if (fwLoaded && !confirm('Charger ' + g.n + ' (le jeu courant est remplacé) ?')) return;
+      setStatus('chargement de ' + g.f + ' …');
+      try {
+        await loadDirect(await offlineBytes(g.f), g.f);
+      } catch (e) { setStatus(g.f + ' : ' + e.message); }
+    });
+    host.appendChild(b);
+  }
+}
+renderDirectGames();pauseBtn.addEventListener('click', () => {
   if (!fwLoaded) return;
-  paused = !paused;
-  const f = cfunc('emu_pause');
-  if (f) f(paused ? 1 : 0);
+  const t = cfunc('emu_pause_toggle');
+  const q = cfunc('emu_paused');
+  if (t) t();
+  paused = q ? !!q() : !paused; /* l'état vient du C, pas du JS */
   pauseBtn.textContent = paused ? '▶' : '⏸';
   setStatus(paused ? 'pause' : 'reprise');
 });
@@ -436,32 +450,41 @@ stopBtn.addEventListener('click', () => {
   if (f) { f(); setStatus('jeu redémarré'); }
 });
 
-/* lapinou : démo technique servie à côté de la page */
-document.getElementById('lapBtn').addEventListener('click', async () => {
-  if (typeof fwLoaded !== 'undefined' && fwLoaded && !confirm('Charger Lapinou (le jeu courant est remplacé) ?')) return;
-  try {
-    const r = await fetch('lapinou.bin');
-    if (!r.ok) { setStatus('lapinou.bin introuvable (HTTP ' + r.status + ')'); return; }
-    await loadDirect(new Uint8Array(await r.arrayBuffer()), 'lapinou.bin');
-  } catch (e) { setStatus('lapinou : ' + e.message); }
-});
+/* jeux offline : window.OFFLINE_GAMES (games.js) ; le standalone embarque
+ * ces fichiers en base64 (window.OFFLINE_EMBED, construit par
+ * make_single.py) — pas de réseau, file:// compris */
+function offlineBytes(f) {
+  if (window.OFFLINE_EMBED && window.OFFLINE_EMBED[f]) {
+    const b64 = window.OFFLINE_EMBED[f];
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return Promise.resolve(u8);
+  }
+  return fetch(encodeURI(f)).then(r => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.arrayBuffer();
+  }).then(b => new Uint8Array(b));
+}
 
-/* jeux emblématiques du site META : https://gamebuino.com/games/<slug>/download
- * (selon le serveur, CORS peut refuser le fetch depuis une autre origine —
- * dans ce cas téléchargez le fichier et déposez-le) */
-document.querySelectorAll('.metaGame').forEach(b => {
-  b.addEventListener('click', () =>
-    loadUrl('https://gamebuino.com/games/' + b.dataset.slug + '/download', b.dataset.slug));
-});
-document.getElementById('urlGo').addEventListener('click', () => {
-  const s = document.getElementById('urlSlug').value.trim();
-  if (!s) { setStatus('entrez un slug gamebuino.com (ou une URL complète)'); return; }
-  if (/^https?:\/\//i.test(s)) loadUrl(s, 'URL');
-  else loadUrl('https://gamebuino.com/games/' + s + '/download', s);
-});
-document.getElementById('urlSlug').addEventListener('keydown', e => {
-  if (e.key === 'Enter') document.getElementById('urlGo').click();
-});
+function renderDirectGames() {
+  const host = document.getElementById('directGames');
+  const list = (window.OFFLINE_GAMES || []).slice(0, 6);
+  for (const g of list) {
+    const b = document.createElement('button');
+    b.textContent = g.n;
+    b.title = 'Charger ' + g.f + ' (offline)';
+    b.addEventListener('click', async () => {
+      if (fwLoaded && !confirm('Charger ' + g.n + ' (le jeu courant est remplacé) ?')) return;
+      setStatus('chargement de ' + g.f + ' …');
+      try {
+        await loadDirect(await offlineBytes(g.f), g.f);
+      } catch (e) { setStatus(g.f + ' : ' + e.message); }
+    });
+    host.appendChild(b);
+  }
+}
+renderDirectGames();
 
 
 </script>
