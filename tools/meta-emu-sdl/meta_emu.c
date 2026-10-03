@@ -2286,6 +2286,7 @@ static uint32_t spiBeatAcc;      /* accumulateur de ticks */
 static uint32_t spiBeatTicks = 7; /* ticks par beat (baud) */
 static uint32_t spiBaud;         /* SERCOM4 BAUD (f = 48 MHz / (2×(b+1))) */
 static uint8_t  dmaTrig[DMAC_CHANNELS], dmaOn[DMAC_CHANNELS];
+static uint8_t  dmacIntFlag[DMAC_CHANNELS]; /* INTFLAG par canal : TCMPL=0x02, SUSP=0x04 */
 static uint16_t dmaCtrl[DMAC_CHANNELS], dmaCnt[DMAC_CHANNELS], dmaIdx[DMAC_CHANNELS];
 static uint32_t dmaSrc[DMAC_CHANNELS], dmaDst[DMAC_CHANNELS], dmaNext[DMAC_CHANNELS];
 
@@ -2302,7 +2303,12 @@ static int dma_is_tc4(uint32_t ch) {
 
 static void dma_load(uint32_t ch, uint32_t desc) {
     uint16_t ctrl = desc ? fetchHalf(desc) : 0;
-    if (!(ctrl & 1u)) { dmaOn[ch] = 0; return; } /* VALID absent */
+    if (!(ctrl & 1u)) { /* VALID absent : fin de chaîne -> canal suspendu */
+        dmaOn[ch] = 0;
+        dmacIntFlag[ch] |= 0x04; /* SUSP */
+        dmacInterrupt = 1;
+        return;
+    }
     dmaCtrl[ch] = ctrl;
     dmaCnt[ch] = fetchHalf(desc + 0x02);
     dmaSrc[ch] = fetchWord(desc + 0x04);
@@ -2335,7 +2341,11 @@ static void dma_beat(uint32_t ch) {
     if (size == 1) writeByte(dst, fetchByte(src));
     else if (size == 2) writeHalf(dst, fetchHalf(src));
     else writeWord(dst, fetchWord(src));
-    if (++dmaIdx[ch] >= dmaCnt[ch]) { dma_wrb_write(ch); dma_load(ch, dmaNext[ch]); }
+    if (++dmaIdx[ch] >= dmaCnt[ch]) {
+        dmacIntFlag[ch] |= 0x02; /* TCMPL */
+        dma_wrb_write(ch);
+        dma_load(ch, dmaNext[ch]);
+    }
 }
 
 static int dma_tc4_active(void) {
@@ -2397,7 +2407,7 @@ static uint32_t periph_read(uint32_t a, int *handled) {
         }
         return ser4_data; }                /* SERCOM4 DATA */
     if (a == 0x42001c28u) { *handled = 1; return 0x80; }                     /* SERCOM5 DATA */
-    if (a == 0x4100484eu) { *handled = 1; return 0x02; }                     /* DMAC CHINTFLAG TCMPL */
+    if (a == 0x4100484eu) { *handled = 1; return dmacIntFlag[dmac_chid & 0xfu]; } /* DMAC CHINTFLAG (canal sélectionné par CHID) */
     if (a == 0x4200300du) { *handled = 1; return tc4IntEnMask; }             /* TC4 INTENSET */
     if (a == 0x4200300eu) { *handled = 1; return tc4IntFlagMask; }           /* TC4 INTFLAG */
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) {                         /* CHCTRLA ENABLE */
@@ -2487,8 +2497,9 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == 0x4100483fu) { dmac_chid = v; return; }
     if (a == 0x41004844u && dmac_chid < DMAC_CHANNELS) { /* CHCTRLB */
         uint32_t cmd = (v >> 24) & 3u;
-        if (cmd == 2) { /* retrigger : (re)charge et (re)lance le bloc */
+        if (cmd == 2) { /* RESUME/retrigger : (re)charge et (re)lance le bloc */
             uint32_t desc = dmac_baseAddr + dmac_chid * 0x10;
+            dmacIntFlag[dmac_chid] &= (uint8_t)~0x04u; /* reprise : SUSP effacé */
             dma_load(dmac_chid, desc);
             { static int n; if (n++ < 8)
                 fprintf(stderr, "[retrig] ch=%u ctrl=%04x dst=%x n=%u on=%d spiBaud=%u\n",
@@ -2612,6 +2623,7 @@ static void writeByte(uint32_t a, uint8_t v) {
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
     if (a == 0x42001828u) { sercom4_write(v); return; }
     if (a == 0x4200180au) { spiBaud = v; return; } /* SERCOM4 BAUD (SPI) */
+    if (a == 0x4100484eu) { dmacIntFlag[dmac_chid & 0xfu] &= (uint8_t)~v; return; } /* DMAC CHINTFLAG acquittement */
     if (a == 0x4100483fu) { dmac_chid = v; return; }
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
@@ -2625,7 +2637,10 @@ static void writeByte(uint32_t a, uint8_t v) {
 
 static void buttons_apply(void);
 
+static uint8_t serLast[8]; static long serIdx; static long serNz;
 static void sercom4_write(uint8_t v) {
+    if (v) serNz++;
+    if (getenv("EMU_DMA_DEBUG")) { serLast[serIdx++ & 7] = v; }
     /* ordre du TypeScript (écran, boutons, carte SD) ; l'octet de réponse
      * repart à 0x80 à chaque échange, les périphériques sélectionnés le
      * remplacent (sercom-register.ts : this.data = 0x80 puis listeners).
@@ -3489,6 +3504,7 @@ static void reset_core(void) {
     tc4IntEnMask = tc4IntFlagMask = 0;
     tc4CtrlA = 0;
     spiDmaCh = -1; spiBeatAcc = 0; spiBeatTicks = 7; spiBaud = 0;
+    memset(dmacIntFlag, 0, sizeof dmacIntFlag);
     tc4Top = tc4Counter = 0; tc4Period = 907;
     tc4Window = tc4Fires = tc4Writes = 0;
     lcd_xStart = lcd_xEnd = lcd_yStart = lcd_yEnd = lcd_x = lcd_y = 0;
@@ -4071,8 +4087,14 @@ int main(int argc, char **argv) {
                     for (; k < 16; k++) if (seen[k] == srcp[i]) break;
                     if (k == 16) distinct++;
                 }
-                fprintf(stderr, "[frame %u] hash=%08x distinct<=%d stWr=%ld ramwr=%ld x=%u y=%u cmd=%02x\n",
-                        frame, h, distinct, stWrites, ramwrTotal, lcd_x, lcd_y, lcd_lastCommand);
+                uint32_t nz = 0;
+                for (unsigned q = 0; q < SCR_W * SCR_H; q += 7) if (srcp[q]) nz++;
+                if (getenv("EMU_DMA_DEBUG"))
+                    fprintf(stderr, "  derniers octets SPI: %02x %02x %02x %02x %02x %02x %02x %02x (nz=%ld/%ld)\n",
+                            serLast[0], serLast[1], serLast[2], serLast[3],
+                            serLast[4], serLast[5], serLast[6], serLast[7], serNz, stWrites);
+                fprintf(stderr, "[frame %u] hash=%08x distinct<=%d nz=%u stWr=%ld ramwr=%ld x=%u y=%u cmd=%02x\n",
+                        frame, h, distinct, nz, stWrites, ramwrTotal, lcd_x, lcd_y, lcd_lastCommand);
             }
         }
         /* temps réel : une frame = 1/59,7 s, jamais plus vite.  Échéance

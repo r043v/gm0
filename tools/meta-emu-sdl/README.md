@@ -186,11 +186,18 @@ transfert immédiat hérité du TS (firmwares 0.1.0 : sortie identique).
 
 ## État
 
-**Jeux du site META (lib récente)** : la couche display tourne (DMA
-chaîné par retrigger CHCTRLB.CMD, write-back WRB, ~47 fps) mais la
-couche applicative de ces jeux démarre encore sur un écran noir —
-investigation en cours (USB/RTC/EVSYS non modélisés ?).  Les jeux
-ancienne lib (lapinou, zedtest) sont complets.
+**Jeux du site META (lib récente, cf. github.com/Gamebuino/Gamebuino-META)**
+: la couche display tourne (DMA chaîné par retrigger CHCTRLB.CMD=RESUME,
+write-back WRB, INTFLAG par canal, ~47 fps) et pousse des frames
+entières, mais le **contenu est noir** : la boucle de conversion du flip
+(0xae08 chez cats-and-coins, borne relue dans [r7+0x24]) tourne en
+continu pendant que la couche applicative n'exécute plus rien.  État du
+diagnostic : objet service en SRAM 0x20000b04 (drapeaux +0x140=1,
++0x141=0 — le service 0x9120 sort tôt), Millis OK (0x20001870), palette
+en flash (colorIndex direct).  Suspects : champ de ligne de l'objet
+display jamais mis à jour par la chaîne ISR/callbacks, ou appel
+applicatif manquant dans la queue SysTick.  Outils : EMU_DMA_DEBUG
+(derniers octets SPI + nz), EMU_LCD_DEBUG, compteurs dans [frame].
 
 Le boot est **paritairement validé contre le fork TypeScript** : mêmes
 hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,
