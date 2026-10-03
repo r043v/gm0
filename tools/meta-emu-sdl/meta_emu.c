@@ -2564,7 +2564,16 @@ static uint32_t prevInstPc;  /* PC à l'entrée du pas courant (la boucle le tie
  * exécuté aux pas suivants.  Les commandes du contrôleur (0x41004000+)
  * restent des no-ops : sur circuit le jeu prépare ses pages puis les
  * programme ; ici seule l'écriture effective compte.  L'alias physique
- * 0x00400000 est accepté en écriture aussi. */
+ * 0x00400000 est accepté en écriture aussi.
+ *
+ * Build wasm : écritures simplement IGNORÉES (comportement d'avant) — la
+ * distribution web privilégie le démarrage partout ; les écrans de boot
+ * sont identiques, seuls les auto-patchs des loaders restent inertes. */
+#ifdef __EMSCRIPTEN__
+static void flash_store(uint32_t a, uint32_t v, int bytes) {
+    (void)a; (void)v; (void)bytes;
+}
+#else
 static void flash_store(uint32_t a, uint32_t v, int bytes) {
     if (a >= FLASH_PHYS_BASE) a -= FLASH_PHYS_BASE;
     if (a + (uint32_t)bytes > FLASH_SIZE) return;
@@ -2584,6 +2593,7 @@ static void flash_store(uint32_t a, uint32_t v, int bytes) {
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
     } else p[0] = (uint8_t)v;
 }
+#endif /* __EMSCRIPTEN__ */
 
 static void writeWord(uint32_t a, uint32_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_word(a, v); return; }

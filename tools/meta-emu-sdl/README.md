@@ -219,6 +219,13 @@ CMD17).  Trois causes racines, toutes corrigées :
   (code mort pour DMB).  L'espace 32 bits (0xE800-0xFFFF hors BL) est
   maintenant consommé proprement, MRS pose Rd=0 (mode thread).
 
+**Build web** : les écritures flash y sont simplement ignorées
+(`__EMSCRIPTEN__`) — la distribution privilégie le démarrage partout ;
+les écrans de boot sont identiques, seuls les auto-patchs des loaders
+restent inertes.  Le standalone embarque les jeux de la liste offline en
+base64 et, au chargement d'un jeu, peuple la carte avec les autres
+(parité avec le natif : carte = répertoire du firmware).
+
 Reste ouvert (écran « SD INIT... » persistant) : la **lecture des
 secteurs** par la lib récente.  Le flux hardware est identifié
 (SdSpiGamebuino.cpp : TX-DMA horloge la carte, RX lue par le CPU au fil

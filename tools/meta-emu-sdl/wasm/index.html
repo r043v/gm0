@@ -393,6 +393,17 @@ async function loadDirect(bytes, name) {
     return;
   }
   if (cFirmware(u8, name)) {
+    /* carte = les autres jeux de la liste offline (comme le natif : la
+     * carte est le répertoire du firmware) ; le jeu chargé y est déjà */
+    if (window.OFFLINE_GAMES) {
+      for (const g of window.OFFLINE_GAMES) {
+        if (g.f === name) continue;
+        try {
+          const other = await offlineBytes(g.f);
+          cCardFile(g.f, other);
+        } catch (e) { /* fichier absent (mode servi) : ignoré */ }
+      }
+    }
     cCardFinish();
     overlay.classList.add('hidden');
     enableTransport();
