@@ -186,6 +186,12 @@ transfert immédiat hérité du TS (firmwares 0.1.0 : sortie identique).
 
 ## État
 
+**Jeux du site META (lib récente)** : la couche display tourne (DMA
+chaîné par retrigger CHCTRLB.CMD, write-back WRB, ~47 fps) mais la
+couche applicative de ces jeux démarre encore sur un écran noir —
+investigation en cours (USB/RTC/EVSYS non modélisés ?).  Les jeux
+ancienne lib (lapinou, zedtest) sont complets.
+
 Le boot est **paritairement validé contre le fork TypeScript** : mêmes
 hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,
 même splash Gamebuino au même tick (proportions de couleurs identiques),

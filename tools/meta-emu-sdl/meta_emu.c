@@ -2312,9 +2312,22 @@ static void dma_load(uint32_t ch, uint32_t desc) {
     dmaOn[ch] = 1;
 }
 
+/* le matériel écrit le descripteur courant dans la banque WRB à chaque
+ * fin de bloc (VALID effacé, BTCNT=0) — les libs pollent cette copie
+ * pour savoir si un transfert est fini */
+static void dma_wrb_write(uint32_t ch) {
+    if (!dmac_wrbAddr || ch >= DMAC_CHANNELS) return;
+    uint32_t a = dmac_wrbAddr + ch * 0x10;
+    writeHalf(a, (uint16_t)(dmaCtrl[ch] & ~1u));
+    writeHalf(a + 2, 0);
+    writeWord(a + 4, dmaSrc[ch]);
+    writeWord(a + 8, dmaDst[ch]);
+    writeWord(a + 0xc, dmaNext[ch]);
+}
+
 static void dma_beat(uint32_t ch) {
     if (!dmaOn[ch]) return;
-    if (dmaCnt[ch] == 0) { dma_load(ch, dmaNext[ch]); return; }
+    if (dmaCnt[ch] == 0) { dma_wrb_write(ch); dma_load(ch, dmaNext[ch]); return; }
     uint32_t size = 1u << ((dmaCtrl[ch] >> 8) & 3u);           /* BEATSIZE */
     uint32_t src = dmaSrc[ch], dst = dmaDst[ch];
     if (dmaCtrl[ch] & (1u << 10)) src += (dmaIdx[ch] - dmaCnt[ch]) * size; /* SRCINC */
@@ -2322,7 +2335,7 @@ static void dma_beat(uint32_t ch) {
     if (size == 1) writeByte(dst, fetchByte(src));
     else if (size == 2) writeHalf(dst, fetchHalf(src));
     else writeWord(dst, fetchWord(src));
-    if (++dmaIdx[ch] >= dmaCnt[ch]) dma_load(ch, dmaNext[ch]);
+    if (++dmaIdx[ch] >= dmaCnt[ch]) { dma_wrb_write(ch); dma_load(ch, dmaNext[ch]); }
 }
 
 static int dma_tc4_active(void) {
@@ -2450,7 +2463,7 @@ static uint32_t watchAddr = 0;
 static void writeWord(uint32_t a, uint32_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_word(a, v); return; }
     if (a == millisWatchAddr) millisWrites++;
-    if (watchAddr && a == watchAddr && usbWatch < 40)
+    if (watchAddr && a == watchAddr && usbWatch < 4000)
         fprintf(stderr, "[watch %x] tick=%u pc=%x val=%08x\n", a, tickCount, regs[15] - 2, v);
     if (a < 0x20000000u) return;
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 4 > SRAM_SIZE) return;
@@ -2472,10 +2485,32 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == 0x41004834u) { dmac_baseAddr = v; return; }
     if (a == 0x41004838u) { dmac_wrbAddr = v; return; }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
-    if (a == 0x41004844u) { /* CHCTRLB : TRIGSRC */
-        if (dmac_chid < DMAC_CHANNELS) dmaTrig[dmac_chid] = (uint8_t)((v >> 8) & 0x3fu);
+    if (a == 0x41004844u && dmac_chid < DMAC_CHANNELS) { /* CHCTRLB */
+        uint32_t cmd = (v >> 24) & 3u;
+        if (cmd == 2) { /* retrigger : (re)charge et (re)lance le bloc */
+            uint32_t desc = dmac_baseAddr + dmac_chid * 0x10;
+            dma_load(dmac_chid, desc);
+            { static int n; if (n++ < 8)
+                fprintf(stderr, "[retrig] ch=%u ctrl=%04x dst=%x n=%u on=%d spiBaud=%u\n",
+                        (unsigned)dmac_chid, dmaCtrl[dmac_chid], dmaDst[dmac_chid],
+                        dmaCnt[dmac_chid], dmaOn[dmac_chid], spiBaud); }
+            if (dmaOn[dmac_chid]) {
+                if (dmaDst[dmac_chid] == 0x42001828u ||
+                    dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX) {
+                    spiDmaCh = (int)dmac_chid; spiBeatAcc = 0; /* beats SPI cadencés */
+                } else { /* vers SRAM : bloc instantané puis TCMPL */
+                    while (dmaOn[dmac_chid]) dma_beat(dmac_chid);
+                    dmacInterrupt = 1;
+                }
+            }
+        } else {
+            dmaTrig[dmac_chid] = (uint8_t)((v >> 8) & 0x3fu); /* TRIGSRC */
+        }
         return;
     }
+    if (a == 0x41004840u) { static int n; if (n++ < 14)
+        fprintf(stderr, "[chctrla?] v=%02x ch=%u trig=%02x tc4=%d spiCh=%d\n",
+                v, (unsigned)dmac_chid, dmaTrig[dmac_chid], dma_is_tc4(dmac_chid), spiDmaCh); }
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) { /* canal audio (TC4) */
         if ((v & 0x03u) == 0x02u) { if (!dmaOn[dmac_chid]) dma_load(dmac_chid, dmac_baseAddr + dmac_chid * 0x10); }
         else dmaOn[dmac_chid] = 0; /* SWRST ou désactivation */
@@ -2490,6 +2525,10 @@ static void writeWord(uint32_t a, uint32_t v) {
             if (!dmac_desc) dmac_desc = dmac_baseAddr + dmac_chid * 0x10;
             uint16_t pctrl = fetchHalf(dmac_desc);
             uint32_t pdst = fetchWord(dmac_desc + 0x08);
+            { static int n; if (n++ < 12)
+                fprintf(stderr, "[chctrla] ch=%u trig=%02x desc=%x ctrl=%04x dst=%x n=%u\n",
+                        (unsigned)dmac_chid, dmaTrig[dmac_chid], dmac_desc, pctrl, pdst,
+                        fetchHalf(dmac_desc + 0x02)); }
             if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX || pdst == 0x42001828u) {
                 /* écran : beats cadencés par le baud SPI, le CPU vit pendant */
                 dma_load(dmac_chid, dmac_desc);
@@ -2499,6 +2538,13 @@ static void writeWord(uint32_t a, uint32_t v) {
                     if (spiBeatTicks < 1) spiBeatTicks = 1;
                     spiBeatAcc = 0;
                     spiDmaCh = (int)dmac_chid;
+                    { static int n; if (n++ < 6)
+                        fprintf(stderr, "[dma spi] ch=%u ctrl=%04x src=%x dst=%x n=%u beats=%u t\n",
+                                (unsigned)dmac_chid, dmaCtrl[dmac_chid], dmaSrc[dmac_chid],
+                                dmaDst[dmac_chid], dmaCnt[dmac_chid], spiBeatTicks); }
+                } else {
+                    static int n; if (n++ < 4)
+                        fprintf(stderr, "[dma spi] ch=%u : descripteur INVALIDE\n", (unsigned)dmac_chid);
                 }
                 dmac_desc = 0;
                 return;
@@ -2532,6 +2578,7 @@ static void writeWord(uint32_t a, uint32_t v) {
                 else if (size == 2) writeHalf(d, fetchHalf(s));
                 else writeWord(d, fetchWord(s));
             }
+            dma_wrb_write(dmac_chid);
             dmac_desc = nxt;
             dmacInterrupt = 1; /* verrouillé, traité au prochain step (TS) */
         }
@@ -4024,7 +4071,8 @@ int main(int argc, char **argv) {
                     for (; k < 16; k++) if (seen[k] == srcp[i]) break;
                     if (k == 16) distinct++;
                 }
-                fprintf(stderr, "[frame %u] hash=%08x distinct<=%d\n", frame, h, distinct);
+                fprintf(stderr, "[frame %u] hash=%08x distinct<=%d stWr=%ld ramwr=%ld x=%u y=%u cmd=%02x\n",
+                        frame, h, distinct, stWrites, ramwrTotal, lcd_x, lcd_y, lcd_lastCommand);
             }
         }
         /* temps réel : une frame = 1/59,7 s, jamais plus vite.  Échéance
