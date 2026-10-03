@@ -433,8 +433,9 @@ function renderDirectGames() {
   const list = (window.OFFLINE_GAMES || []).slice(0, 6);
   for (const g of list) {
     const b = document.createElement('button');
-    b.textContent = g.n;
-    b.title = 'Charger ' + g.f + ' (offline)';
+    /* icône seule : le texte complet reste dans l'infobulle */
+    b.textContent = g.n.split(' ')[0];
+    b.title = 'Charger ' + g.n + ' (offline)';
     b.addEventListener('click', async () => {
       if (fwLoaded && !confirm('Charger ' + g.n + ' (le jeu courant est remplacé) ?')) return;
       setStatus('chargement de ' + g.f + ' …');
@@ -477,26 +478,6 @@ function offlineBytes(f) {
     return r.arrayBuffer();
   }).then(b => new Uint8Array(b));
 }
-
-function renderDirectGames() {
-  const host = document.getElementById('directGames');
-  const list = (window.OFFLINE_GAMES || []).slice(0, 6);
-  for (const g of list) {
-    const b = document.createElement('button');
-    b.textContent = g.n;
-    b.title = 'Charger ' + g.f + ' (offline)';
-    b.addEventListener('click', async () => {
-      if (fwLoaded && !confirm('Charger ' + g.n + ' (le jeu courant est remplacé) ?')) return;
-      setStatus('chargement de ' + g.f + ' …');
-      try {
-        await loadDirect(await offlineBytes(g.f), g.f);
-      } catch (e) { setStatus(g.f + ' : ' + e.message); }
-    });
-    host.appendChild(b);
-  }
-}
-renderDirectGames();
-
 
 </script>
 <script>
