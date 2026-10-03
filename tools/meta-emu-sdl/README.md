@@ -56,7 +56,13 @@ métadonnées sont ignorés, le programme est flashé).
 
 ## Compilation
 
-    make        # natif (SDL2 via pkg-config)
+    make        # natif (SDL2 via pkg-config) — -O3 -flto par défaut
+
+À vitesse native l'émulateur tourne à ~8 ms/frame pour un budget temps
+réel de 16,7 ms (59,7 fps) ; la marge vise le wasm (~3-4x plus lent).
+Profil gprof : ~84 % du temps dans le cœur CPU (step + incrementPc),
+le reste dans le chemin DMA/SPI — le dispatch n'est pas refactorisé
+sans garantie de parité TS.
     make wasm   # navigateur (nécessite emsdk : source ~/emsdk/emsdk_env.sh)
 
 ## Usage (natif)
