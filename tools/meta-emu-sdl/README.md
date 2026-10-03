@@ -100,6 +100,18 @@ fonctionnalités que la version servie.
   `./test/` servis à côté (hook de test local ; `wasm/test/` est
   ignoré par git — y déposer un firmware et des jeux pour essayer).
 
+## Audio par DMA (firmwares gbrecomp 0.4.0+)
+
+Depuis la 0.4.0, les firmwares gbrecomp envoient le son au DAC par le
+DMAC (canal 1, déclencheur `TC4_DMAC_ID_OVF`, descripteurs chaînés),
+l'écran gardant le canal 0.  L'émulateur suit à part tout canal déclenché
+par TC4 : un beat par débordement TC4 (907 ticks, ~22 kHz), descripteur
+suivant lu en fin de bloc, canal arrêté sur un descripteur invalide ;
+`CHCTRLA` relu donne l'état ENABLE.  Avant ce suivi, l'activation du
+canal audio détournait le descripteur courant de l'écran : écran figé
+sur une couleur unie et aucun son.  Les autres canaux gardent le
+transfert immédiat hérité du TS (firmwares 0.1.0 : sortie identique).
+
 ## État Pokitto
 
 - Boot complet validé sur le binaire de test du dépôt PokittoEmu

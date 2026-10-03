@@ -2214,6 +2214,59 @@ static uint8_t st7735_byte(uint8_t v) {
 
 static uint32_t dmac_baseAddr, dmac_wrbAddr, dmac_desc, dmac_chid;
 
+/* Canaux déclenchés par TC4 (audio META_AUDIO_DMA du firmware gbrecomp) :
+ * suivis à part du hack « copie immédiate » ci-dessus, sinon leur chaîne
+ * détourne dmac_desc et l'écran (canal 0) ne reçoit plus rien.  Un beat
+ * par débordement TC4 ; le descripteur suivant est lu à la fin du courant
+ * (invalide ou nul -> canal arrêté, comme une erreur de fetch). */
+#define DMAC_CHANNELS 12
+#define DMAC_TRIG_TC4_OVF 0x1bu /* TC4_DMAC_ID_OVF (SAMD21) */
+static uint8_t  dmaTrig[DMAC_CHANNELS], dmaOn[DMAC_CHANNELS];
+static uint16_t dmaCtrl[DMAC_CHANNELS], dmaCnt[DMAC_CHANNELS], dmaIdx[DMAC_CHANNELS];
+static uint32_t dmaSrc[DMAC_CHANNELS], dmaDst[DMAC_CHANNELS], dmaNext[DMAC_CHANNELS];
+
+static uint16_t fetchHalf(uint32_t a);
+static uint32_t fetchWord(uint32_t a);
+static uint8_t fetchByte(uint32_t a);
+static void writeWord(uint32_t a, uint32_t v);
+static void writeHalf(uint32_t a, uint16_t v);
+static void writeByte(uint32_t a, uint8_t v);
+
+static int dma_is_tc4(uint32_t ch) {
+    return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC4_OVF;
+}
+
+static void dma_load(uint32_t ch, uint32_t desc) {
+    uint16_t ctrl = desc ? fetchHalf(desc) : 0;
+    if (!(ctrl & 1u)) { dmaOn[ch] = 0; return; } /* VALID absent */
+    dmaCtrl[ch] = ctrl;
+    dmaCnt[ch] = fetchHalf(desc + 0x02);
+    dmaSrc[ch] = fetchWord(desc + 0x04);
+    dmaDst[ch] = fetchWord(desc + 0x08);
+    dmaNext[ch] = fetchWord(desc + 0x0c);
+    dmaIdx[ch] = 0;
+    dmaOn[ch] = 1;
+}
+
+static void dma_beat(uint32_t ch) {
+    if (!dmaOn[ch]) return;
+    if (dmaCnt[ch] == 0) { dma_load(ch, dmaNext[ch]); return; }
+    uint32_t size = 1u << ((dmaCtrl[ch] >> 8) & 3u);           /* BEATSIZE */
+    uint32_t src = dmaSrc[ch], dst = dmaDst[ch];
+    if (dmaCtrl[ch] & (1u << 10)) src += (dmaIdx[ch] - dmaCnt[ch]) * size; /* SRCINC */
+    if (dmaCtrl[ch] & (1u << 11)) dst += (dmaIdx[ch] - dmaCnt[ch]) * size; /* DSTINC */
+    if (size == 1) writeByte(dst, fetchByte(src));
+    else if (size == 2) writeHalf(dst, fetchHalf(src));
+    else writeWord(dst, fetchWord(src));
+    if (++dmaIdx[ch] >= dmaCnt[ch]) dma_load(ch, dmaNext[ch]);
+}
+
+static int dma_tc4_active(void) {
+    for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
+        if (dmaOn[ch] && dmaTrig[ch] == DMAC_TRIG_TC4_OVF) return 1;
+    return 0;
+}
+
 static void irq_inject(uint32_t vector);
 
 /* ------------------------------------------------- interruptions */
@@ -2260,6 +2313,8 @@ static uint32_t periph_read(uint32_t a, int *handled) {
     if (a == 0x42001828u) { *handled = 1; return ser4_data; }                /* SERCOM4 DATA */
     if (a == 0x42001c28u) { *handled = 1; return 0x80; }                     /* SERCOM5 DATA */
     if (a == 0x4100484eu) { *handled = 1; return 0x02; }                     /* DMAC CHINTFLAG TCMPL */
+    if (a == 0x41004840u && dma_is_tc4(dmac_chid)) {                         /* CHCTRLA ENABLE */
+        *handled = 1; return dmaOn[dmac_chid] ? 0x02 : 0; }
     return 0;
 }
 
@@ -2336,6 +2391,15 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == 0x41004834u) { dmac_baseAddr = v; return; }
     if (a == 0x41004838u) { dmac_wrbAddr = v; return; }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
+    if (a == 0x41004844u) { /* CHCTRLB : TRIGSRC */
+        if (dmac_chid < DMAC_CHANNELS) dmaTrig[dmac_chid] = (uint8_t)((v >> 8) & 0x3fu);
+        return;
+    }
+    if (a == 0x41004840u && dma_is_tc4(dmac_chid)) { /* canal audio (TC4) */
+        if ((v & 0x03u) == 0x02u) { if (!dmaOn[dmac_chid]) dma_load(dmac_chid, dmac_baseAddr + dmac_chid * 0x10); }
+        else dmaOn[dmac_chid] = 0; /* SWRST ou désactivation */
+        return;
+    }
     if (a == 0x41004840u) { /* CHCTRLA == 2 : transfert via descripteur */
         if (v == 0x02) {
             if (!dmac_desc) dmac_desc = dmac_baseAddr + dmac_chid * 0x10;
@@ -2405,7 +2469,16 @@ static void incrementPc(void) {
     regs[15] += 2;
 
     if (emuTarget == TGT_POKITTO) return; /* timers LPC dans pk_machine_step */
-    if (tc4Enabled && tc4Armed && tc4Top > 0) {
+    if (tc4Enabled && tc4Top > 0 && !tc4Armed && dma_tc4_active()) {
+        /* TC4 sans interruption, lu par DMA : cadence fixe, 1 ms = 20000
+         * ticks (SysTick émulé), donc 907 ticks par échantillon à 22 kHz */
+        if (++tc4Counter >= 907u) {
+            tc4Counter = 0;
+            tc4Fires++;
+            for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
+                if (dmaTrig[ch] == DMAC_TRIG_TC4_OVF) dma_beat(ch);
+        }
+    } else if (tc4Enabled && tc4Armed && tc4Top > 0) {
         /* régulateur du TS : la carte doit produire ~369 échantillons par
          * frame ; aucun attente -> rapproche les tirs, trop -> les espace */
         tc4Window++;
@@ -2462,7 +2535,12 @@ static uint32_t addSetCond(uint32_t a, uint32_t b, int carry) {
 
 static void irq_inject(uint32_t vector);
 
+static uint32_t prevInstPc;  /* PC à l'entrée du pas courant */
+static uint32_t lastExecPc;  /* PC de l'instruction exécutée au pas précédent */
+
 static void step(void) {
+    lastExecPc = prevInstPc;
+    prevInstPc = regs[15] - 2;
     /* trace instruction par instruction (comparaison TS) : avant toute
      * injection, état = ce qui va s'exécuter */
     static long stepNo = 0;
@@ -2538,6 +2616,22 @@ static void step(void) {
         wildLogged++;
         regs[15] = vectorBase + fetchWord(vectorBase + 4);
         return;
+    }
+    /* PC hors flash (et hors SRAM exécutable) : log de diagnostic avec le PC
+     * de l'instruction précédente — WILD_RESET=1 reprend sur le vecteur de
+     * reset au lieu d'exécuter les mauvaises herbes (comportement TS = non) */
+    if (emuTarget == TGT_META && instAddr >= 0x00040000u &&
+        !(instAddr >= 0x20000000u && instAddr < 0x20000000u + SRAM_SIZE)) {
+        static int wildFlashLogged = 0;
+        static int wildReset = -1;
+        static uint32_t prevPc = 0;
+        if (wildReset < 0) wildReset = getenv("WILD_RESET") ? 1 : 0;
+        if (wildFlashLogged < 20)
+            fprintf(stderr, "[pc fou flash] tick=%u pc=%x prev=%x lr=%x sp=%x r0=%x r1=%x r2=%x r3=%x\n",
+                    tickCount, instAddr, lastExecPc, regs[14], regs[13],
+                    regs[0], regs[1], regs[2], regs[3]);
+        wildFlashLogged++;
+        if (wildReset) { regs[15] = vectorBase + fetchWord(vectorBase + 4); return; }
     }
     uint16_t inst = fetchHalf(instAddr);
     static int trace = -1;
@@ -3139,6 +3233,7 @@ static void reset_core(void) {
     sysTickVector = dmacVector = tc4Vector = 0;
     dmacInterrupt = tc4Interrupt = 0;
     dmac_baseAddr = dmac_wrbAddr = dmac_desc = dmac_chid = 0;
+    memset(dmaTrig, 0, sizeof dmaTrig); memset(dmaOn, 0, sizeof dmaOn);
     portA_out = portB_out = portA_dir = portB_dir = 0;
     ser4_data = 0x80;
     tc4Enabled = tc4Armed = 0;
