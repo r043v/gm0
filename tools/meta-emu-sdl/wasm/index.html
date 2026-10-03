@@ -52,6 +52,25 @@
                         background: #000; border: 1px solid #333;
                         image-rendering: pixelated; }
   #lightbox .game .nm { margin-top: 4px; word-break: break-word; }
+  /* dock de droite : ouverture, transport, chargements directs */
+  #dock { position: fixed; top: 50%; right: 0; transform: translateY(-50%);
+          z-index: 25; display: flex; flex-direction: column; gap: 6px;
+          padding: 10px 8px; background: rgba(16,20,24,.82);
+          border: 1px solid #263238; border-right: none;
+          border-radius: 10px 0 0 10px; align-items: center; }
+  #dock button {
+    width: 44px; height: 40px; font-size: 19px; line-height: 1;
+    background: #1b2430; color: #cfd8dc; border: 1px solid #37474f;
+    border-radius: 8px; cursor: pointer; padding: 0;
+  }
+  #dock button:hover { background: #26313f; border-color: #78909c; }
+  #dock button:disabled { opacity: .35; cursor: default; }
+  #dock .sep { width: 34px; height: 1px; background: #263238; margin: 2px 0; }
+  #dock .lab { color: #546e7a; font: 10px system-ui; }
+  #dock input {
+    width: 40px; text-align: center; background: #0d1117; color: #cfd8dc;
+    border: 1px solid #37474f; border-radius: 6px; font: 11px monospace;
+  }
   #lightbox #closeLb { position: fixed; top: 10px; right: 10px; color: #cfd8dc;
                        font: 20px system-ui; cursor: pointer; }
 </style>
@@ -60,12 +79,6 @@
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
 <div id="overlay">
   <h1>Gamebuino META / Pokitto — émulateur (wasm)</h1>
-  <div class="btns">
-    <button id="pickFiles" aria-label="Choisir un fichier : .zip (carte) ou .bin (jeu)"
-            title="Un fichier : .zip (carte SD) ou .bin (jeu)">📄</button>
-    <button id="pickFolder" aria-label="Choisir un répertoire de jeu"
-            title="Un répertoire de jeu (bin + rom + sauvegarde)">📁</button>
-  </div>
   <div>… ou déposez-les directement ici.</div>
   <small>La cible (META ou Pokitto) est détectée automatiquement — .bin,
          .pop (loader Pokitto), .zip ou dossier acceptés. Un .zip = carte SD
@@ -74,6 +87,23 @@
          *=HOME. Pokitto : IJKL/flèches, A=« a », B=« s », C=« d » — ou manette.</small>
 </div>
 <div id="pct"></div>
+<div id="dock">
+  <button id="pickFiles" title="Un fichier : .zip (carte SD) ou .bin (jeu)" aria-label="Ouvrir un fichier">📄</button>
+  <button id="pickFolder" title="Un répertoire de jeu (bin + rom + sauvegarde)" aria-label="Ouvrir un dossier">📁</button>
+  <div class="sep"></div>
+  <button id="pauseBtn" title="Pause / reprise" disabled>⏸</button>
+  <button id="stopBtn" title="Revenir au premier écran du jeu" disabled>⏹</button>
+  <div class="sep"></div>
+  <span class="lab">direct</span>
+  <button id="lapBtn" title="Lapinou (démo technique, servie à côté de la page)">🐰</button>
+  <button class="metaGame" data-slug="qtron" title="QTRON — gamebuino.com">🕹</button>
+  <button class="metaGame" data-slug="border" title="Border — gamebuino.com">🚢</button>
+  <button class="metaGame" data-slug="caverns-of-khron" title="Caverns of Khron — gamebuino.com">🕯</button>
+  <div class="sep"></div>
+  <span class="lab">URL</span>
+  <input id="urlSlug" placeholder="slug" title="Slug gamebuino.com (https://gamebuino.com/games/<slug>/download)">
+  <button id="urlGo" title="Charger https://gamebuino.com/games/<slug>/download">⤓</button>
+</div>
 <div id="gamesBtn">🎮 Jeux</div>
 <div id="lightbox"><span id="closeLb">✕</span><h2>Jeux sur la carte</h2><div class="grid" id="gameGrid"></div></div>
 <div id="status"><span id="gamename"></span><span id="msg"></span></div>
@@ -338,6 +368,99 @@ filesInput.addEventListener('change', async () => {
   const items = [...filesInput.files].map(f => ({ path: f.name, file: f }));
   await loadSet(items);
   filesInput.value = '';
+});
+
+/* ---- dock de droite : transport + chargements directs ---- */
+const pauseBtn = document.getElementById('pauseBtn');
+const stopBtn = document.getElementById('stopBtn');
+let fwLoaded = false;   /* un firmware tourne (pour activer ⏸/⏹) */
+let paused = false;
+
+function enableTransport() {
+  fwLoaded = true;
+  pauseBtn.disabled = stopBtn.disabled = false;
+}
+
+/* charge un binaire brut (firmware) ou un zip (carte complète) */
+async function loadDirect(bytes, name) {
+  await new Promise(res => {
+    if (Module.calledRun || Module._malloc) res();
+    else Module.onRuntimeInitialized = () => res();
+  });
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (u8.length > 3 && u8[0] === 0x50 && u8[1] === 0x4b) { /* PK : zip = carte */
+    const r = cZip(u8);
+    if (r === 2) {
+      overlay.classList.add('hidden');
+      enableTransport();
+      setStatus(name + ' : zip chargé (firmware + carte)');
+      if (gamesCount() > 1) gamesBtn.style.display = 'block';
+    } else setStatus(name + ' : zip inexploitable');
+    return;
+  }
+  if (cFirmware(u8, name)) {
+    cCardFinish();
+    overlay.classList.add('hidden');
+    enableTransport();
+    setStatus('jeu : ' + name);
+  } else setStatus(name + ' : firmware refusé');
+}
+
+async function loadUrl(url, label) {
+  setStatus('téléchargement : ' + url + ' …');
+  try {
+    const r = await fetch(url, { mode: 'cors' });
+    if (!r.ok) { setStatus(label + ' : HTTP ' + r.status + ' — ' + url); return; }
+    const buf = await r.arrayBuffer();
+    const name = decodeURIComponent(url.split('/').pop().split('?')[0]) || label;
+    setStatus(label + ' : ' + buf.byteLength + ' octets reçus');
+    await loadDirect(new Uint8Array(buf), name);
+  } catch (e) {
+    setStatus(label + ' : échec réseau (CORS ?) — ' + e.message +
+              ' — téléchargez le fichier puis déposez-le ici');
+  }
+}
+
+pauseBtn.addEventListener('click', () => {
+  if (!fwLoaded) return;
+  paused = !paused;
+  const f = cfunc('emu_pause');
+  if (f) f(paused ? 1 : 0);
+  pauseBtn.textContent = paused ? '▶' : '⏸';
+  setStatus(paused ? 'pause' : 'reprise');
+});
+stopBtn.addEventListener('click', () => {
+  if (!fwLoaded) return;
+  if (paused) pauseBtn.click(); /* dépausse puis redémarre */
+  const f = cfunc('emu_restart');
+  if (f) { f(); setStatus('jeu redémarré'); }
+});
+
+/* lapinou : démo technique servie à côté de la page */
+document.getElementById('lapBtn').addEventListener('click', async () => {
+  if (typeof fwLoaded !== 'undefined' && fwLoaded && !confirm('Charger Lapinou (le jeu courant est remplacé) ?')) return;
+  try {
+    const r = await fetch('lapinou.bin');
+    if (!r.ok) { setStatus('lapinou.bin introuvable (HTTP ' + r.status + ')'); return; }
+    await loadDirect(new Uint8Array(await r.arrayBuffer()), 'lapinou.bin');
+  } catch (e) { setStatus('lapinou : ' + e.message); }
+});
+
+/* jeux emblématiques du site META : https://gamebuino.com/games/<slug>/download
+ * (selon le serveur, CORS peut refuser le fetch depuis une autre origine —
+ * dans ce cas téléchargez le fichier et déposez-le) */
+document.querySelectorAll('.metaGame').forEach(b => {
+  b.addEventListener('click', () =>
+    loadUrl('https://gamebuino.com/games/' + b.dataset.slug + '/download', b.dataset.slug));
+});
+document.getElementById('urlGo').addEventListener('click', () => {
+  const s = document.getElementById('urlSlug').value.trim();
+  if (!s) { setStatus('entrez un slug gamebuino.com (ou une URL complète)'); return; }
+  if (/^https?:\/\//i.test(s)) loadUrl(s, 'URL');
+  else loadUrl('https://gamebuino.com/games/' + s + '/download', s);
+});
+document.getElementById('urlSlug').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('urlGo').click();
 });
 
 

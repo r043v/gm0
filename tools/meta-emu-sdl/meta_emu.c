@@ -4199,6 +4199,19 @@ static unsigned seenEpoch = 0;
 static double wasmLastFrame = 0;
 static Uint32 hudMs; /* dernier push du HUD dans la page */
 
+static int wasmPaused; /* bouton pause de la page */
+
+EMSCRIPTEN_KEEPALIVE
+void emu_pause(int on) { wasmPaused = on ? 1 : 0; }
+
+EMSCRIPTEN_KEEPALIVE
+int emu_paused(void) { return wasmPaused; }
+
+EMSCRIPTEN_KEEPALIVE
+void emu_restart(void) {
+    if (fwLoaded) fw_restart(); /* ⏹ de la page : redémarre le jeu courant */
+}
+
 static void wasm_loop(void) {
     if (!poll_events()) emscripten_cancel_main_loop();
     update_diagnostics(wasmFrame);
@@ -4216,7 +4229,7 @@ static void wasm_loop(void) {
     if (wasmLastFrame == 0) wasmLastFrame = now;
     int due = (int)((now - wasmLastFrame) / frameMs);
     if (due > 4) { due = 1; wasmLastFrame = now; }
-    if (fwLoaded && booted) {
+    if (fwLoaded && booted && !wasmPaused) {
         for (int i = 0; i < due; i++) run_emulated_frame();
         wasmFrame += (Uint32)due;
     }

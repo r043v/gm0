@@ -123,6 +123,14 @@ Un unique `.html` avec le wasm embarqué en base64 (`-sSINGLE_FILE=1`) :
 à ouvrir directement (file:// compris), à envoyer tel quel — mêmes
 fonctionnalités que la version servie.
 
+**Dock de droite** (toujours visible) : 📄/📁 ouverture, ⏸ pause /
+▶ reprise, ⏹ redémarrage du jeu, 🐰 Lapinou chargé en un clic (fetch de
+`lapinou.bin` à côté de la page), jeux du site META et champ slug/URL
+(`https://gamebuino.com/games/<slug>/download`) — selon le serveur, CORS
+peut refuser le fetch depuis une autre origine : dans ce cas téléchargez
+le fichier et déposez-le.  Pause/stop appellent les exports C
+`emu_pause`/`emu_restart`.
+
 - **Déposez** un .bin (firmware), une image .img, ou un **dossier de jeu**
   (traversé récursivement) — ou cliquez pour choisir un dossier
   (`webkitdirectory`) : un .bin unique du dossier devient le firmware,
