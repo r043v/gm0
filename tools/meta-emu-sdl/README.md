@@ -186,17 +186,44 @@ transfert immédiat hérité du TS (firmwares 0.1.0 : sortie identique).
 
 ## État
 
+## État
+
 **Jeux du site META (lib récente, cf. github.com/Gamebuino/Gamebuino-META)**
-: la couche display tourne (DMA chaîné, INTFLAG par canal, SysTick
-indépendant du DMAC, ~47 fps) et pousse des frames entières, mais le
-**contenu est noir** : le flip lit son framebuffer via un pointeur vers
-la **flash physique (0x00400000 + offset, au-delà de l'image chargée)**
-— l'alias est maintenant mappé, mais l'objet visé vit au-delà de
-l'image du jeu (zone 0xFF) : la couche applicative ne démarre pas
-(open item : sémantique complète Adafruit_ZeroDMA / init lib 2.x).  Le
-fork TS de référence (output/gbemu) fait tourner ces jeux avec un
-modèle DMAC plus simple — le pas suivant est donc de comparer
-l'exécution TS vs C pas à pas sur le même .bin (node headless.js).
+: le boot est **réparé** — écran « GAMEBUINO / SD INIT... » et écrans
+loaders affichés, init SD complète (CMD0 → CMD8 → ACMD41 → CMD58 →
+CMD17).  Trois causes racines, toutes corrigées :
+
+- **carte SD sans table de partitions** : la carte construite depuis un
+  dossier était une superfloppy (boot sector en LBA 0) ; la lib officielle
+  (SdFat, partition 1) lit le secteur 0, ne trouve pas d'entrée à 0x1BE
+  et boucle.  Le constructeur écrit maintenant un MBR (une partition
+  FAT16 à LBA 2048) — le loader gbrecomp (meta_fat.c) gère les deux
+  dispositions.  La Pokitto reste en superfloppy (son lecteur FAT attend
+  le boot sector en LBA 0) : le décalage est choisi par cible au moment
+  de la construction de la carte ;
+- **écritures flash jetées** : les jeux auto-patchés (loaders) écrivent
+  dans leur propre flash (compteur d'animation, flags d'installation) ;
+  `writeWord/Half/Byte` les ignoraient → boucles infinies.  La
+  programmation est modélisée par effet net (`flash_store`, NVM_DEBUG=1
+  pour tracer, FLASH_DUMP=fichier pour dumper la flash en fin de run) ;
+- **paires 32 bits Thumb-2 exécutées comme deux 16 bits** : MRS
+  (`0xF3EF 0x8xxx`, « suis-je dans une ISR ? ») laissait son second
+  demi-mot s'exécuter en STRH fantôme (écritures sauvages en flash,
+  registres écrasés), et MSR/DSB étaient avalés par la branche BL
+  (code mort pour DMB).  L'espace 32 bits (0xE800-0xFFFF hors BL) est
+  maintenant consommé proprement, MRS pose Rd=0 (mode thread).
+
+Reste ouvert (écran « SD INIT... » persistant) : la **lecture des
+secteurs** par la lib récente.  Le flux hardware est identifié
+(SdSpiGamebuino.cpp : TX-DMA horloge la carte, RX lue par le CPU au fil
+des beats) ; côté émulateur le jeu attend le token 0xFE en relisant
+SERCOM4 DATA sans ré-horloger assez tôt — l'échange DMA/CPU ne se
+synchronise pas encore (l'INTFLAG.RXC honnête a été essayé et retiré :
+il régressait le boot ; il faut vraisemblablement cadencer RXC sur les
+beats TX, ou faire avancer la file SD à la lecture).  Le TS de référence
+est pris en défaut sur ces jeux indépendamment (closures de décodage
+périmées après auto-patch flash) : le C est le seul des deux à pouvoir
+les exécuter.
 
 Le boot est **paritairement validé contre le fork TypeScript** : mêmes
 hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,

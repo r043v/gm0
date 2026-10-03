@@ -34,7 +34,11 @@
 /* ---------------------------------------------------------------- état */
 
 #define FLASH_SIZE 0x40000u
-#define SRAM_SIZE  0x8000u
+/* 40 Ko : la SRAM du SAMD21 fait 32 Ko mais les jeux lib récente placent
+ * leur buffer de réception SD (SdFat) vers 0x20008860 — hors des 32 Ko —
+ * et attendent des écritures fonctionnelles à cette adresse ; ce surplus
+ * reste inutilisé par les autres jeux */
+#define SRAM_SIZE  0xa000u
 
 /* Le tampon d'écran doit contenir la plus grande des deux cibles
  * (160x128 META, 220x176 Pokitto) ; SCR_W/SCR_H suivent la cible. */
@@ -304,7 +308,11 @@ static size_t sd_card_size(void) {
     return sd_image ? sd_size : (fatImage ? fatImageSize : 0);
 }
 
+static int sdDbg = -1;
 static void sd_command(uint8_t cmd, uint32_t arg) {
+    if (sdDbg < 0) sdDbg = getenv("SD_DEBUG") ? 1 : 0;
+    if (sdDbg && cmd != 55)
+        fprintf(stderr, "[sd] CMD%u arg=%u (%#x) @tick=%u\n", cmd, arg, arg, tickCount);
     switch (cmd) {
         case 0:  sd_out_push(sd_initialized ? 0x00 : 0x01); break; /* idle */
         case 8:  sd_out_push(0x01); sd_out_push(0x00);
@@ -430,6 +438,15 @@ static size_t   fatImageSize;
 static uint32_t fatClusterCount; /* clusters de données du volume */
 static uint32_t fatSpc = 8;         /* secteurs / cluster (dynamique) */
 static uint32_t fatFatsz = 65;      /* secteurs / FAT (dynamique) */
+/* Table de partitions, par cible : les cartes réelles ont toujours un MBR
+ * et la lib META officielle (SdFat, partition 1) ne monte pas une
+ * superfloppy — elle lit le secteur 0, ne trouve pas d'entrée à 0x1BE et
+ * boucle sur son écran de chargement.  Le loader gbrecomp (meta_fat.c)
+ * gère les deux dispositions ; en revanche le lecteur FAT Pokitto attend
+ * le secteur de boot en LBA 0 (superfloppy).  fatPartStart est donc posé
+ * au moment de la construction de la carte (fat_bootstrap_for), la cible
+ * étant déjà détectée à ce moment. */
+static uint32_t fatPartStart; /* décalage du volume (secteurs) */
 typedef struct { uint32_t lba; size_t bytes; char path[1024]; uint8_t *mem; } FatFile;
 static FatFile  fatFiles[512];
 static int      fatFileCount;
@@ -504,7 +521,7 @@ static uint32_t fat_alloc(int clusters) {
 }
 
 static uint32_t fat_data_lba(uint32_t first) {
-    return 1 + 2 * fatFatsz + (FAT_ROOT * 32 + 511) / 512 + (first - 2) * fatSpc;
+    return fatPartStart + 1 + 2 * fatFatsz + (FAT_ROOT * 32 + 511) / 512 + (first - 2) * fatSpc;
 }
 
 static void fat_place(const char *dir, uint32_t parentFirst, int isRoot,
@@ -609,6 +626,7 @@ static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
 /* amorce du volume : géométrie calculée pour contenir `bytes` de données
  * (FAT16, clusters 4-32 Ko, volume borné à ~511 Mo) */
 static void fat_bootstrap_for(size_t bytes, int ndirs) {
+    fatPartStart = (emuTarget == TGT_POKITTO) ? 0 : 2048; /* 1 Mio, alignement SD */
     /* FAT16 impose 4085..65000 clusters : choisit le spc en conséquence */
     uint32_t spc = 8; /* 4 Ko */
     double cl;
@@ -623,7 +641,8 @@ static void fat_bootstrap_for(size_t bytes, int ndirs) {
     if (clusters > 65000u) clusters = 65000u;
     fatClusterCount = clusters;
     uint32_t fatsz = (uint32_t)(((clusters + 2) * 2 + FAT_SECTOR - 1) / FAT_SECTOR);
-    uint32_t total = 1 + 2 * fatsz + 32 + clusters * spc;
+    uint32_t vol = 1 + 2 * fatsz + 32 + clusters * spc; /* secteurs du volume */
+    uint32_t total = fatPartStart + vol;                /* + table de partitions */
     fatSpc = spc;
     fatFatsz = fatsz;
     fatTotalSectors = (int)total;
@@ -639,26 +658,51 @@ static void fat_bootstrap_for(size_t bytes, int ndirs) {
     }
     fatTable[0] = 0xf8; fatTable[1] = 0xff;
     fatTable[2] = 0xff; fatTable[3] = 0xff;
-    fatImage[0] = 0xeb; fatImage[1] = 0x3c; fatImage[2] = 0x90;
-    memcpy(fatImage + 3, "GBREMU", 6);
-    fatImage[0x0b] = 0x00; fatImage[0x0c] = 0x02; /* 512 octets/secteur */
-    fatImage[0x0d] = (uint8_t)spc;
-    fatImage[0x0e] = 0x01; fatImage[0x0f] = 0x00;
-    fatImage[0x10] = 0x02;
-    fatImage[0x11] = FAT_ROOT & 0xff; fatImage[0x12] = FAT_ROOT >> 8;
-    fatImage[0x15] = 0xf8;
-    fatImage[0x16] = fatsz & 0xff; fatImage[0x17] = (fatsz >> 8) & 0xff;
-    fatImage[0x18] = 32; fatImage[0x19] = 0;   /* secteurs/piste */
-    fatImage[0x1a] = 8; fatImage[0x1b] = 0;    /* têtes */
-    /* FAT16 : total en 16 bits (0x13) sous 65536 secteurs, sinon en 32
-     * (0x20) — le driver du firmware ne lit que le champ 16 bits */
-    if (total < 65536u) {
-        fatImage[0x13] = total & 0xff; fatImage[0x14] = (total >> 8) & 0xff;
+    /* --- secteur de boot de la partition (le driver du firmware ne lit
+     * que le champ 16 bits du total, fat_finish recopie les FAT) --- */
+    uint8_t *bs = fatImage + fatPartStart * FAT_SECTOR;
+    bs[0] = 0xeb; bs[1] = 0x3c; bs[2] = 0x90;
+    memcpy(bs + 3, "GBREMU", 6);
+    bs[0x0b] = 0x00; bs[0x0c] = 0x02; /* 512 octets/secteur */
+    bs[0x0d] = (uint8_t)spc;
+    bs[0x0e] = 0x01; bs[0x0f] = 0x00;
+    bs[0x10] = 0x02;
+    bs[0x11] = FAT_ROOT & 0xff; bs[0x12] = FAT_ROOT >> 8;
+    bs[0x15] = 0xf8;
+    bs[0x16] = fatsz & 0xff; bs[0x17] = (fatsz >> 8) & 0xff;
+    bs[0x18] = 32; bs[0x19] = 0;   /* secteurs/piste */
+    bs[0x1a] = 8; bs[0x1b] = 0;    /* têtes */
+    /* FAT16 : total du VOLUME en 16 bits (0x13) sous 65536 secteurs,
+     * sinon en 32 (0x20) */
+    if (vol < 65536u) {
+        bs[0x13] = vol & 0xff; bs[0x14] = (vol >> 8) & 0xff;
     } else {
-        fatImage[0x20] = total & 0xff; fatImage[0x21] = (total >> 8) & 0xff;
-        fatImage[0x22] = (total >> 16) & 0xff; fatImage[0x23] = (total >> 24) & 0xff;
+        bs[0x20] = vol & 0xff; bs[0x21] = (vol >> 8) & 0xff;
+        bs[0x22] = (vol >> 16) & 0xff; bs[0x23] = (vol >> 24) & 0xff;
     }
-    fatImage[510] = 0x55; fatImage[511] = 0xaa;
+    bs[0x1c] = fatPartStart & 0xff; bs[0x1d] = (fatPartStart >> 8) & 0xff; /* secteurs cachés */
+    bs[0x1e] = (fatPartStart >> 16) & 0xff; bs[0x1f] = (fatPartStart >> 24) & 0xff;
+    bs[510] = 0x55; bs[511] = 0xaa;
+    /* --- MBR : une partition FAT16 occupant tout le reste --- */
+    fatImage[0x1be] = 0x00; /* non amorçable */
+    {   /* CHS calculés avec la géométrie du BPB (8 têtes, 32 secteurs/piste) ;
+         * les pilotes utilisent le champ LBA — le Codé CHS ne sert qu'aux
+         * outils de disque.  Au-delà de 1023 cylindres : forme saturée. */
+        uint32_t end = total - 1;
+        uint32_t cs = fatPartStart / 256, ce = end / 256;
+        fatImage[0x1bf] = (uint8_t)((fatPartStart / 32) % 8);
+        fatImage[0x1c0] = (uint8_t)((fatPartStart % 32 + 1) | ((cs >> 2) & 0xc0));
+        fatImage[0x1c1] = (uint8_t)cs;
+        fatImage[0x1c2] = 0x06; /* type FAT16 */
+        fatImage[0x1c3] = ce > 1023 ? 0xfe : (uint8_t)((end / 32) % 8);
+        fatImage[0x1c4] = ce > 1023 ? 0xff : (uint8_t)((end % 32 + 1) | ((ce >> 2) & 0xc0));
+        fatImage[0x1c5] = ce > 1023 ? 0xff : (uint8_t)ce;
+        fatImage[0x1c6] = fatPartStart & 0xff; fatImage[0x1c7] = (fatPartStart >> 8) & 0xff;
+        fatImage[0x1c8] = (fatPartStart >> 16) & 0xff; fatImage[0x1c9] = (fatPartStart >> 24) & 0xff;
+        fatImage[0x1ca] = vol & 0xff; fatImage[0x1cb] = (vol >> 8) & 0xff;
+        fatImage[0x1cc] = (vol >> 16) & 0xff; fatImage[0x1cd] = (vol >> 24) & 0xff;
+        fatImage[510] = 0x55; fatImage[511] = 0xaa;
+    }
 }
 
 static FatEnt *rootEnts; /* entrées de la racine, consommées par fat_finish */
@@ -681,10 +725,10 @@ static void fat_finish(const char *label) {
         rootBuf[off + 30] = (rootEnts[i].size >> 16) & 0xff; rootBuf[off + 31] = (rootEnts[i].size >> 24) & 0xff;
         off += 32;
     }
-    uint32_t rootLba = 1 + 2 * fatsz;
+    uint32_t rootLba = fatPartStart + 1 + 2 * fatsz;
     memcpy(fatImage + rootLba * FAT_SECTOR, rootBuf, FAT_ROOT * 32);
-    memcpy(fatImage + FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
-    memcpy(fatImage + (1 + fatsz) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
+    memcpy(fatImage + (fatPartStart + 1) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
+    memcpy(fatImage + (fatPartStart + 1 + fatsz) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
     free(rootBuf); free(rootEnts); rootEnts = NULL; rootN = 0;
     if (getenv("FAT_DUMP")) {
         FILE *g = fopen(getenv("FAT_DUMP"), "wb");
@@ -2278,6 +2322,7 @@ static uint32_t dmac_baseAddr, dmac_wrbAddr, dmac_desc, dmac_chid;
 #define DMAC_CHANNELS 12
 #define DMAC_TRIG_TC4_OVF 0x1bu /* TC4_DMAC_ID_OVF (SAMD21) */
 #define DMAC_TRIG_SERCOM4_TX 0x0au /* SERCOM4_DMAC_ID_TX (écran) */
+#define DMAC_TRIG_SERCOM4_RX 0x09u /* SERCOM4_DMAC_ID_RX (carte SD, lib récente) */
 /* DMA SPI cadencé : les beats sortent au rythme du baud SERCOM4 (le CPU
  * continue de tourner pendant le transfert — sur hardware le DMA écran
  * prend ~6,8 ms par demi-frame à 24 MHz, d'où les 40-55 fps réels) */
@@ -2297,6 +2342,7 @@ static void writeWord(uint32_t a, uint32_t v);
 static void writeHalf(uint32_t a, uint16_t v);
 static void writeByte(uint32_t a, uint8_t v);
 
+static void dma_sercom4_rx_beat(void);
 static int dma_is_tc4(uint32_t ch) {
     return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC4_OVF;
 }
@@ -2338,9 +2384,15 @@ static void dma_beat(uint32_t ch) {
     uint32_t src = dmaSrc[ch], dst = dmaDst[ch];
     if (dmaCtrl[ch] & (1u << 10)) src += (dmaIdx[ch] - dmaCnt[ch]) * size; /* SRCINC */
     if (dmaCtrl[ch] & (1u << 11)) dst += (dmaIdx[ch] - dmaCnt[ch]) * size; /* DSTINC */
+    static int dmaDbg = -1;
+    if (dmaDbg < 0) dmaDbg = getenv("EMU_DMA_DEBUG") ? 1 : 0;
+    if (dmaDbg && (dst == 0x42001828u || dst < 0x20000000u)) /* SPI ou canal égaré */
+        fprintf(stderr, "[dma] tick=%u ch=%u beat src=%x dst=%x ctrl=%04x idx=%u cnt=%u\n",
+                tickCount, ch, src, dst, dmaCtrl[ch], dmaIdx[ch], dmaCnt[ch]);
     if (size == 1) writeByte(dst, fetchByte(src));
     else if (size == 2) writeHalf(dst, fetchHalf(src));
     else writeWord(dst, fetchWord(src));
+    if (dst == 0x42001828u) dma_sercom4_rx_beat(); /* plein-duplex SD */
     if (++dmaIdx[ch] >= dmaCnt[ch]) {
         /* TCMPL PAR DESCRIPTEUR : le matériel lève l'interruption à chaque
          * fin de bloc (chaîné ou pas) — les libs comptent les descripteurs
@@ -2349,6 +2401,30 @@ static void dma_beat(uint32_t ch) {
         dma_wrb_write(ch);
         dmacInterrupt = 1;
         dma_load(ch, dmaNext[ch]); /* suit la chaîne, ou suspend si invalide */
+    }
+}
+
+/* La lib récente lit la carte SD via un canal DMA déclenché par
+ * SERCOM4_RX (SdSpiGamebuino.cpp : receive() arme rx = SPI.DATA -> buffer,
+ * tx = n x 0xFF, puis attend les deux TCMPL).  Chaque beat TX horloge un
+ * octet : le beat RX est son miroir plein-duplex (la réponse vient d'être
+ * produite dans ser4_data). */
+static void dma_sercom4_rx_beat(void) {
+    for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++) {
+        if (!dmaOn[ch] || dmaTrig[ch] != DMAC_TRIG_SERCOM4_RX) continue;
+        if (dmaCnt[ch] == 0) { dma_wrb_write(ch); dma_load(ch, dmaNext[ch]); continue; }
+        uint32_t size = 1u << ((dmaCtrl[ch] >> 8) & 3u);
+        uint32_t dst = dmaDst[ch];
+        if (dmaCtrl[ch] & (1u << 11)) dst += (dmaIdx[ch] - dmaCnt[ch]) * size;
+        if (size == 1) writeByte(dst, ser4_data);
+        else if (size == 2) writeHalf(dst, ser4_data);
+        else writeWord(dst, ser4_data);
+        if (++dmaIdx[ch] >= dmaCnt[ch]) {
+            dmacIntFlag[ch] |= 0x02;
+            dma_wrb_write(ch);
+            dmacInterrupt = 1;
+            dma_load(ch, dmaNext[ch]);
+        }
     }
 }
 
@@ -2404,9 +2480,10 @@ static uint32_t periph_read(uint32_t a, int *handled) {
     if ((a & ~0x1fu) == 0x41004480u) { *handled = 1; return port_read(1, a & 0x1f); }
     if (a == 0x42001818u || a == 0x42001c18u) { *handled = 1; return 0x07; } /* SERCOM4/5 INTFLAG */
     if (a == 0x42001828u) { *handled = 1;
-        if (dbg() && dbgDac < 6000) {
-            fprintf(stderr, "[dbg] SPI DATA lu <- %02x pc=%x PA27=%d\n", ser4_data, regs[15] - 2,
-                    (portA_out >> 27) & 1);
+        if (dbg() && dbgDac < 6000 && ((portA_out >> 27) & 1) == 0) {
+            /* cartes sélectionnée seulement : le polling CS-haut noie tout */
+            fprintf(stderr, "[dbg] SPI DATA lu <- %02x pc=%x PA27=%d tick=%u\n", ser4_data, regs[15] - 2,
+                    (portA_out >> 27) & 1, tickCount);
             dbgDac++;
         }
         return ser4_data; }                /* SERCOM4 DATA */
@@ -2481,12 +2558,39 @@ static long millisWrites;
 /* montre générique d'écriture (WATCH_ADDR), pour le débogage */
 static long usbWatch;
 static uint32_t watchAddr = 0;
+static uint32_t prevInstPc;  /* PC à l'entrée du pas courant (la boucle le tient à jour) */
+/* programmation flash (auto-patch des loaders) : effet net du NVMCTRL —
+ * la valeur écrite est stockée en flash et le code fraîchement écrit est
+ * exécuté aux pas suivants.  Les commandes du contrôleur (0x41004000+)
+ * restent des no-ops : sur circuit le jeu prépare ses pages puis les
+ * programme ; ici seule l'écriture effective compte.  L'alias physique
+ * 0x00400000 est accepté en écriture aussi. */
+static void flash_store(uint32_t a, uint32_t v, int bytes) {
+    if (a >= FLASH_PHYS_BASE) a -= FLASH_PHYS_BASE;
+    if (a + (uint32_t)bytes > FLASH_SIZE) return;
+    static int nvmDbg = -1;
+    if (nvmDbg < 0) nvmDbg = getenv("NVM_DEBUG") ? 1 : 0;
+    if (nvmDbg) {
+        static int n; if (n < 300) fprintf(stderr, "[nvm] tick=%u pc=%x flash[%x] <- %0*x (%d o)\n",
+                                          tickCount, prevInstPc, a, bytes * 2,
+                                          v & ((1u << (bytes * 8)) - 1), bytes);
+        n++;
+    }
+    uint8_t *p = flash + a;
+    if (bytes == 4) {
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+        p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+    } else if (bytes == 2) {
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    } else p[0] = (uint8_t)v;
+}
+
 static void writeWord(uint32_t a, uint32_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_word(a, v); return; }
     if (a == millisWatchAddr) millisWrites++;
     if (watchAddr && a == watchAddr && usbWatch < 4000)
         fprintf(stderr, "[watch %x] tick=%u pc=%x val=%08x\n", a, tickCount, regs[15] - 2, v);
-    if (a < 0x20000000u) return;
+    if (a < 0x20000000u) { flash_store(a, v, 4); return; }
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 4 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff;
         sram[a+2] = (v >> 16) & 0xff; sram[a+3] = (v >> 24) & 0xff; return; }
@@ -2522,9 +2626,21 @@ static void writeWord(uint32_t a, uint32_t v) {
         spiDmaCh = -1; dmaOn[dmac_chid] = 0; /* SWRST/désactivation du canal SPI */
         return;
     }
+    if (a == 0x41004840u && (v & 0x03u) != 0x02u && dmaTrig[dmac_chid & 0xfu] == DMAC_TRIG_SERCOM4_RX) {
+        dmaOn[dmac_chid & 0xfu] = 0; /* désactivation du canal RX SD */
+        return;
+    }
     if (a == 0x41004840u) { /* CHCTRLA == 2 : transfert via descripteur */
         if (v == 0x02) {
             if (!dmac_desc) dmac_desc = dmac_baseAddr + dmac_chid * 0x10;
+            if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_RX) {
+                /* réception SD : armé seulement — les beats arrivent au
+                 * rythme des octets envoyés (miroir plein-duplex), une
+                 * copie instantanée lirait ici 512x le même octet */
+                dma_load(dmac_chid, dmac_desc);
+                dmac_desc = 0;
+                return;
+            }
             uint16_t pctrl = fetchHalf(dmac_desc);
             uint32_t pdst = fetchWord(dmac_desc + 0x08);
             if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX || pdst == 0x42001828u) {
@@ -2586,7 +2702,9 @@ static void writeWord(uint32_t a, uint32_t v) {
 
 static void writeHalf(uint32_t a, uint16_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_half(a, v); return; }
-    if (a < 0x20000000u) return;
+    if (a < 0x20000000u) { flash_store(a, v, 2); return; }
+    if (watchAddr && a == watchAddr && usbWatch < 4000)
+        fprintf(stderr, "[watch-h %x] tick=%u pc=%x val=%04x\n", a, tickCount, prevInstPc, v);
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff; return; }
     if (a == 0x42004808u) { if (dbg() && dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
@@ -2604,7 +2722,7 @@ static void writeHalf(uint32_t a, uint16_t v) {
 
 static void writeByte(uint32_t a, uint8_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_byte(a, v); return; }
-    if (a < 0x20000000u) return;
+    if (a < 0x20000000u) { flash_store(a, v, 1); return; }
     if (a < 0x40000000u) { uint32_t sa = a - 0x20000000u; if (sa < SRAM_SIZE) sram[sa] = v; return; }
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET */
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
@@ -2698,7 +2816,9 @@ static uint32_t popStack(void) { uint32_t v = fetchWord(regs[13]); regs[13] += 4
 static uint32_t state_hash(void) {
     uint32_t h = 0x811c9dc5u;
     for (int i = 0; i < 16; i++) { h = (h ^ regs[i]) * 0x01000193u; }
-    for (int i = 0; i < SRAM_SIZE; i++) { h = (h ^ sram[i]) * 0x01000193u; }
+    /* 32 Ko seulement : comparable au harnais TS (la SRAM étendue au-delà
+     * de 0x8000 ne sert qu'aux buffers SD des libs récentes) */
+    for (uint32_t i = 0; i < 0x8000u; i++) { h = (h ^ sram[i]) * 0x01000193u; }
     if (emuTarget == TGT_POKITTO) {
         for (size_t i = 0; i < sizeof pk_sram1; i++) { h = (h ^ pk_sram1[i]) * 0x01000193u; }
         for (size_t i = 0; i < sizeof pk_usbsram; i++) { h = (h ^ pk_usbsram[i]) * 0x01000193u; }
@@ -2728,7 +2848,6 @@ static uint32_t addSetCond(uint32_t a, uint32_t b, int carry) {
 
 static void irq_inject(uint32_t vector);
 
-static uint32_t prevInstPc;  /* PC à l'entrée du pas courant */
 static uint32_t lastExecPc;  /* PC de l'instruction exécutée au pas précédent */
 
 /* TRACE_TAIL=<n> : tampon circulaire des n dernières lignes de trace ;
@@ -3205,9 +3324,13 @@ static void step(void) {
         uint16_t nextInst = fetchHalf(instAddr + 2);
         setReg((nextInst >> 8) & 0xF, regs[13]);
     }
-    else if ((op & 0xf800) == 0xf000) { /* BL : second demi-mot lu paresseusement */
+    else if ((op & 0xf800) == 0xf000) { /* espace 32 bits 0xF000-0xF7FF */
         uint16_t nextInst = fetchHalf(instAddr + 2);
         if ((nextInst & 0xf800) == 0xf800) {
+            /* BL : LR doit pointer APRÈS la paire (bit Thumb posé) — le TS
+             * fixe LR au second demi-mot, l'ancien port laissait
+             * LR = PC + off1<<12 en corrompant tout retour bx lr.
+             * La paire coûte 3 ticks et finit avec PC = cible+2 (état TS). */
             int32_t off1 = op & 0x7ff;
             if (off1 & 0x400) off1 |= ~0x7ff;
             int32_t off2 = nextInst & 0x7ff;
@@ -3227,11 +3350,23 @@ static void step(void) {
             incrementPc(); /* second demi-mot : PC = cible+2 */
             incrementPc(); /* troisième tick de la paire (pas du second demi-mot) */
             regs[15] -= 2; /* état final du TS */
+        } else {
+            /* MRS (0xF3EF 0x8xxx) : Rd <- 0 — mode thread (IPSR = 0) ; les
+             * libs testent « suis-je dans une ISR ? » avec.  MSR, DSB/DMB
+             * et autres 0xF0xx-0xF7FF : paire consommée sans effet.  SANS
+             * ÇA le second demi-mot s'exécutait comme instruction 16 bits
+             * fantôme (STRH sauvage en flash, registres écrasés, tests
+             * IPSR déraillant — écran noir des jeux lib récente). */
+            if ((op & 0xfff0) == 0xf3e0 && (nextInst & 0xf000) == 0x8000)
+                setReg((nextInst >> 8) & 0xF, 0);
+            incrementPc(); /* consomme le second demi-mot */
         }
-        /* demi-mot 0xf0xx isolé : non décodé, on continue (comme le TS) */
     }
-    else if (op == 0xf3bf || (op & 0xffe0) == 0xf3e0) { /* DMB/MRS : no-op ; le TS ajoute un tick pour DMB seul */
-        if (op == 0xf3bf) incrementPc();
+    else if ((op & 0xf000) == 0xe800 || (op & 0xf800) == 0xf800) {
+        /* reste de l'espace 32 bits (0xE800-0xEFFF, 0xF800-0xFFFF : ldr.w,
+         * str.w, udiv… ) : paire consommée comme no-op — le second demi-mot
+         * ne doit jamais s'exécuter seul */
+        incrementPc();
     }
     else {
         /* instruction non décodée : comme le TS, on continue */
@@ -4123,6 +4258,11 @@ int main(int argc, char **argv) {
     pk_debug_dump();
     pk_eeprom_save();
     pk_card_export();
+    { const char *fd = getenv("FLASH_DUMP"); /* flash après auto-patch du jeu */
+      if (fd && emuTarget == TGT_META) {
+        FILE *g = fopen(fd, "wb");
+        if (g) { fwrite(flash, 1, FLASH_SIZE, g); fclose(g); }
+      } }
     if (audioDev) SDL_CloseAudioDevice(audioDev);
     SDL_DestroyRenderer(emuRen); SDL_DestroyTexture(tex); SDL_DestroyWindow(emuWin);
     SDL_Quit();
