@@ -386,6 +386,11 @@ static void sd_byte(uint8_t v) {
     }
     ser4_data = sd_pending;
     sd_pending = sd_outPos < sd_outLen ? sd_out[sd_outPos++] : 0xff;
+    { static int sdDbg2 = -1;
+      if (sdDbg2 < 0) sdDbg2 = getenv("SD_DEBUG") ? (getenv("SD_DEBUG")[0] == '2' ? 1 : 0) : 0;
+      if (sdDbg2 && sd_outLen + sd_cmdIdx > 0)
+          fprintf(stderr, "[sdx] t=%u w=%02x -> %02x q=%u/%u sel=%d\n",
+                  tickCount, v, ser4_data, sd_outPos, sd_outLen, sd_selected()); }
     sd_process(v);
 }
 
@@ -2332,6 +2337,7 @@ static uint32_t spiBeatTicks = 7; /* ticks par beat (baud) */
 static uint32_t spiBaud;         /* SERCOM4 BAUD (f = 48 MHz / (2×(b+1))) */
 static uint8_t  dmaTrig[DMAC_CHANNELS], dmaOn[DMAC_CHANNELS];
 static uint8_t  dmacIntFlag[DMAC_CHANNELS]; /* INTFLAG par canal : TCMPL=0x02, SUSP=0x04 */
+static uint8_t  dmacIntEn[DMAC_CHANNELS];   /* CHINTENSET par canal (lecture) */
 static uint16_t dmaCtrl[DMAC_CHANNELS], dmaCnt[DMAC_CHANNELS], dmaIdx[DMAC_CHANNELS];
 static uint32_t dmaSrc[DMAC_CHANNELS], dmaDst[DMAC_CHANNELS], dmaNext[DMAC_CHANNELS];
 
@@ -2343,6 +2349,7 @@ static void writeHalf(uint32_t a, uint16_t v);
 static void writeByte(uint32_t a, uint8_t v);
 
 static void dma_sercom4_rx_beat(void);
+static int dmaBeatSkipSd; /* un beat DMA d'affichage ne doit pas horloger la carte */
 static int dma_is_tc4(uint32_t ch) {
     return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC4_OVF;
 }
@@ -2389,10 +2396,21 @@ static void dma_beat(uint32_t ch) {
     if (dmaDbg && (dst == 0x42001828u || dst < 0x20000000u)) /* SPI ou canal égaré */
         fprintf(stderr, "[dma] tick=%u ch=%u beat src=%x dst=%x ctrl=%04x idx=%u cnt=%u\n",
                 tickCount, ch, src, dst, dmaCtrl[ch], dmaIdx[ch], dmaCnt[ch]);
-    if (size == 1) writeByte(dst, fetchByte(src));
-    else if (size == 2) writeHalf(dst, fetchHalf(src));
-    else writeWord(dst, fetchWord(src));
-    if (dst == 0x42001828u) dma_sercom4_rx_beat(); /* plein-duplex SD */
+    if (dst == 0x42001828u && size == 1) {
+        /* beat SPI : n'horloge la carte SD que pour un dummy 0xFF pendant
+         * une transaction active — sinon c'est un pixel du display, et le
+         * collisionneur viderait la file SD au milieu d'un échange CPU */
+        uint8_t b = fetchByte(src);
+        int sdClock = b == 0xffu && sd_selected() && (sd_outLen != 0 || sd_cmdIdx != 0);
+        dmaBeatSkipSd = !sdClock;
+        writeByte(dst, b);
+        dmaBeatSkipSd = 0;
+        if (sdClock) dma_sercom4_rx_beat(); /* plein-duplex SD */
+    } else {
+        if (size == 1) writeByte(dst, fetchByte(src));
+        else if (size == 2) writeHalf(dst, fetchHalf(src));
+        else writeWord(dst, fetchWord(src));
+    }
     if (++dmaIdx[ch] >= dmaCnt[ch]) {
         /* TCMPL PAR DESCRIPTEUR : le matériel lève l'interruption à chaque
          * fin de bloc (chaîné ou pas) — les libs comptent les descripteurs
@@ -2411,7 +2429,10 @@ static void dma_beat(uint32_t ch) {
  * produite dans ser4_data). */
 static void dma_sercom4_rx_beat(void) {
     for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++) {
-        if (!dmaOn[ch] || dmaTrig[ch] != DMAC_TRIG_SERCOM4_RX) continue;
+        /* canaux déclenchés SERCOM4_RX ou armés depuis un descripteur qui
+         * lit SPI.DATA (la lib récente prépare le RX en mémoire) */
+        if (!dmaOn[ch]) continue;
+        if (dmaTrig[ch] != DMAC_TRIG_SERCOM4_RX && dmaSrc[ch] != 0x42001828u) continue;
         if (dmaCnt[ch] == 0) { dma_wrb_write(ch); dma_load(ch, dmaNext[ch]); continue; }
         uint32_t size = 1u << ((dmaCtrl[ch] >> 8) & 3u);
         uint32_t dst = dmaDst[ch];
@@ -2488,7 +2509,22 @@ static uint32_t periph_read(uint32_t a, int *handled) {
         }
         return ser4_data; }                /* SERCOM4 DATA */
     if (a == 0x42001c28u) { *handled = 1; return 0x80; }                     /* SERCOM5 DATA */
-    if (a == 0x4100484eu) { *handled = 1; return dmacIntFlag[dmac_chid & 0xfu]; } /* DMAC CHINTFLAG (canal sélectionné par CHID) */
+    if (a == 0x4100484eu) { *handled = 1; return dmacIntFlag[dmac_chid & 0xfu]; } /* DMAC CHINTFLAG (fenêtre CHID) */
+    if (a >= 0x4100485eu && a < 0x41004900u && ((a - 0x4100484eu) & 0xfu) == 0) {
+        *handled = 1; return dmacIntFlag[(a - 0x4100484eu) >> 4]; } /* CHINTFLAG indexé (canaux 1+) */
+    if (a >= 0x4100485du && a < 0x41004900u && ((a - 0x4100484du) & 0xfu) == 0) {
+        *handled = 1; return dmacIntEn[(a - 0x4100484du) >> 4]; } /* CHINTENSET indexé */
+    if (a == 0x41004820u) { /* INTPEND : premier canal avec un drapeau levé */
+        *handled = 1;
+        for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++) {
+            if (dmacIntFlag[ch]) {
+                return (ch & 0xfu) | ((dmacIntFlag[ch] & 1u) << 4)
+                     | (((dmacIntFlag[ch] >> 2) & 1u) << 5)
+                     | (((dmacIntFlag[ch] >> 1) & 1u) << 6);
+            }
+        }
+        return 0;
+    }
     if (a == 0x4200300du) { *handled = 1; return tc4IntEnMask; }             /* TC4 INTENSET */
     if (a == 0x4200300eu) { *handled = 1; return tc4IntFlagMask; }           /* TC4 INTFLAG */
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) {                         /* CHCTRLA ENABLE */
@@ -2496,6 +2532,7 @@ static uint32_t periph_read(uint32_t a, int *handled) {
     return 0;
 }
 
+static uint32_t periph_read(uint32_t a, int *handled);
 /* alias physique de la flash (0x00400000) : certaines libs y accèdent
  * directement pour leurs données (images embarquées streamees en DMA) */
 #define FLASH_PHYS_BASE 0x00400000u
@@ -2524,8 +2561,14 @@ static uint16_t fetchHalf(uint32_t a) {
         return (uint16_t)(flash[a] | (flash[a+1] << 8)); }
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return 0;
         return (uint16_t)(sram[a] | (sram[a+1] << 8)); }
-    /* demi-mot : le TS ne consulte que le hack ADC RESULT */
-    if (a == 0x4200401au) return (uint16_t)adc_random();
+    /* demi-mot : le TS ne consultait que l'ADC, mais la lib officielle lit
+     * DMAC INTPEND en ldrh (0x41004820) pour retrouver le canal à service —
+     * les périphériques passent donc par periph_read aussi */
+    if (a >= 0x40000000u && a < 0x60000000u) {
+        if (a == 0x4200401au) return (uint16_t)adc_random();
+        int handled; uint32_t v = periph_read(a & ~1u, &handled);
+        return (uint16_t)v;
+    }
     return 0;
 }
 
@@ -2620,11 +2663,48 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == 0x41004834u) { dmac_baseAddr = v; return; }
     if (a == 0x41004838u) { dmac_wrbAddr = v; return; }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
+    /* la lib officielle adresse les canaux en INDEXÉ — 16 octets par canal :
+     * Channel[n] = 0x41004840 + n*16, CHCTRLA@+0, CHCTRLB@+4, CHINTENCLR@+C,
+     * CHINTENSET@+D, CHINTFLAG@+E.  Les canaux 1+ (0x50+) arrivent ici ; les
+     * adresses 0x40-0x4F sont la fenêtre CHID (= canal 0 pour la lib, qui
+     * n'écrit jamais CHID) et passent par les handlers CHID ci-dessous. */
+    if (a >= 0x41004850u && a < 0x41004900u) {
+        uint32_t ch = (a - 0x41004840u) >> 4;
+        uint32_t off = (a - 0x41004840u) & 0xfu;
+        if (ch < DMAC_CHANNELS && (off == 0 || off == 4 || (off >= 0xc && off <= 0xe))) {
+            if (off == 0) { /* CHCTRLA */
+                if ((v & 0x03u) == 0x02u) {
+                    uint32_t desc = dmac_baseAddr ? dmac_baseAddr + ch * 0x10 : 0;
+                    if (desc) dma_load(ch, desc);
+                } else dmaOn[ch] = 0; /* SWRST / disable */
+                return;
+            }
+            if (off == 4) { dmaTrig[ch] = (uint8_t)((v >> 8) & 0x3fu); return; } /* CHCTRLB.TRIGSRC */
+            if (off == 0xc) { dmacIntEn[ch] = (uint8_t)~v; return; }  /* CHINTENCLR */
+            if (off == 0xd) { dmacIntEn[ch] = (uint8_t)v; return; }   /* CHINTENSET */
+            if (off == 0xe) {
+                dmacIntFlag[ch] = 0; /* CHINTFLAG (acquitter) */
+                for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
+                    if (k != ch && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
+                return;
+            }
+        }
+        return;
+    }
     if (a == 0x41004844u && dmac_chid < DMAC_CHANNELS) { /* CHCTRLB */
         /* comme le TS : seul TRIGSRC est retenu ; CMD (RESUME/retigger) est
          * ignoré — le transfert part de l'écriture CHCTRLA=ENABLE, le
          * curseur de descripteurs tournant (anneau de la lib) fait le reste */
         dmaTrig[dmac_chid] = (uint8_t)((v >> 8) & 0x3fu);
+        return;
+    }
+    if (a == 0x4100484eu && dmac_chid < DMAC_CHANNELS) { /* CHINTFLAG : acquittement */
+        dmacIntFlag[dmac_chid] &= (uint8_t)~v;
+        /* l'interruption DMAC est level-triggered sur le hardware : tant
+         * qu'un autre canal attend, le NVIC ré-entre dans le handler — la
+         * lib ne lit INTPEND qu'une fois par entrée */
+        for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
+            if (k != dmac_chid && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
         return;
     }
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) { /* canal audio (TC4) */
@@ -2738,7 +2818,12 @@ static void writeByte(uint32_t a, uint8_t v) {
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
     if (a == 0x42001828u) { sercom4_write(v); return; }
     if (a == 0x4200180au) { spiBaud = v; return; } /* SERCOM4 BAUD (SPI) */
-    if (a == 0x4100484eu) { dmacIntFlag[dmac_chid & 0xfu] &= (uint8_t)~v; return; } /* DMAC CHINTFLAG acquittement */
+    if (a == 0x4100484eu) { /* DMAC CHINTFLAG acquittement (fenêtre, octet) */
+        dmacIntFlag[dmac_chid & 0xfu] &= (uint8_t)~v;
+        for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
+            if (k != (dmac_chid & 0xfu) && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
+        return;
+    }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
@@ -2767,7 +2852,7 @@ static void sercom4_write(uint8_t v) {
         ser4_data = buttonData; /* boutons : PB03 (lib standard) ou PA25
                                  * (certains jeux maison pilotent ce CS en
                                  * direct — même registre à décalage) */
-    sd_byte(v);
+    if (!dmaBeatSkipSd) sd_byte(v);
 }
 
 /* ---------------------------------------------------------------- CPU */

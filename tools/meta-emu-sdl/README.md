@@ -226,17 +226,36 @@ restent inertes.  Le standalone embarque les jeux de la liste offline en
 base64 et, au chargement d'un jeu, peuple la carte avec les autres
 (parité avec le natif : carte = répertoire du firmware).
 
-Reste ouvert (écran « SD INIT... » persistant) : la **lecture des
-secteurs** par la lib récente.  Le flux hardware est identifié
-(SdSpiGamebuino.cpp : TX-DMA horloge la carte, RX lue par le CPU au fil
-des beats) ; côté émulateur le jeu attend le token 0xFE en relisant
-SERCOM4 DATA sans ré-horloger assez tôt — l'échange DMA/CPU ne se
-synchronise pas encore (l'INTFLAG.RXC honnête a été essayé et retiré :
-il régressait le boot ; il faut vraisemblablement cadencer RXC sur les
-beats TX, ou faire avancer la file SD à la lecture).  Le TS de référence
-est pris en défaut sur ces jeux indépendamment (closures de décodage
-périmées après auto-patch flash) : le C est le seul des deux à pouvoir
-les exécuter.
+**La pile SD de la lib récente fonctionne** (Yatzy, Reuben Quest :
+« SD INIT... OK! », sauvegarde écrite via CMD24).  Les cinq pièces qui
+manquaient, toutes côté émulateur :
+
+- **registres DMAC indexés** : la lib adresse Channel[n] à
+  0x41004840 + n*16 (CHCTRLA@0, CHCTRLB@4, CHINTENCLR@C, CHINTENSET@D,
+  CHINTFLAG@E) sans jamais écrire CHID — ces écritures étaient
+  silencieusement jetées, le canal RX ne démarrait jamais ;
+- **INTPEND lu en demi-mot** : le handler DMAC du jeu retrouve le canal
+  à service par `ldrh 0x41004820` — fetchHalf ne consultait pas
+  periph_read (héritage TS : « mot et octet, jamais demi-mot ») et
+  renvoyait 0 ;
+- **interruption DMAC level-triggered** : le handler ne service qu'un
+  canal par entrée ; sur circuit le NVIC ré-entre tant qu'un drapeau
+  pend — l'émulateur ré-arme maintenant dmacInterrupt à chaque
+  acquittement si d'autres canaux attendent ;
+- **collision display-DMA / SD** : les beats DMA de l'écran
+  horlogenaient la machine SD et vidaient sa file au milieu des
+  échanges CPU — un beat n'horloge plus la carte que pour un dummy
+  0xFF pendant une transaction active ;
+- **acquittement fenêtre** : le clear CHINTFLAG par la fenêtre CHID
+  (0x4100484E, octet) était jeté lui aussi.
+
+Reste ouvert : les **deux loaders du site** (Cats & Coins, GB Theft
+Auto) montent la carte (MBR + partition + FAT) puis leur init SD
+maison se fige après CMD8 — elle n'enchaîne pas sur ACMD41.  Leurs
+assets (`CatsAndCoinsDemo/`…) ne sont de toute façon pas distribués
+avec les .bin.  Le TS de référence reste pris en défaut sur ces jeux
+indépendamment (closures de décodage périmées après auto-patch flash)
+: le C est le seul des deux à pouvoir les exécuter.
 
 Le boot est **paritairement validé contre le fork TypeScript** : mêmes
 hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,
