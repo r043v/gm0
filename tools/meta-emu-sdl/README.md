@@ -6,6 +6,42 @@ périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
 (fenêtre 160×128, clavier, audio 22 049 Hz).  Se compile aussi en
 **WebAssembly** (même cœur, navigateur).
 
+**Jeux maison sans lib standard** (ex. lapinou : buffer demi-écran envoyé
+en DMA blocs vers `SERCOM4->SPI.DATA`, pilote SD et audio PMF écrits à la
+main) : pris en charge depuis la révision « compat lapinou » —
+
+- DMAC : les canaux à destination **SERCOM4 DATA** (écran) sont
+  **cadencés par le baud SPI** (registre BAUD, f = 48 MHz/(2×(b+1))) —
+  le CPU continue de tourner pendant le transfert, comme sur hardware
+  où le DMA écran prend ~6,8 ms par demi-frame à 24 MHz (d'où les
+  40-55 fps réels).  L'interruption TCMPL part à la fin du bloc.
+  Les autres canaux (memset/memcpy vers la SRAM) restent des transferts
+  instantanés à l'écriture CHCTRLA, avec le descripteur honoré
+  précisément : **BEATSIZE** octet/demi/mot et drapeaux **SRCINC/DSTINC**
+  (adresses de fin SAMD21) ;
+- CS périphériques (PA27 carte SD, PA25 boutons) **hauts au reset**
+  (pull-ups réelles) : un firmware qui ne configure pas les broches ne
+  voit plus son trafic SPI écran dévoré par la machine SD ;
+- boutons répondant sur **PA25** en plus de PB03 (même registre à
+  décalage, certains jeux pilotent ce CS en direct), avec **l'ordre
+  physique du registre** tel que lu par les jeux : left, right, up, a,
+  b, menu, down, home (bits 0→7, actifs bas) ;
+- couleurs : un jeu dont l'init déclare MADCTL.BGR=1 (init custom, ex.
+  lapinou 0xC8) reçoit l'inversion R/B du panneau à l'affichage ; la
+  lib standard (jamais de BGR) reste affichée brute ;
+- TC4 : `INTENSET` accepte OVF (0x01, jeux maison) autant que MC0 (0x10,
+  lib standard), et `INTFLAG`/`INTENSET` sont **lisibles** (un handler
+  qui teste `INTFLAG.bit.OVF && INTENSET.bit.OVF` fonctionne) ; la
+  cadence des tirs est **dérivée de la config réelle du timer**
+  (prescaler CTRLA × (CC0+1), générateur audio 48 MHz) — l'ancien
+  gouverneur heuristique du TS accélérait indéfiniment un jeu qui sert
+  chaque interruption immédiatement ;
+- file de réponse SD à croissance dynamique (parité avec le tableau JS
+  du TS) : une commande reçue avant que la réponse précédente soit
+  drainée ne déborde plus d'un tampon de 528 octets ;
+- écritures disque des secteurs carte : `fseek` avant `fwrite` (les
+  .SAV/.STA multi-secteurs n'écrasent plus le début du fichier).
+
 Depuis l'ajout Pokitto, le même binaire émule aussi la **Pokitto**
 (LPC11U68, Cortex-M0 — port C fidèle du PokittoEmu de felipemanga) :
 périphériques LPC (SYSCON, IOCON, CT32B0/1, SysTick, SCT, SSP0/1, ADC,
@@ -172,6 +208,19 @@ SRAM) ; sans effet observé sur l'écran ni l'audio.
 - `TRACE_ALL=1` (+ `TRACE_FROM=<tick>`) : trace instruction par
   instruction (pas, tick, pc, inst, sp, r0-r12, lr), même format que le
   harnais TS `/tmp/ts_steptrace.js` — diff 1:1 avec la référence.
+- `TRACE_TAIL=<n>` (+ `TRACE_TAIL_OUT=<fichier>`) : garde les n
+  dernières instructions en tampon circulaire et les déverse au
+  **premier PC fou** (le tick du crash variant selon les runs, c'est le
+  moyen fiable d'attraper la fenêtre avant le déraillement).
+- `WILD_RESET=1` : sur PC hors flash, reprend sur le vecteur de reset au
+  lieu d'exécuter les mauvaises herbes (comportement TS = exécuter).
+  Les PC fous sont journalisés avec `pc/prev/lr/sp/r0-r3` (trois
+  occurrences max, comportement TS sinon inchangé).
+- `EMU_DMA_DEBUG=1` : chaque transfert DMA instantané (canal, src, dst,
+  taille, beats, position LCD, hachure du contenu) — pour auditer le
+  chemin d'affichage DMA d'un jeu maison.
+- `EMU_LCD_DEBUG=1` : trace les écritures MADCTL (ordre des composantes
+  déclaré au panneau et verrou d'inversion).
 - `STATE_HASH=1` (+ `HASH_INTERVAL=<ticks>`) : hachage FNV-1a des
   registres + SRAM toutes les N ticks, avec dump des registres —
   comparable à `/tmp/ts_hash.js`.

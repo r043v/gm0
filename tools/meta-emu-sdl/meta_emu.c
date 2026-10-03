@@ -29,6 +29,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#include <stdarg.h>
 
 /* ---------------------------------------------------------------- état */
 
@@ -56,13 +57,20 @@ static uint32_t sysTickVector, dmacVector, tc4Vector;
 static int dmacInterrupt, tc4Interrupt;
 static long sysTickEntries;
 
-/* périphériques */
-static uint32_t portA_out, portB_out, portA_dir, portB_dir;
+/* périphériques — PA27 (CS carte SD) et PA25 (CS boutons) hauts dès le
+ * boot : pull-ups réelles de la carte, les périphériques n'écoutent le
+ * SPI que si le firmware les sélectionne (le boot initial ne passe PAS
+ * par reset_core ; les jeux sans lib standard ne sélectionnent jamais
+ * ce qu'ils n'utilisent pas — sinon leur trafic SPI écran partait dans
+ * la machine SD) */
+static uint32_t portA_out = (1u << 27) | (1u << 25), portB_out, portA_dir, portB_dir;
 static uint8_t  ser4_data = 0x80;
 static uint8_t  buttonData = 0xff;
 
 /* TC4 + DAC */
 static int      tc4Enabled, tc4Armed;
+static uint8_t  tc4IntEnMask, tc4IntFlagMask; /* INTENSET/INTFLAG lisibles (jeux maison) */
+static uint32_t tc4CtrlA; /* valeur complète de CTRLA (prescaler bits 8-10) */
 static uint32_t tc4Top, tc4Counter, tc4Period = 907;
 static uint32_t tc4Window, tc4Fires, tc4Writes;
 static int      tc4Interrupt;
@@ -77,11 +85,41 @@ static int ramwrCount; /* compte les RAMWR : ~32 par frame rendue */
 static uint8_t *sd_image = NULL;
 static size_t   sd_size = 0;
 static uint8_t  sd_pending = 0xff;
-static uint8_t  sd_out[512 + 16];
+/* file de réponse : le TS utilise un tableau JS non borné — une commande
+ * peut arriver avant que la réponse précédente soit drainée (jeu avec son
+ * propre pilote SD) ; on réplique avec un tampon qui grandit, plafonné */
+static uint8_t *sd_out = NULL;
+static int      sd_outCap = 0;
 static int      sd_outLen = 0, sd_outPos = 0;
 static uint8_t  sd_cmdBuf[6];
 static int      sd_cmdIdx = 0;
 static int      sd_writing = 0, sd_writeIdx = 0, sd_writeLba = 0;
+
+#define SD_OUT_MAX (1u << 20)
+static void sd_out_push(uint8_t b) {
+    if (sd_outLen >= SD_OUT_MAX) return; /* déraille : on n'accumule plus */
+    if (sd_outLen >= sd_outCap) {
+        int cap = sd_outCap ? sd_outCap * 2 : 512;
+        if (cap > SD_OUT_MAX) cap = SD_OUT_MAX;
+        uint8_t *n = realloc(sd_out, (size_t)cap);
+        if (!n) return;
+        sd_out = n; sd_outCap = cap;
+    }
+    sd_out[sd_outLen++] = b;
+}
+static void sd_out_append(const uint8_t *p, int n) {
+    if (sd_outLen + n > SD_OUT_MAX) return;
+    if (sd_outLen + n > sd_outCap) {
+        int cap = sd_outCap ? sd_outCap : 512;
+        while (cap < sd_outLen + n) cap *= 2;
+        if (cap > SD_OUT_MAX) cap = SD_OUT_MAX;
+        uint8_t *b = realloc(sd_out, (size_t)cap);
+        if (!b) return;
+        sd_out = b; sd_outCap = cap;
+    }
+    memcpy(sd_out + sd_outLen, p, (size_t)n);
+    sd_outLen += n;
+}
 static int      sd_initialized = 0;
 static uint8_t  sd_writeBuf[515];
 
@@ -268,27 +306,26 @@ static size_t sd_card_size(void) {
 
 static void sd_command(uint8_t cmd, uint32_t arg) {
     switch (cmd) {
-        case 0:  sd_out[sd_outLen++] = sd_initialized ? 0x00 : 0x01; break; /* idle */
-        case 8:  sd_out[sd_outLen++] = 0x01; sd_out[sd_outLen++] = 0x00;
-                 sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0x01;
-                 sd_out[sd_outLen++] = 0xaa; break;
-        case 55: sd_out[sd_outLen++] = 0x01; break;
-        case 41: sd_initialized = 1; sd_out[sd_outLen++] = 0x00; break;
-        case 58: sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0xc0;
-                 sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0x00;
-                 sd_out[sd_outLen++] = 0x00; break;
-        case 16: sd_out[sd_outLen++] = 0x00; break;
+        case 0:  sd_out_push(sd_initialized ? 0x00 : 0x01); break; /* idle */
+        case 8:  sd_out_push(0x01); sd_out_push(0x00);
+                 sd_out_push(0x00); sd_out_push(0x01);
+                 sd_out_push(0xaa); break;
+        case 55: sd_out_push(0x01); break;
+        case 41: sd_initialized = 1; sd_out_push(0x00); break;
+        case 58: sd_out_push(0x00); sd_out_push(0xc0);
+                 sd_out_push(0x00); sd_out_push(0x00);
+                 sd_out_push(0x00); break;
+        case 16: sd_out_push(0x00); break;
         case 17: { /* lecture d'un secteur */
             size_t base = (size_t)arg * 512;
             uint8_t *card = sd_card_data();
             if (card && base + 512 <= sd_card_size()) {
-                sd_out[sd_outLen++] = 0x00;
-                sd_out[sd_outLen++] = 0xfe;
-                memcpy(sd_out + sd_outLen, card + base, 512);
-                sd_outLen += 512;
-                sd_out[sd_outLen++] = 0xff; sd_out[sd_outLen++] = 0xff;
+                sd_out_push(0x00);
+                sd_out_push(0xfe);
+                sd_out_append(card + base, 512);
+                sd_out_push(0xff); sd_out_push(0xff);
             } else {
-                sd_out[sd_outLen++] = 0x04;
+                sd_out_push(0x04);
             }
             break;
         }
@@ -296,9 +333,9 @@ static void sd_command(uint8_t cmd, uint32_t arg) {
             sd_writeLba = arg;
             sd_writeIdx = 0;
             sd_writing = 1;
-            sd_out[sd_outLen++] = 0x00;
+            sd_out_push(0x00);
             break;
-        default: sd_out[sd_outLen++] = 0x04; break;
+        default: sd_out_push(0x04); break;
     }
 }
 
@@ -316,8 +353,8 @@ static void sd_process(uint8_t v) {
                 sd_write_persist(sd_writeLba, card + (size_t)sd_writeLba * 512);
             }
             /* accepté, puis busy (comme sdcard.ts) */
-            sd_out[sd_outLen++] = 0x05; sd_out[sd_outLen++] = 0x00;
-            sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0xff;
+            sd_out_push(0x05); sd_out_push(0x00);
+            sd_out_push(0x00); sd_out_push(0xff);
         }
         return;
     }
@@ -787,7 +824,10 @@ static void sd_write_persist(uint32_t lba, const uint8_t *data) {
                 memcpy(fatFiles[i].mem + (lba - fatFiles[i].lba) * 512, data, 512);
             } else {
                 FILE *g = fopen(fatFiles[i].path, "r+b");
-                if (g) { fwrite(data, 1, 512, g); fclose(g); }
+                if (g) {
+                    fseek(g, (long)((lba - fatFiles[i].lba) * 512), SEEK_SET);
+                    fwrite(data, 1, 512, g); fclose(g);
+                }
             }
             return;
         }
@@ -926,14 +966,17 @@ static int zip_load_card(const uint8_t *data, size_t len) {
  * ====================================================================== */
 
 /* boutons : bit0 bas, 1 gauche, 2 droite, 3 haut, 4 A, 5 B, 6 MENU, 7 HOME
- * (actifs bas : 0 = enfoncé) — même masque pour les deux cibles */
-#define BTN_DOWN   (1u << 0)
-#define BTN_LEFT   (1u << 1)
-#define BTN_RIGHT  (1u << 2)
-#define BTN_UP     (1u << 3)
-#define BTN_A      (1u << 4)
-#define BTN_B      (1u << 5)
-#define BTN_MENU   (1u << 6)
+ * (actifs bas : 0 = enfoncé).  Ordre du registre à décalage physique du
+ * META (MSB en premier : home..down), confirmé par le source du registre
+ * gdl de lapinou : left,right,up,a,b,menu,down,home — même masque pour
+ * les deux cibles. */
+#define BTN_LEFT   (1u << 0)
+#define BTN_RIGHT  (1u << 1)
+#define BTN_UP     (1u << 2)
+#define BTN_A      (1u << 3)
+#define BTN_B      (1u << 4)
+#define BTN_MENU   (1u << 5)
+#define BTN_DOWN   (1u << 6)
 #define BTN_HOME   (1u << 7)
 #define BTN_DIRMASK (BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_UP)
 
@@ -1113,7 +1156,8 @@ static void pk_sd_exec(uint32_t cmd, uint32_t arg) {
                    pk_sd_resp(r, 5); } break;
         case 59: pk_sd_checkCRC = arg != 0;
                  { uint8_t r = (uint8_t)(pk_sd_idle ? 1 : 0); pk_sd_resp(&r, 1); } break;
-        case 61: /* ACMD41 : quitte l'idle (la référence rendait {4}, ce qui
+        case 61: case 169: /* ACMD41 (41 + marqueur alt 0x80) : quitte l'idle
+                  * (la référence rendait {4}, ce qui
                   * empêchait toute init de carte réelle — ici la carte
                   * monte quand une image/un dossier est fourni) */
             pk_sd_idle = 0;
@@ -1701,12 +1745,12 @@ static uint32_t pk_reg_peek(uint32_t a) {
         uint32_t off = a - 0xA0000000u;
         if (off < 0x1000) { /* banque octet */
             uint32_t p, b;
-            if (off < 0x18) { p = 0; b = off & 0x1C; }
+            if (off < 0x18) { p = 0; b = off; }
             else if (off < 0x40) { p = 1; b = off - 0x20; }
             else if (off < 0x58) { p = 2; b = off - 0x40; }
             else return 0;
-            uint32_t bit = b + (a & 3);
-            return ((pk_pin[p] >> bit) & 1) << ((a & 3) << 3);
+            uint32_t bit = b; /* l'adresse octet encode déjà la broche */
+            return ((pk_pin[p] >> bit) & 1);
         }
         if (off < 0x2000) { /* banque mot */
             uint32_t p, bit;
@@ -1879,12 +1923,12 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
         uint32_t off = a - 0xA0000000u;
         if (off < 0x1000) { /* banque octet */
             uint32_t p, b;
-            if (off < 0x18) { p = 0; b = off & 0x1C; }
+            if (off < 0x18) { p = 0; b = off; }
             else if (off < 0x40) { p = 1; b = off - 0x20; }
             else if (off < 0x58) { p = 2; b = off - 0x40; }
             else return;
-            uint32_t bit = b + (a & 3);
-            if ((v >> ((a & 3) << 3)) & 0xFF) pk_pout[p] |= 1u << bit;
+            uint32_t bit = b; /* l'adresse octet encode déjà la broche */
+            if (v & 0xFF) pk_pout[p] |= 1u << bit;
             else pk_pout[p] &= ~(1u << bit);
             if (a == 0xA0000057u) pk_audio_gpio_write(); /* bit 23 latching */
             return;
@@ -2177,6 +2221,11 @@ static void pk_card_export(void) {
 
 
 static long stWrites = 0, ramwrTotal = 0;
+/* le panneau META est câblé BGR ; une init qui déclare MADCTL.BGR=1
+ * (jeux maison à init custom, ex. lapinou : 0xC8) envoie des couleurs
+ * d'ordre natif — l'émulateur doit inverser R/B à l'affichage.  La lib
+ * standard ne déclare jamais BGR et pré-swappe elle-même. */
+static int lcdBgrSwapped;
 static uint8_t st7735_byte(uint8_t v) {
     if (portB_out & (1u << 22)) return 0xff; /* CS écran haut */
     stWrites++;
@@ -2184,7 +2233,13 @@ static uint8_t st7735_byte(uint8_t v) {
         lcd_lastCommand = v;
         lcd_argIndex = 0;            /* comme st7735.ts : reset à chaque commande */
         if (v == 0x2c) ramwrTotal++;
+        if (v == 0x36 && getenv("EMU_LCD_DEBUG")) fprintf(stderr, "[lcd] MADCTL cmd\n");
         return 0xff;
+    }
+    if (lcd_lastCommand == 0x36) {
+        if (v & 0x08) lcdBgrSwapped = 1;
+        if (getenv("EMU_LCD_DEBUG"))
+            fprintf(stderr, "[lcd] MADCTL <- %02x (BGR=%d, verrou=%d)\n", v, (v >> 3) & 1, lcdBgrSwapped);
     }
     { /* données */
         switch (lcd_lastCommand) {
@@ -2192,6 +2247,7 @@ static uint8_t st7735_byte(uint8_t v) {
                 if (lcd_argIndex % 2 == 0) lcd_tmp = v;
                 else {
                     uint16_t p = (uint16_t)((lcd_tmp << 8) | v);
+                    if (lcdBgrSwapped) p = (uint16_t)((p >> 11) | (p & 0x07e0u) | ((p & 0x1fu) << 11));
                     if (lcd_x < 160 && lcd_y < 128) pix[lcd_y * 160 + lcd_x] = p;
                     if (++lcd_x > lcd_xEnd) { lcd_x = lcd_xStart; if (++lcd_y > lcd_yEnd) lcd_y = lcd_yStart; }
                 }
@@ -2221,6 +2277,14 @@ static uint32_t dmac_baseAddr, dmac_wrbAddr, dmac_desc, dmac_chid;
  * (invalide ou nul -> canal arrêté, comme une erreur de fetch). */
 #define DMAC_CHANNELS 12
 #define DMAC_TRIG_TC4_OVF 0x1bu /* TC4_DMAC_ID_OVF (SAMD21) */
+#define DMAC_TRIG_SERCOM4_TX 0x0au /* SERCOM4_DMAC_ID_TX (écran) */
+/* DMA SPI cadencé : les beats sortent au rythme du baud SERCOM4 (le CPU
+ * continue de tourner pendant le transfert — sur hardware le DMA écran
+ * prend ~6,8 ms par demi-frame à 24 MHz, d'où les 40-55 fps réels) */
+static int      spiDmaCh = -1;   /* canal SERCOM4-TX en cours, -1 = aucun */
+static uint32_t spiBeatAcc;      /* accumulateur de ticks */
+static uint32_t spiBeatTicks = 7; /* ticks par beat (baud) */
+static uint32_t spiBaud;         /* SERCOM4 BAUD (f = 48 MHz / (2×(b+1))) */
 static uint8_t  dmaTrig[DMAC_CHANNELS], dmaOn[DMAC_CHANNELS];
 static uint16_t dmaCtrl[DMAC_CHANNELS], dmaCnt[DMAC_CHANNELS], dmaIdx[DMAC_CHANNELS];
 static uint32_t dmaSrc[DMAC_CHANNELS], dmaDst[DMAC_CHANNELS], dmaNext[DMAC_CHANNELS];
@@ -2305,14 +2369,24 @@ static uint32_t adc_random(void) {
 
 /* handlers de lecture périphériques enregistrés (comme le TS : consultés
  * pour les accès mot ET octet, jamais demi-mot).  0 = pas de handler. */
+static int dbg(void);
+extern int dbgDac;
 static uint32_t periph_read(uint32_t a, int *handled) {
     *handled = 0;
     if ((a & ~0x1fu) == 0x41004400u) { *handled = 1; return port_read(0, a & 0x1f); }
     if ((a & ~0x1fu) == 0x41004480u) { *handled = 1; return port_read(1, a & 0x1f); }
     if (a == 0x42001818u || a == 0x42001c18u) { *handled = 1; return 0x07; } /* SERCOM4/5 INTFLAG */
-    if (a == 0x42001828u) { *handled = 1; return ser4_data; }                /* SERCOM4 DATA */
+    if (a == 0x42001828u) { *handled = 1;
+        if (dbg() && dbgDac < 6000) {
+            fprintf(stderr, "[dbg] SPI DATA lu <- %02x pc=%x PA27=%d\n", ser4_data, regs[15] - 2,
+                    (portA_out >> 27) & 1);
+            dbgDac++;
+        }
+        return ser4_data; }                /* SERCOM4 DATA */
     if (a == 0x42001c28u) { *handled = 1; return 0x80; }                     /* SERCOM5 DATA */
     if (a == 0x4100484eu) { *handled = 1; return 0x02; }                     /* DMAC CHINTFLAG TCMPL */
+    if (a == 0x4200300du) { *handled = 1; return tc4IntEnMask; }             /* TC4 INTENSET */
+    if (a == 0x4200300eu) { *handled = 1; return tc4IntFlagMask; }           /* TC4 INTFLAG */
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) {                         /* CHCTRLA ENABLE */
         *handled = 1; return dmaOn[dmac_chid] ? 0x02 : 0; }
     return 0;
@@ -2361,7 +2435,8 @@ static void writeWord(uint32_t a, uint32_t v);
 static void writeHalf(uint32_t a, uint16_t v);
 static void writeByte(uint32_t a, uint8_t v);
 
-static int dbgTc4Cfg = 0, dbgDac = 0;
+int dbgDac = 0;
+static int dbgTc4Cfg = 0;
 static int dbgEnabled = -1; /* EMU_DEBUG=1 : traces de config périphériques */
 static int dbg(void) {
     if (dbgEnabled < 0) dbgEnabled = getenv("EMU_DEBUG") ? 1 : 0;
@@ -2385,9 +2460,15 @@ static void writeWord(uint32_t a, uint32_t v) {
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     if (a == 0x42001828u) { sercom4_write((uint8_t)v); return; } /* SERCOM4 DATA */
     if (a == 0x42004808u) { dac_write((uint16_t)v); return; }    /* DAC DATA */
-    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
     if (a == 0x42003018u) { tc4Top = v; return; }                /* TC4 CC0 */
-    if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; }/* TC4 INTENSET */
+    if (a == 0x4200300cu) { tc4IntEnMask &= (uint8_t)~v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENCLR */
+    if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET : OVF=0x01 (jeux maison), MC0=0x10 (lib standard) */
+    if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG (acquittement) */
+    /* GCLK GENDIV/GENCTRL : sans effet (la cadence TC4 est dérivée de
+     * CTRLA/CC0, et la fréquence du générateur vaut 48 MHz pour les
+     * configurations audio rencontrées — lib standard comme jeux maison) */
+    if (a == 0x40000c04u || a == 0x40000c08u) return;
     if (a == 0x41004834u) { dmac_baseAddr = v; return; }
     if (a == 0x41004838u) { dmac_wrbAddr = v; return; }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
@@ -2400,15 +2481,57 @@ static void writeWord(uint32_t a, uint32_t v) {
         else dmaOn[dmac_chid] = 0; /* SWRST ou désactivation */
         return;
     }
+    if (a == 0x41004840u && (v & 0x03u) != 0x02u && spiDmaCh == (int)dmac_chid) {
+        spiDmaCh = -1; dmaOn[dmac_chid] = 0; /* SWRST/désactivation du canal SPI */
+        return;
+    }
     if (a == 0x41004840u) { /* CHCTRLA == 2 : transfert via descripteur */
         if (v == 0x02) {
             if (!dmac_desc) dmac_desc = dmac_baseAddr + dmac_chid * 0x10;
+            uint16_t pctrl = fetchHalf(dmac_desc);
+            uint32_t pdst = fetchWord(dmac_desc + 0x08);
+            if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX || pdst == 0x42001828u) {
+                /* écran : beats cadencés par le baud SPI, le CPU vit pendant */
+                dma_load(dmac_chid, dmac_desc);
+                if (dmaOn[dmac_chid]) {
+                    uint32_t b = (spiBaud & 0xFFu) + 1;
+                    spiBeatTicks = (b * 20u + 1u) / 3u; /* 8 bits @ f/2(1+b), 20000 ticks/ms */
+                    if (spiBeatTicks < 1) spiBeatTicks = 1;
+                    spiBeatAcc = 0;
+                    spiDmaCh = (int)dmac_chid;
+                }
+                dmac_desc = 0;
+                return;
+            }
+            uint16_t ctrl = fetchHalf(dmac_desc);
             uint16_t btcnt = fetchHalf(dmac_desc + 0x02);
             uint32_t src = fetchWord(dmac_desc + 0x04);
             uint32_t dst = fetchWord(dmac_desc + 0x08);
             uint32_t nxt = fetchWord(dmac_desc + 0x0c);
-            for (uint16_t i = 0; i < btcnt; i++)
-                writeByte(dst, fetchByte(src + i - btcnt));
+            /* SAMD21 : SRCADDR/DSTADDR sont des adresses de FIN ; les
+             * drapeaux SRCINC/DSTINC disent si l'on remonte.  BEATSIZE
+             * (octet/demi/mot) respecté — memset32 du jeu (beats mot,
+             * source fixe) sinon n'écrit que 4 octets. */
+            uint32_t size = 1u << ((ctrl >> 8) & 3u);
+            int srcinc = ctrl & (1u << 10), dstinc = ctrl & (1u << 11);
+            if (getenv("EMU_DMA_DEBUG") && btcnt > 100) {
+                unsigned h = 0x811c9dc5;
+                for (uint32_t k = 0; k < btcnt; k++) {
+                    uint32_t s = srcinc ? src + (k - btcnt) * size : src;
+                    if (size == 1) h = (h ^ fetchByte(s)) * 0x01000193u;
+                    else if (size == 2) h = (h ^ fetchHalf(s)) * 0x01000193u;
+                    else h = (h ^ fetchWord(s)) * 0x01000193u;
+                }
+                fprintf(stderr, "[dma] ch=%u src=%x dst=%x n=%u sz=%u lcd_y=%u tick=%u hash=%08x\n",
+                        (unsigned)dmac_chid, src, dst, btcnt, size, lcd_y, tickCount, h);
+            }
+            for (uint16_t i = 0; i < btcnt; i++) {
+                uint32_t s = srcinc ? src + (i - btcnt) * size : src;
+                uint32_t d = dstinc ? dst + (i - btcnt) * size : dst;
+                if (size == 1) writeByte(d, fetchByte(s));
+                else if (size == 2) writeHalf(d, fetchHalf(s));
+                else writeWord(d, fetchWord(s));
+            }
             dmac_desc = nxt;
             dmacInterrupt = 1; /* verrouillé, traité au prochain step (TS) */
         }
@@ -2422,10 +2545,13 @@ static void writeHalf(uint32_t a, uint16_t v) {
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff; return; }
     if (a == 0x42004808u) { if (dbg() && dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
-    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
     if (a == 0x42003018u) { tc4Top = v; return; }
-    if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; }
-    if (a == 0x40000c02u) return;                                /* GCLK CLKCTRL */
+    if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; }
+    if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; }
+    if (a == 0x40000c02u) { if (dbg() && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v); dbgTc4Cfg++; } return; }
+    if (a == 0x40000c04u) { fprintf(stderr, "[gclk] GENDIV <- %x\n", v); return; }
+    if (a == 0x40000c08u) { fprintf(stderr, "[gclk] GENCTRL <- %x\n", v); return; }
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     writeWord(a, v);
@@ -2435,9 +2561,10 @@ static void writeByte(uint32_t a, uint8_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_byte(a, v); return; }
     if (a < 0x20000000u) return;
     if (a < 0x40000000u) { uint32_t sa = a - 0x20000000u; if (sa < SRAM_SIZE) sram[sa] = v; return; }
-    if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; } /* TC4 INTENSET */
-    if (a == 0x4200300eu) return;                                 /* TC4 INTFLAG */
+    if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET */
+    if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
     if (a == 0x42001828u) { sercom4_write(v); return; }
+    if (a == 0x4200180au) { spiBaud = v; return; } /* SERCOM4 BAUD (SPI) */
     if (a == 0x4100483fu) { dmac_chid = v; return; }
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
@@ -2454,10 +2581,15 @@ static void buttons_apply(void);
 static void sercom4_write(uint8_t v) {
     /* ordre du TypeScript (écran, boutons, carte SD) ; l'octet de réponse
      * repart à 0x80 à chaque échange, les périphériques sélectionnés le
-     * remplacent (sercom-register.ts : this.data = 0x80 puis listeners) */
+     * remplacent (sercom-register.ts : this.data = 0x80 puis listeners).
+     * Boutons : PB03 (lib standard) ; PA25 accepté aussi — même registre à
+     * décalage sur le bus, certains jeux maison le pilotent en direct. */
     ser4_data = 0x80;
     st7735_byte(v);
-    if ((portB_out & (1u << 3)) == 0) ser4_data = buttonData; /* boutons PB03 */
+    if ((portB_out & (1u << 3)) == 0 || (portA_out & (1u << 25)) == 0)
+        ser4_data = buttonData; /* boutons : PB03 (lib standard) ou PA25
+                                 * (certains jeux maison pilotent ce CS en
+                                 * direct — même registre à décalage) */
     sd_byte(v);
 }
 
@@ -2479,19 +2611,31 @@ static void incrementPc(void) {
                 if (dmaTrig[ch] == DMAC_TRIG_TC4_OVF) dma_beat(ch);
         }
     } else if (tc4Enabled && tc4Armed && tc4Top > 0) {
-        /* régulateur du TS : la carte doit produire ~369 échantillons par
-         * frame ; aucun attente -> rapproche les tirs, trop -> les espace */
-        tc4Window++;
-        if (tc4Window >= 4000000u) {
-            uint32_t holds = tc4Fires - tc4Writes;
-            if (holds == 0 && tc4Period > 300) tc4Period -= 10;
-            else if (holds > tc4Fires * 0.6 && tc4Period < 20000) tc4Period += 10;
-            tc4Window = 0; tc4Fires = 0; tc4Writes = 0;
-        }
+        /* cadence dérivée de la vraie config (MFRQ) : F = GCLK_TC4 /
+         * (prescale × (CC0+1)) ; GCLK audio = 48 MHz (lib standard et jeux
+         * maison), domaine de ticks de l'ému : 20000/ms → période =
+         * prescale × (CC0+1) × 20000/48 = ×5/12.  L'ancien gouverneur
+         * heuristique du TS comprimait la période quand le jeu sert chaque
+         * interruption immédiatement (son qui accélère à l'infini). */
+        static const uint16_t prescTab[8] = {1, 2, 4, 8, 16, 64, 256, 1024};
+        uint32_t cfg = (uint32_t)prescTab[(tc4CtrlA >> 8) & 7u] * (tc4Top + 1) * 5u / 12u;
+        tc4Period = cfg < 2 ? 2 : cfg;
         if (++tc4Counter >= tc4Period) {
             tc4Counter = 0;
             tc4Fires++;
+            tc4IntFlagMask |= tc4IntEnMask & 0x11u; /* OVF/MC0 posés, lus par le handler */
             tc4Interrupt = 1;
+        }
+    }
+    if (spiDmaCh >= 0) { /* beats SPI : un octet tous les spiBeatTicks */
+        if (!dmaOn[spiDmaCh]) { spiDmaCh = -1; }
+        else if (++spiBeatAcc >= spiBeatTicks) {
+            spiBeatAcc = 0;
+            dma_beat(spiDmaCh);
+            if (!dmaOn[spiDmaCh]) { /* bloc terminé : TCMPL */
+                spiDmaCh = -1;
+                dmacInterrupt = 1;
+            }
         }
     }
 }
@@ -2538,6 +2682,45 @@ static void irq_inject(uint32_t vector);
 static uint32_t prevInstPc;  /* PC à l'entrée du pas courant */
 static uint32_t lastExecPc;  /* PC de l'instruction exécutée au pas précédent */
 
+/* TRACE_TAIL=<n> : tampon circulaire des n dernières lignes de trace ;
+ * déversé quand un PC fou est détecté (le tick du crash varie selon les
+ * runs) — TRACE_TAIL_OUT=<fichier>, sinon stderr */
+#define TRACE_TAIL_LINES 8192
+static char *traceTail[TRACE_TAIL_LINES];
+static unsigned traceTailCount, traceTailNext, traceTailLen;
+static int traceTailOn = -1;
+
+static void trace_tail_init(void) {
+    const char *e = getenv("TRACE_TAIL");
+    traceTailOn = e ? atoi(e) : 0;
+    if (traceTailOn > TRACE_TAIL_LINES) traceTailOn = TRACE_TAIL_LINES;
+}
+
+static void trace_tail_push(const char *fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    free(traceTail[traceTailNext]);
+    traceTail[traceTailNext] = strdup(buf);
+    traceTailNext = (traceTailNext + 1) % (unsigned)traceTailOn;
+    if (traceTailLen < (unsigned)traceTailOn) traceTailLen++;
+    traceTailCount++;
+}
+
+static void trace_tail_dump(void) {
+    FILE *f = stderr;
+    const char *out = getenv("TRACE_TAIL_OUT");
+    if (out) { f = fopen(out, "w"); if (!f) f = stderr; }
+    fprintf(f, "--- trace_tail (%u lignes) ---\n", traceTailLen);
+    for (unsigned i = 0; i < traceTailLen; i++) {
+        unsigned idx = (traceTailNext + (unsigned)traceTailOn - traceTailLen + i) % (unsigned)traceTailOn;
+        if (traceTail[idx]) fputs(traceTail[idx], f), fputc('\n', f);
+    }
+    if (f != stderr) fclose(f);
+}
+
 static void step(void) {
     lastExecPc = prevInstPc;
     prevInstPc = regs[15] - 2;
@@ -2553,6 +2736,14 @@ static void step(void) {
                 regs[0], regs[1], regs[2], regs[3],
                 regs[4], regs[5], regs[6], regs[7],
                 regs[8], regs[9], regs[10], regs[11], regs[12], regs[14]);
+    if (traceTailOn > 0) /* initialisation paresseuse au premier appel */
+        trace_tail_push("%ld %u %x %04x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x", stepNo, tickCount,
+                regs[15] - 2, fetchHalf(regs[15] - 2), regs[13],
+                regs[0], regs[1], regs[2], regs[3],
+                regs[4], regs[5], regs[6], regs[7],
+                regs[8], regs[9], regs[10], regs[11], regs[12], regs[14]);
+    else if (traceTailOn < 0)
+        trace_tail_init();
     stepNo++;
     if (emuTarget == TGT_POKITTO) {
         /* SysTick, CT32B0/1, broches et SYSRESETREQ (ordre de la référence) */
@@ -2610,10 +2801,13 @@ static void step(void) {
     }
     if (emuTarget == TGT_META && instAddr >= 0x42000000u) { /* PC fou : le TS planterait ici — log fort */
         static int wildLogged = 0;
-        if (wildLogged < 10)
+        if (wildLogged < 3)
             fprintf(stderr, "[pc fou] tick=%u pc=%x lr=%x sp=%x\n",
                     tickCount, instAddr, regs[14], regs[13]);
         wildLogged++;
+        if (wildLogged == 1) trace_tail_dump();
+        tickCount += 2; /* pas d'instruction exécutée : avance artificielle,
+                         * sinon les interruptions se figent avec le tick */
         regs[15] = vectorBase + fetchWord(vectorBase + 4);
         return;
     }
@@ -2624,13 +2818,14 @@ static void step(void) {
         !(instAddr >= 0x20000000u && instAddr < 0x20000000u + SRAM_SIZE)) {
         static int wildFlashLogged = 0;
         static int wildReset = -1;
-        static uint32_t prevPc = 0;
         if (wildReset < 0) wildReset = getenv("WILD_RESET") ? 1 : 0;
-        if (wildFlashLogged < 20)
+        if (wildFlashLogged < 3)
             fprintf(stderr, "[pc fou flash] tick=%u pc=%x prev=%x lr=%x sp=%x r0=%x r1=%x r2=%x r3=%x\n",
                     tickCount, instAddr, lastExecPc, regs[14], regs[13],
                     regs[0], regs[1], regs[2], regs[3]);
         wildFlashLogged++;
+        if (wildFlashLogged == 1) trace_tail_dump();
+        tickCount += 2;
         if (wildReset) { regs[15] = vectorBase + fetchWord(vectorBase + 4); return; }
     }
     uint16_t inst = fetchHalf(instAddr);
@@ -3120,6 +3315,7 @@ static uint8_t key_bit(SDL_Keycode sym) {
 
 static void btn_press(uint8_t mask) {
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 1); return; }
+    if (getenv("EMU_DEBUG")) fprintf(stderr, "[btn] press mask=%02x -> buttonData=%02x\n", mask, (uint8_t)(buttonData & ~mask));
     buttonData &= (uint8_t)~mask;
     if (mask & BTN_HOME) homeHeld = SDL_GetTicks();
 }
@@ -3234,13 +3430,23 @@ static void reset_core(void) {
     dmacInterrupt = tc4Interrupt = 0;
     dmac_baseAddr = dmac_wrbAddr = dmac_desc = dmac_chid = 0;
     memset(dmaTrig, 0, sizeof dmaTrig); memset(dmaOn, 0, sizeof dmaOn);
-    portA_out = portB_out = portA_dir = portB_dir = 0;
+    /* PA27 (CS carte SD) et PA25 (CS boutons) hauts : lignes désélectionnées
+     * (pull-ups réelles), les périphériques n'écoutent le bus SPI que si le
+     * firmware les sélectionne.  Les jeux sans lib standard (pas de pinMode
+     * early) restent sinon « sélectionnés » en permanence et le trafic SPI
+     * écran part dans la machine SD. */
+    portA_out = (1u << 27) | (1u << 25); /* PA27 (SD) et PA25 (boutons) hauts */
+    portB_out = portA_dir = portB_dir = 0;
     ser4_data = 0x80;
     tc4Enabled = tc4Armed = 0;
+    tc4IntEnMask = tc4IntFlagMask = 0;
+    tc4CtrlA = 0;
+    spiDmaCh = -1; spiBeatAcc = 0; spiBeatTicks = 7; spiBaud = 0;
     tc4Top = tc4Counter = 0; tc4Period = 907;
     tc4Window = tc4Fires = tc4Writes = 0;
     lcd_xStart = lcd_xEnd = lcd_yStart = lcd_yEnd = lcd_x = lcd_y = 0;
     lcd_argIndex = lcd_lastCommand = lcd_tmp = 0;
+    lcdBgrSwapped = 0;
     memset(pix, 0, sizeof pix);
     millisWrites = 0;
     aq_head = aq_tail = 0; audioHold = 0;
