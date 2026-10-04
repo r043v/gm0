@@ -30,6 +30,37 @@
 #include <time.h>
 #include <math.h>
 #include <stdarg.h>
+static const char *fwName; /* firmware courant (clé de sauvegarde wasm) */
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+/* persistance des fichiers de carte modifiés (sauvegardes) en localStorage,
+ * clé par jeu : « emusav:<firmware>:<fichier> » */
+EM_JS(void, em_ls_set, (const char *key, const uint8_t *data, int len), {
+    try {
+        const k = UTF8ToString(key);
+        let s = '';
+        const h = HEAPU8;
+        for (let i = 0; i < len; i += 8192)
+            s += String.fromCharCode.apply(null, h.subarray(data + i, Math.min(data + i + 8192, data + len)));
+        localStorage.setItem(k, btoa(s));
+    } catch (e) { /* quota ou privacy : la sauvegarde reste en RAM */ }
+});
+EM_JS(int, em_ls_get, (const char *key, uint8_t *out, int maxlen), {
+    try {
+        const v = localStorage.getItem(UTF8ToString(key));
+        if (!v) return 0;
+        const s = atob(v);
+        const n = Math.min(s.length, maxlen);
+        for (let i = 0; i < n; i++) HEAPU8[out + i] = s.charCodeAt(i);
+        return n;
+    } catch (e) { return 0; }
+});
+static const char *em_save_key(const char *path) {
+    static char key[1200];
+    snprintf(key, sizeof(key), "emusav:%s:%s", fwName ? fwName : "jeu", path);
+    return key;
+}
+#endif
 
 /* ---------------------------------------------------------------- état */
 
@@ -74,6 +105,7 @@ static uint8_t  buttonData = 0xff;
 /* TC4 + DAC */
 static int      tc4Enabled, tc4Armed;
 static uint8_t  tc4IntEnMask, tc4IntFlagMask; /* INTENSET/INTFLAG lisibles (jeux maison) */
+static int      primask; /* CPSID/CPSIE : masque les injections d'interruptions */
 static uint32_t tc4CtrlA; /* valeur complète de CTRLA (prescaler bits 8-10) */
 static uint32_t tc4Top, tc4Counter, tc4Period = 907;
 static uint32_t tc4Window, tc4Fires, tc4Writes;
@@ -359,8 +391,10 @@ static void sd_process(uint8_t v) {
             { static int wd2 = -1;
               if (wd2 < 0) wd2 = getenv("SD_DEBUG") ? (getenv("SD_DEBUG")[0] == '2' ? 1 : 0) : 0;
               if (wd2) {
-                fprintf(stderr, "[wr-done] t=%u lba=%u octets[0..23]=", tickCount, sd_writeLba);
-                for (int i = 1; i <= 24; i++) fprintf(stderr, "%02x", sd_writeBuf[i]);
+                int lfn = 0;
+                for (int i = 130; i <= 150; i++) if (sd_writeBuf[i]) lfn++;
+                fprintf(stderr, "[wr-done] t=%u lba=%u lfn=%d octets[128..159]=", tickCount, sd_writeLba, lfn);
+                for (int i = 129; i <= 160; i++) fprintf(stderr, "%02x", sd_writeBuf[i]);
                 fprintf(stderr, "\n"); } }
             if (card && sd_writeBuf[0] == 0xfe) {
                 memcpy(card + (size_t)sd_writeLba * 512, sd_writeBuf + 1, 512);
@@ -741,6 +775,18 @@ static void fat_finish(const char *label) {
     memcpy(fatImage + (fatPartStart + 1) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
     memcpy(fatImage + (fatPartStart + 1 + fatsz) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
     free(rootBuf); free(rootEnts); rootEnts = NULL; rootN = 0;
+#ifdef __EMSCRIPTEN__
+    /* restaure les fichiers modifiés lors d'une session précédente
+     * (localStorage, clé par jeu) */
+    for (int i = 0; i < fatFileCount; i++) {
+        if (!fatFiles[i].mem || !fatFiles[i].path[0]) continue;
+        int n = em_ls_get(em_save_key(fatFiles[i].path), fatFiles[i].mem,
+                          (int)fatFiles[i].bytes);
+        if (n > 0)
+            memcpy(fatImage + fatFiles[i].lba * FAT_SECTOR, fatFiles[i].mem,
+                   (size_t)n);
+    }
+#endif
     if (getenv("FAT_DUMP")) {
         FILE *g = fopen(getenv("FAT_DUMP"), "wb");
         if (g) { fwrite(fatImage, 1, fatImageSize, g); fclose(g);
@@ -874,9 +920,13 @@ static void sd_write_persist(uint32_t lba, const uint8_t *data) {
     for (int i = 0; i < fatFileCount; i++) {
         if (lba >= fatFiles[i].lba && (lba - fatFiles[i].lba) * 512 < fatFiles[i].bytes) {
             if (fatFiles[i].mem) {
-                /* fichier virtuel (navigateur) : écrit dans le tampon ;
-                 * l'export inter-sessions est géré côté JS */
+                /* fichier virtuel (navigateur) : écrit dans le tampon et
+                 * persiste le fichier complet en localStorage (clé par jeu) */
                 memcpy(fatFiles[i].mem + (lba - fatFiles[i].lba) * 512, data, 512);
+#ifdef __EMSCRIPTEN__
+                em_ls_set(em_save_key(fatFiles[i].path), fatFiles[i].mem,
+                          (int)fatFiles[i].bytes);
+#endif
             } else {
                 FILE *g = fopen(fatFiles[i].path, "r+b");
                 if (g) {
@@ -916,7 +966,6 @@ typedef struct { char name[1024]; const uint8_t *cdata; size_t csize; size_t usi
 static void reset_machine(void);
 static void load_firmware_data(const uint8_t *data, size_t len, const char *display);
 static int fwLoaded;
-static const char *fwName;
 
 /* parse le central directory ; renvoie le nombre d'entrées (fichiers) */
 static int zip_parse(const uint8_t *data, size_t len, ZipEnt *ents, int max) {
@@ -2356,6 +2405,7 @@ static void writeByte(uint32_t a, uint8_t v);
 
 static void dma_sercom4_rx_beat(void);
 static int dmaBeatSkipSd; /* un beat DMA d'affichage ne doit pas horloger la carte */
+static int sdTxCh = -1;   /* canal TX de la carte SD pendant une écriture de secteur */
 static int dma_is_tc4(uint32_t ch) {
     return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC4_OVF;
 }
@@ -2407,10 +2457,12 @@ static void dma_beat(uint32_t ch) {
          * une transaction active — sinon c'est un pixel du display, et le
          * collisionneur viderait la file SD au milieu d'un échange CPU */
         uint8_t b = fetchByte(src);
-        /* pendant l'écriture d'un secteur (CMD24), chaque beat porte un
-         * octet de données : tous doivent horloger, pas seulement les 0xFF */
+        /* pendant l'écriture d'un secteur (CMD24), chaque beat du canal TX
+         * de la carte porte un octet de données ; les beats des autres
+         * canaux (affichage) ne doivent rien horloger ni perturber */
         int sdClock = sd_selected() &&
-                      (sd_writing || (b == 0xffu && (sd_outLen != 0 || sd_cmdIdx != 0)));
+                      (sd_writing ? (int)ch == sdTxCh
+                                  : (b == 0xffu && (sd_outLen != 0 || sd_cmdIdx != 0)));
         dmaBeatSkipSd = !sdClock;
         writeByte(dst, b);
         dmaBeatSkipSd = 0;
@@ -2742,6 +2794,13 @@ static void writeWord(uint32_t a, uint32_t v) {
             }
             uint16_t pctrl = fetchHalf(dmac_desc);
             uint32_t pdst = fetchWord(dmac_desc + 0x08);
+            if (sd_writing) {
+                /* écriture de secteur en cours : l'armement du canal TX de
+                 * la carte doit passer (ce sont ses beats qui portent les
+                 * données) ; ceux de l'affichage seront sautés au beat */
+                if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX || pdst == 0x42001828u)
+                    sdTxCh = (int)dmac_chid;
+            }
             if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX || pdst == 0x42001828u) {
                 /* écran : beats cadencés par le baud SPI, le CPU vit pendant */
                 dma_load(dmac_chid, dmac_desc);
@@ -3021,21 +3080,30 @@ static void step(void) {
         /* SysTick, CT32B0/1, broches et SYSRESETREQ (ordre de la référence) */
         pk_machine_step();
     } else {
-        if (tc4Interrupt) {
-            tc4Interrupt = 0;
-            irq_inject(tc4Vector);
-        }
-        if (dmacInterrupt) {
-            dmacInterrupt = 0;
-            irq_inject(dmacVector);
+        /* CPSID masque les interruptions (PRIMASK) : les sections critiques
+         * du jeu (écritures flash, caches FS) doivent s'exécuter sans
+         * injection — sinon les handlers corrompent ce qu'elles modifient.
+         * Les drapeaux restent posés : le handler part au CPSIE. */
+        if (!primask) {
+            if (tc4Interrupt) {
+                tc4Interrupt = 0;
+                irq_inject(tc4Vector);
+            }
+            if (dmacInterrupt) {
+                dmacInterrupt = 0;
+                irq_inject(dmacVector);
+            }
         }
         /* SysTick indépendant du DMAC : la chaîne `else if` du TS affamait
          * Millis dès qu'une lib streame l'écran en DMA continu (dmacInterrupt
          * posé à chaque pas) — gb.update() ne s'ouvrait plus jamais */
         if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
-            sysTickTrigger = 0;
-            sysTickEntries++;
-            irq_inject(sysTickVector);
+            if (!primask) {
+                sysTickTrigger = 0;
+                sysTickEntries++;
+                irq_inject(sysTickVector);
+            }
+            /* masqué : le compteur attend, une seule entrée au CPSIE */
         }
     }
 
@@ -3466,6 +3534,8 @@ static void step(void) {
             incrementPc(); /* consomme le second demi-mot */
         }
     }
+    else if (op == 0xb672) { primask = 1; }  /* CPSID i */
+    else if (op == 0xb662) { primask = 0; }  /* CPSIE i */
     else if ((op & 0xf000) == 0xe800 || (op & 0xf800) == 0xf800) {
         /* reste de l'espace 32 bits (0xE800-0xEFFF, 0xF800-0xFFFF : ldr.w,
          * str.w, udiv… ) : paire consommée comme no-op — le second demi-mot
@@ -3678,7 +3748,6 @@ static uint8_t joy_hat_bits(SDL_Joystick *joy) {
 }
 
 static char fwPath[1024];
-static const char *fwName = NULL;
 static int fwLoaded;
 static int sd_explicit; /* carte passée explicitement en ligne de commande */
 static int fwNeedsBoot; /* un zip a chargé un firmware : vecteurs à remettre */
@@ -3716,6 +3785,7 @@ static void reset_core(void) {
     memset(regs, 0, sizeof regs);
     memset(regD, 0, sizeof regD);
     fN = fZ = fC = fV = 0;
+    primask = 0;
     tickCount = 0; sysTickTrigger = 0; sysTickEntries = 0;
     sysTickVector = dmacVector = tc4Vector = 0;
     dmacInterrupt = tc4Interrupt = 0;
