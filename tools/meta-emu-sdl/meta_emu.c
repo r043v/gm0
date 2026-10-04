@@ -2478,6 +2478,7 @@ static void writeByte(uint32_t a, uint8_t v);
 
 static void dma_sercom4_rx_beat(void);
 static int dmaBeatSkipSd; /* un beat DMA d'affichage ne doit pas horloger la carte */
+static int emuSiteModel = -1; /* modèle d'appareil du site (v12) : runtime, testable en natif */
 static int sdTxCh = -1;   /* canal TX de la carte SD pendant une écriture de secteur */
 static int dma_is_tc4(uint32_t ch) {
     return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC4_OVF;
@@ -2635,6 +2636,10 @@ static uint32_t periph_read(uint32_t a, int *handled) {
     if ((a & ~0x1fu) == 0x41004480u) { *handled = 1; return port_read(1, a & 0x1f); }
     if (a == 0x42001818u || a == 0x42001c18u) { *handled = 1; return 0x07; } /* SERCOM4/5 INTFLAG */
     if (a == 0x42001828u) { *handled = 1;
+        if (emuSiteModel > 0)
+            /* modèle du site : `data` ne change que par les listeners —
+             * le boutons (PB03 bas) y écrit buttonData (0xFF au repos) */
+            return (portB_out & 0x08u) ? 0x80u : buttonData;
         if (dbg() && dbgDac < 6000 && ((portA_out >> 27) & 1) == 0) {
             /* cartes sélectionnée seulement : le polling CS-haut noie tout */
             fprintf(stderr, "[dbg] SPI DATA lu <- %02x pc=%x PA27=%d tick=%u\n", ser4_data, regs[15] - 2,
@@ -2643,6 +2648,13 @@ static uint32_t periph_read(uint32_t a, int *handled) {
         }
         return ser4_data; }                /* SERCOM4 DATA */
     if (a == 0x42001c28u) { *handled = 1; return 0x80; }                     /* SERCOM5 DATA */
+    if (a == 0x41004840u) { /* CHCTRLA : « activé » en modèle site ; natif : état réel du canal */
+        *handled = 1;
+        if (emuSiteModel > 0) return 2;
+        if (dma_is_tc4(dmac_chid)) return dmaOn[dmac_chid] ? 2 : 0;
+        return 0;
+    }
+    if (emuSiteModel > 0) { *handled = 1; return 0; } /* modèle du site : rien d'autre */
     if (a == 0x4100484eu) { *handled = 1; return dmacIntFlag[dmac_chid & 0xfu]; } /* DMAC CHINTFLAG (fenêtre CHID) */
     if (a >= 0x4100485eu && a < 0x41004900u && ((a - 0x4100484eu) & 0xfu) == 0) {
         *handled = 1; return dmacIntFlag[(a - 0x4100484eu) >> 4]; } /* CHINTFLAG indexé (canaux 1+) */
@@ -2774,18 +2786,19 @@ static void flash_store(uint32_t a, uint32_t v, int bytes) {
 
 static void writeWord(uint32_t a, uint32_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_word(a, v); return; }
+    if (a == 0x41004840u) { static int n; if (n < 6) fprintf(stderr, "[WW-40] t=%u v=%x site=%d\n", tickCount, v, emuSiteModel); n++; }
     if (a == millisWatchAddr) millisWrites++;
     if (watchAddr && a == watchAddr && usbWatch < 4000)
         fprintf(stderr, "[watch %x] tick=%u pc=%x val=%08x\n", a, tickCount, regs[15] - 2, v);
-    if (a < 0x20000000u) { flash_store(a, v, 4); return; }
+    if (a < 0x20000000u) { if (emuSiteModel <= 0) flash_store(a, v, 4); return; } /* site : jettées */
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 4 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff;
         sram[a+2] = (v >> 16) & 0xff; sram[a+3] = (v >> 24) & 0xff; return; }
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     if (a == 0x42001828u) { sercom4_write((uint8_t)v); return; } /* SERCOM4 DATA */
-    if (a == 0x42004808u) { dac_write((uint16_t)v); return; }    /* DAC DATA */
-    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42004808u) { if (emuSiteModel <= 0) dac_write((uint16_t)v); return; }    /* DAC DATA */
+    if (a == 0x42003000u) { if (emuSiteModel > 0) return; if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
     if (a == 0x42003018u) { tc4Top = v; return; }                /* TC4 CC0 */
     if (a == 0x4200300cu) { tc4IntEnMask &= (uint8_t)~v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENCLR */
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET : OVF=0x01 (jeux maison), MC0=0x10 (lib standard) */
@@ -2819,7 +2832,7 @@ static void writeWord(uint32_t a, uint32_t v) {
             if (off == 0xe) {
                 dmacIntFlag[ch] = 0; /* CHINTFLAG (acquitter) */
                 for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-                    if (k != ch && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
+                    if (k != ch && (dmacIntFlag[k] & 0x02u)) { dmacInterrupt = 1; break; }
                 return;
             }
         }
@@ -2835,16 +2848,43 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == 0x4100484eu && dmac_chid < DMAC_CHANNELS) { /* CHINTFLAG : acquittement */
         dmacIntFlag[dmac_chid] &= (uint8_t)~v;
         /* l'interruption DMAC est level-triggered sur le hardware : tant
-         * qu'un autre canal attend, le NVIC ré-entre dans le handler — la
-         * lib ne lit INTPEND qu'une fois par entrée */
+         * qu'un autre canal attend une fin de transfert (TCMPL), le NVIC
+         * ré-entre — les SUSP périmés ne doivent pas ré-armer */
         for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-            if (k != dmac_chid && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
+            if (k != dmac_chid && (dmacIntFlag[k] & 0x02u)) { dmacInterrupt = 1; break; }
         return;
     }
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) { /* canal audio (TC4) */
         if ((v & 0x03u) == 0x02u) { if (!dmaOn[dmac_chid]) dma_load(dmac_chid, dmac_baseAddr + dmac_chid * 0x10); }
         else dmaOn[dmac_chid] = 0; /* SWRST ou désactivation */
         return;
+    }
+    if (emuSiteModel > 0) {
+    /* modèle du site : CHCTRLA=2 copie le descripteur INSTANTANÉMENT
+     * (BTCNT octets, src = adresse de fin, dst constant), suit la chaîne
+     * et lève l'interruption — pas de gouverneur de beats */
+    if (a == 0x41004840u && v == 0x02u) {
+        uint32_t desc = dmac_baseAddr ? dmac_baseAddr + dmac_chid * 0x10 : 0;
+        uint32_t guard = 0;
+        { static int n; if (n < 8) fprintf(stderr, "[wasm-dma] ch=%u cnt=%u src=%x dst=%x nxt=%x\n",
+                dmac_chid, desc ? fetchHalf(desc + 2) : 0, desc ? fetchWord(desc + 4) : 0,
+                desc ? fetchWord(desc + 8) : 0, desc ? fetchWord(desc + 12) : 0); n++; }
+        while (desc && guard++ < 200) {
+            uint16_t cnt = fetchHalf(desc + 2);
+            uint32_t src = fetchWord(desc + 4);
+            uint32_t dst = fetchWord(desc + 8);
+            uint32_t nxt = fetchWord(desc + 12);
+            { static int n; long before = stWrites; int pb22 = (int)((portB_out >> 22) & 1);
+              for (uint32_t a = 0; a < cnt; a++)
+                  writeByte(dst, fetchByte(src + a - cnt));
+              if (n < 8) fprintf(stderr, "[wasm-tx] dst=%x cnt=%u pb22=%d stWr=%ld (+%ld) b0=%02x\n",
+                  dst, cnt, pb22, stWrites, stWrites - before, fetchByte(src - cnt));
+              n++; }
+            dmacInterrupt = 1;
+            desc = nxt;
+        }
+        return;
+    }
     }
     if (a == 0x41004840u && (v & 0x03u) != 0x02u && spiDmaCh == (int)dmac_chid) {
         spiDmaCh = -1; dmaOn[dmac_chid] = 0; /* SWRST/désactivation du canal SPI */
@@ -2933,12 +2973,13 @@ static void writeWord(uint32_t a, uint32_t v) {
 
 static void writeHalf(uint32_t a, uint16_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_half(a, v); return; }
-    if (a < 0x20000000u) { flash_store(a, v, 2); return; }
+    if (a < 0x20000000u) { if (emuSiteModel <= 0) flash_store(a, v, 2); return; } /* site : jettées */
     if (watchAddr && a == watchAddr && usbWatch < 4000)
         fprintf(stderr, "[watch-h %x] tick=%u pc=%x val=%04x\n", a, tickCount, prevInstPc, v);
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff; return; }
     if (a == 0x42004808u) { if (dbg() && dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
+    if (emuSiteModel > 0) return; /* modèle du site */
     if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
     if (a == 0x42003018u) { tc4Top = v; return; }
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; }
@@ -2953,8 +2994,10 @@ static void writeHalf(uint32_t a, uint16_t v) {
 
 static void writeByte(uint32_t a, uint8_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_byte(a, v); return; }
-    if (a < 0x20000000u) { flash_store(a, v, 1); return; }
+    if (a == 0x41004840u) { static int n; if (n < 6) fprintf(stderr, "[WB-40] t=%u v=%02x site=%d\n", tickCount, v, emuSiteModel); n++; }
+    if (a < 0x20000000u) { if (emuSiteModel <= 0) flash_store(a, v, 1); return; } /* site : jettées */
     if (a < 0x40000000u) { uint32_t sa = a - 0x20000000u; if (sa < SRAM_SIZE) sram[sa] = v; return; }
+    if (emuSiteModel > 0) return; /* modèle du site */
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET */
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
     if (a == 0x42001828u) { sercom4_write(v); return; }
@@ -2962,7 +3005,7 @@ static void writeByte(uint32_t a, uint8_t v) {
     if (a == 0x4100484eu) { /* DMAC CHINTFLAG acquittement (fenêtre, octet) */
         dmacIntFlag[dmac_chid & 0xfu] &= (uint8_t)~v;
         for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-            if (k != (dmac_chid & 0xfu) && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
+            if (k != (dmac_chid & 0xfu) && (dmacIntFlag[k] & 0x02u)) { dmacInterrupt = 1; break; }
         return;
     }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
@@ -2980,6 +3023,22 @@ static void buttons_apply(void);
 
 static uint8_t serLast[8]; static long serIdx; static long serNz;
 static void sercom4_write(uint8_t v) {
+    if (emuSiteModel < 0)
+        emuSiteModel =
+#ifdef __EMSCRIPTEN__
+            0; /* modèle précis par défaut ; EMU_SITE=1 experimental */
+#else
+            getenv("EMU_SITE") && getenv("EMU_SITE")[0] == '1' ? 1 : 0;
+#endif
+    if (emuSiteModel) {
+        /* modèle du site (meta-emulatorv12) : pas de carte SD — le display
+         * écoute le bus, la machine SD n'existe pas (DATA renverra 0x80) */
+        if (v) serNz++;
+        st7735_byte(v);
+        if ((portB_out & (1u << 3)) == 0 || (portA_out & (1u << 25)) == 0)
+            ser4_data = buttonData;
+        return;
+    }
     if (v) serNz++;
     if (getenv("EMU_DMA_DEBUG")) { serLast[serIdx++ & 7] = v; }
     /* ordre du TypeScript (écran, boutons, carte SD) ; l'octet de réponse
@@ -3157,7 +3216,19 @@ static void step(void) {
          * du jeu (écritures flash, caches FS) doivent s'exécuter sans
          * injection — sinon les handlers corrompent ce qu'elles modifient.
          * Les drapeaux restent posés : le handler part au CPSIE. */
-        if (!primask) {
+        if (emuSiteModel > 0) {
+            /* modèle du site (meta-emulatorv12) : PAS d'interruption TC4
+             * (le noyau officiel n'a pas d'audio) et dmac/systick en
+             * if/else-if strict — le comportement que ces jeux attendent */
+            if (dmacInterrupt) {
+                dmacInterrupt = 0;
+                irq_inject(dmacVector);
+            } else if (sysTickTrigger >= 20000) {
+                sysTickTrigger = 0;
+                sysTickEntries++;
+                irq_inject(sysTickVector);
+            }
+        } else /* PRIMASK désactivé : certains jeux CPSID sans réelle paire */ {
             if (tc4Interrupt) {
                 tc4Interrupt = 0;
                 irq_inject(tc4Vector);
@@ -3166,17 +3237,11 @@ static void step(void) {
                 dmacInterrupt = 0;
                 irq_inject(dmacVector);
             }
-        }
-        /* SysTick indépendant du DMAC : la chaîne `else if` du TS affamait
-         * Millis dès qu'une lib streame l'écran en DMA continu (dmacInterrupt
-         * posé à chaque pas) — gb.update() ne s'ouvrait plus jamais */
-        if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
-            if (!primask) {
+            if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
                 sysTickTrigger = 0;
                 sysTickEntries++;
                 irq_inject(sysTickVector);
             }
-            /* masqué : le compteur attend, une seule entrée au CPSIE */
         }
     }
 
@@ -3607,8 +3672,8 @@ static void step(void) {
             incrementPc(); /* consomme le second demi-mot */
         }
     }
-    else if (op == 0xb672) { primask = 1; }  /* CPSID i */
-    else if (op == 0xb662) { primask = 0; }  /* CPSIE i */
+    else if (op == 0xb672) { if (emuSiteModel <= 0) primask = 1; }  /* CPSID i */
+    else if (op == 0xb662) { if (emuSiteModel <= 0) primask = 0; }  /* CPSIE i */
     else if ((op & 0xf000) == 0xe800 || (op & 0xf800) == 0xf800) {
         /* reste de l'espace 32 bits (0xE800-0xEFFF, 0xF800-0xFFFF : ldr.w,
          * str.w, udiv… ) : paire consommée comme no-op — le second demi-mot
@@ -4314,6 +4379,7 @@ int main(int argc, char **argv) {
 /* ------------------------------------------------------------ natif --- */
 
 int main(int argc, char **argv) {
+    emuSiteModel = getenv("EMU_SITE") && getenv("EMU_SITE")[0] == '1' ? 1 : 0;
     if (argc < 2)
         fprintf(stderr, "meta_emu : lancé sans firmware — déposez un .bin "
                         "dans la fenêtre (carte SD = son répertoire).\n");

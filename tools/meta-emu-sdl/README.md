@@ -192,6 +192,11 @@ transfert immédiat hérité du TS (firmwares 0.1.0 : sortie identique).
 
 ## État
 
+> **Suivi détaillé lib officielle / SD / loaders** :
+> voir [NOTES-SD-LIB-OFFICIELLE.md](NOTES-SD-LIB-OFFICIELLE.md) — analyse
+> de l'émulateur officiel du site (v12), causes racines, outils de
+> débogage SD et prochaines étapes.
+
 ## État
 
 **Jeux du site META (lib récente, cf. github.com/Gamebuino/Gamebuino-META)**
