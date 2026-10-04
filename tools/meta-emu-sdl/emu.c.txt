@@ -29,47 +29,11 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
-#include <stdarg.h>
-static const char *fwName; /* firmware courant (clé de sauvegarde wasm) */
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-/* persistance des fichiers de carte modifiés (sauvegardes) en localStorage,
- * clé par jeu : « emusav:<firmware>:<fichier> » */
-EM_JS(void, em_ls_set, (const char *key, const uint8_t *data, int len), {
-    try {
-        const k = UTF8ToString(key);
-        let s = '';
-        const h = HEAPU8;
-        for (let i = 0; i < len; i += 8192)
-            s += String.fromCharCode.apply(null, h.subarray(data + i, Math.min(data + i + 8192, data + len)));
-        localStorage.setItem(k, btoa(s));
-    } catch (e) { /* quota ou privacy : la sauvegarde reste en RAM */ }
-});
-EM_JS(int, em_ls_get, (const char *key, uint8_t *out, int maxlen), {
-    try {
-        const v = localStorage.getItem(UTF8ToString(key));
-        if (!v) return 0;
-        const s = atob(v);
-        const n = Math.min(s.length, maxlen);
-        for (let i = 0; i < n; i++) HEAPU8[out + i] = s.charCodeAt(i);
-        return n;
-    } catch (e) { return 0; }
-});
-static const char *em_save_key(const char *path) {
-    static char key[1200];
-    snprintf(key, sizeof(key), "emusav:%s:%s", fwName ? fwName : "jeu", path);
-    return key;
-}
-#endif
 
 /* ---------------------------------------------------------------- état */
 
 #define FLASH_SIZE 0x40000u
-/* 40 Ko : la SRAM du SAMD21 fait 32 Ko mais les jeux lib récente placent
- * leur buffer de réception SD (SdFat) vers 0x20008860 — hors des 32 Ko —
- * et attendent des écritures fonctionnelles à cette adresse ; ce surplus
- * reste inutilisé par les autres jeux */
-#define SRAM_SIZE  0xa000u
+#define SRAM_SIZE  0x8000u
 
 /* Le tampon d'écran doit contenir la plus grande des deux cibles
  * (160x128 META, 220x176 Pokitto) ; SCR_W/SCR_H suivent la cible. */
@@ -92,21 +56,13 @@ static uint32_t sysTickVector, dmacVector, tc4Vector;
 static int dmacInterrupt, tc4Interrupt;
 static long sysTickEntries;
 
-/* périphériques — PA27 (CS carte SD) et PA25 (CS boutons) hauts dès le
- * boot : pull-ups réelles de la carte, les périphériques n'écoutent le
- * SPI que si le firmware les sélectionne (le boot initial ne passe PAS
- * par reset_core ; les jeux sans lib standard ne sélectionnent jamais
- * ce qu'ils n'utilisent pas — sinon leur trafic SPI écran partait dans
- * la machine SD) */
-static uint32_t portA_out = (1u << 27) | (1u << 25), portB_out, portA_dir, portB_dir;
+/* périphériques */
+static uint32_t portA_out, portB_out, portA_dir, portB_dir;
 static uint8_t  ser4_data = 0x80;
 static uint8_t  buttonData = 0xff;
 
 /* TC4 + DAC */
 static int      tc4Enabled, tc4Armed;
-static uint8_t  tc4IntEnMask, tc4IntFlagMask; /* INTENSET/INTFLAG lisibles (jeux maison) */
-static int      primask; /* CPSID/CPSIE : masque les injections d'interruptions */
-static uint32_t tc4CtrlA; /* valeur complète de CTRLA (prescaler bits 8-10) */
 static uint32_t tc4Top, tc4Counter, tc4Period = 907;
 static uint32_t tc4Window, tc4Fires, tc4Writes;
 static int      tc4Interrupt;
@@ -121,41 +77,11 @@ static int ramwrCount; /* compte les RAMWR : ~32 par frame rendue */
 static uint8_t *sd_image = NULL;
 static size_t   sd_size = 0;
 static uint8_t  sd_pending = 0xff;
-/* file de réponse : le TS utilise un tableau JS non borné — une commande
- * peut arriver avant que la réponse précédente soit drainée (jeu avec son
- * propre pilote SD) ; on réplique avec un tampon qui grandit, plafonné */
-static uint8_t *sd_out = NULL;
-static int      sd_outCap = 0;
+static uint8_t  sd_out[512 + 16];
 static int      sd_outLen = 0, sd_outPos = 0;
 static uint8_t  sd_cmdBuf[6];
 static int      sd_cmdIdx = 0;
 static int      sd_writing = 0, sd_writeIdx = 0, sd_writeLba = 0;
-
-#define SD_OUT_MAX (1u << 20)
-static void sd_out_push(uint8_t b) {
-    if (sd_outLen >= SD_OUT_MAX) return; /* déraille : on n'accumule plus */
-    if (sd_outLen >= sd_outCap) {
-        int cap = sd_outCap ? sd_outCap * 2 : 512;
-        if (cap > SD_OUT_MAX) cap = SD_OUT_MAX;
-        uint8_t *n = realloc(sd_out, (size_t)cap);
-        if (!n) return;
-        sd_out = n; sd_outCap = cap;
-    }
-    sd_out[sd_outLen++] = b;
-}
-static void sd_out_append(const uint8_t *p, int n) {
-    if (sd_outLen + n > SD_OUT_MAX) return;
-    if (sd_outLen + n > sd_outCap) {
-        int cap = sd_outCap ? sd_outCap : 512;
-        while (cap < sd_outLen + n) cap *= 2;
-        if (cap > SD_OUT_MAX) cap = SD_OUT_MAX;
-        uint8_t *b = realloc(sd_out, (size_t)cap);
-        if (!b) return;
-        sd_out = b; sd_outCap = cap;
-    }
-    memcpy(sd_out + sd_outLen, p, (size_t)n);
-    sd_outLen += n;
-}
 static int      sd_initialized = 0;
 static uint8_t  sd_writeBuf[515];
 
@@ -340,32 +266,29 @@ static size_t sd_card_size(void) {
     return sd_image ? sd_size : (fatImage ? fatImageSize : 0);
 }
 
-static int sdDbg = -1;
 static void sd_command(uint8_t cmd, uint32_t arg) {
-    if (sdDbg < 0) sdDbg = getenv("SD_DEBUG") ? 1 : 0;
-    if (sdDbg && cmd != 55)
-        fprintf(stderr, "[sd] CMD%u arg=%u (%#x) @tick=%u\n", cmd, arg, arg, tickCount);
     switch (cmd) {
-        case 0:  sd_out_push(sd_initialized ? 0x00 : 0x01); break; /* idle */
-        case 8:  sd_out_push(0x01); sd_out_push(0x00);
-                 sd_out_push(0x00); sd_out_push(0x01);
-                 sd_out_push(0xaa); break;
-        case 55: sd_out_push(0x01); break;
-        case 41: sd_initialized = 1; sd_out_push(0x00); break;
-        case 58: sd_out_push(0x00); sd_out_push(0xc0);
-                 sd_out_push(0x00); sd_out_push(0x00);
-                 sd_out_push(0x00); break;
-        case 16: sd_out_push(0x00); break;
+        case 0:  sd_out[sd_outLen++] = sd_initialized ? 0x00 : 0x01; break; /* idle */
+        case 8:  sd_out[sd_outLen++] = 0x01; sd_out[sd_outLen++] = 0x00;
+                 sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0x01;
+                 sd_out[sd_outLen++] = 0xaa; break;
+        case 55: sd_out[sd_outLen++] = 0x01; break;
+        case 41: sd_initialized = 1; sd_out[sd_outLen++] = 0x00; break;
+        case 58: sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0xc0;
+                 sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0x00;
+                 sd_out[sd_outLen++] = 0x00; break;
+        case 16: sd_out[sd_outLen++] = 0x00; break;
         case 17: { /* lecture d'un secteur */
             size_t base = (size_t)arg * 512;
             uint8_t *card = sd_card_data();
             if (card && base + 512 <= sd_card_size()) {
-                sd_out_push(0x00);
-                sd_out_push(0xfe);
-                sd_out_append(card + base, 512);
-                sd_out_push(0xff); sd_out_push(0xff);
+                sd_out[sd_outLen++] = 0x00;
+                sd_out[sd_outLen++] = 0xfe;
+                memcpy(sd_out + sd_outLen, card + base, 512);
+                sd_outLen += 512;
+                sd_out[sd_outLen++] = 0xff; sd_out[sd_outLen++] = 0xff;
             } else {
-                sd_out_push(0x04);
+                sd_out[sd_outLen++] = 0x04;
             }
             break;
         }
@@ -373,9 +296,9 @@ static void sd_command(uint8_t cmd, uint32_t arg) {
             sd_writeLba = arg;
             sd_writeIdx = 0;
             sd_writing = 1;
-            sd_out_push(0x00);
+            sd_out[sd_outLen++] = 0x00;
             break;
-        default: sd_out_push(0x04); break;
+        default: sd_out[sd_outLen++] = 0x04; break;
     }
 }
 
@@ -388,21 +311,13 @@ static void sd_process(uint8_t v) {
         if (sd_writeIdx >= 515) {
             sd_writing = 0;
             uint8_t *card = sd_card_data();
-            { static int wd2 = -1;
-              if (wd2 < 0) wd2 = getenv("SD_DEBUG") ? (getenv("SD_DEBUG")[0] == '2' ? 1 : 0) : 0;
-              if (wd2) {
-                int lfn = 0;
-                for (int i = 130; i <= 150; i++) if (sd_writeBuf[i]) lfn++;
-                fprintf(stderr, "[wr-done] t=%u lba=%u lfn=%d octets[128..159]=", tickCount, sd_writeLba, lfn);
-                for (int i = 129; i <= 160; i++) fprintf(stderr, "%02x", sd_writeBuf[i]);
-                fprintf(stderr, "\n"); } }
             if (card && sd_writeBuf[0] == 0xfe) {
                 memcpy(card + (size_t)sd_writeLba * 512, sd_writeBuf + 1, 512);
                 sd_write_persist(sd_writeLba, card + (size_t)sd_writeLba * 512);
             }
             /* accepté, puis busy (comme sdcard.ts) */
-            sd_out_push(0x05); sd_out_push(0x00);
-            sd_out_push(0x00); sd_out_push(0xff);
+            sd_out[sd_outLen++] = 0x05; sd_out[sd_outLen++] = 0x00;
+            sd_out[sd_outLen++] = 0x00; sd_out[sd_outLen++] = 0xff;
         }
         return;
     }
@@ -424,14 +339,8 @@ static void sd_byte(uint8_t v) {
         sd_reset_state();
         return; /* silencieuse quand désélectionnée */
     }
-
     ser4_data = sd_pending;
     sd_pending = sd_outPos < sd_outLen ? sd_out[sd_outPos++] : 0xff;
-    { static int sdDbg2 = -1;
-      if (sdDbg2 < 0) sdDbg2 = getenv("SD_DEBUG") ? (getenv("SD_DEBUG")[0] == '2' ? 1 : 0) : 0;
-      if (sdDbg2 && sd_outLen + sd_cmdIdx > 0)
-          fprintf(stderr, "[sdx] t=%u w=%02x -> %02x q=%u/%u sel=%d\n",
-                  tickCount, v, ser4_data, sd_outPos, sd_outLen, sd_selected()); }
     sd_process(v);
 }
 
@@ -484,15 +393,6 @@ static size_t   fatImageSize;
 static uint32_t fatClusterCount; /* clusters de données du volume */
 static uint32_t fatSpc = 8;         /* secteurs / cluster (dynamique) */
 static uint32_t fatFatsz = 65;      /* secteurs / FAT (dynamique) */
-/* Table de partitions, par cible : les cartes réelles ont toujours un MBR
- * et la lib META officielle (SdFat, partition 1) ne monte pas une
- * superfloppy — elle lit le secteur 0, ne trouve pas d'entrée à 0x1BE et
- * boucle sur son écran de chargement.  Le loader gbrecomp (meta_fat.c)
- * gère les deux dispositions ; en revanche le lecteur FAT Pokitto attend
- * le secteur de boot en LBA 0 (superfloppy).  fatPartStart est donc posé
- * au moment de la construction de la carte (fat_bootstrap_for), la cible
- * étant déjà détectée à ce moment. */
-static uint32_t fatPartStart; /* décalage du volume (secteurs) */
 typedef struct { uint32_t lba; size_t bytes; char path[1024]; uint8_t *mem; } FatFile;
 static FatFile  fatFiles[512];
 static int      fatFileCount;
@@ -567,73 +467,13 @@ static uint32_t fat_alloc(int clusters) {
 }
 
 static uint32_t fat_data_lba(uint32_t first) {
-    return fatPartStart + 1 + 2 * fatFatsz + (FAT_ROOT * 32 + 511) / 512 + (first - 2) * fatSpc;
+    return 1 + 2 * fatFatsz + (FAT_ROOT * 32 + 511) / 512 + (first - 2) * fatSpc;
 }
 
 static void fat_place(const char *dir, uint32_t parentFirst, int isRoot,
                       FatEnt *entries, int nEntries, uint32_t selfFirst);
 
 static uint32_t fat_alloc_dir_data(void) { return fat_alloc(1); }
-
-/* somme de contrôle 8.3 d'une entrée LFN */
-static unsigned char fat_lfn_csum(const char *name83) {
-    unsigned char c = 0;
-    for (int i = 0; i < 11; i++)
-        c = (unsigned char)(((c & 1) << 7) + (c >> 1) + (unsigned char)name83[i]);
-    return c;
-}
-
-/* écrit les entrées LFN (nom long VFAT) se terminant à *off — juste avant
- * l'entrée 8.3 — quand le nom ne tient pas en 8.3.  Les loaders du site
- * scannent les noms longs (CatsAndCoinsDemo, TITLESCREEN.BMP...) ; gbrecomp
- * (meta_fat.c) saute les entrées 0x0F, donc rétrocompatible. */
-static int fat_write_lfn_entries(uint8_t *buf, int off, int cap, const char *longname, const char *name83) {
-    int len = (int)strlen(longname);
-    int nents = (len + 12) / 13;
-    unsigned char csum = fat_lfn_csum(name83);
-    for (int k = nents; k >= 1; k--) {
-        if (off > cap - 32) return off; /* plus de place : sans LFN */
-        uint8_t *e = buf + off;
-        memset(e, 0xff, 32);
-        e[0] = (uint8_t)(k == 1 ? 0x41 : k);
-        uint16_t chars[13];
-        for (int i = 0; i < 13; i++) {
-            int idx = (k - 1) * 13 + i;
-            chars[i] = idx < len ? (uint16_t)(unsigned char)longname[idx]
-                                 : (idx == len ? 0x0000u : 0xFFFFu);
-        }
-        for (int i = 0; i < 5; i++) { e[1 + i*2] = (uint8_t)chars[i]; e[2 + i*2] = (uint8_t)(chars[i] >> 8); }
-        e[11] = 0x0F;
-        e[12] = 0x00;
-        e[13] = csum;
-        for (int i = 0; i < 6; i++) { e[14 + i*2] = (uint8_t)chars[5 + i]; e[15 + i*2] = (uint8_t)(chars[5 + i] >> 8); }
-        e[26] = (uint8_t)chars[11]; e[27] = (uint8_t)(chars[11] >> 8);
-        for (int i = 0; i < 2; i++) { e[28 + i*2] = (uint8_t)chars[12 + i]; e[29 + i*2] = (uint8_t)(chars[12 + i] >> 8); }
-        e[30] = 0x00; e[31] = 0x00;
-        off += 32;
-    }
-    return off;
-}
-
-/* le nom long (basename du chemin) mérite-t-il une entrée LFN ? */
-static const char *fat_longname(const char *path) {
-    const char *sl = strrchr(path, '/');
-    return sl ? sl + 1 : path;
-}
-
-static int fat_needs_lfn(const char *longname, const char *name83) {
-    char up[1024];
-    snprintf(up, sizeof(up), "%s", longname);
-    for (char *q = up; *q; q++) *q = (char)toupper((unsigned char)*q);
-    char canon[16];
-    int bl = 0;
-    while (bl < 11 && name83[bl] != ' ') { canon[bl] = name83[bl]; bl++; }
-    int el = 0;
-    while (el < 3 && name83[11 - 3 + el] != ' ') el++;
-    canon[bl] = 0;
-    if (el) { canon[bl] = '.'; memcpy(canon + bl + 1, name83 + 8, el); canon[bl + 1 + el] = 0; }
-    return strcmp(up, canon) != 0 && strcmp(longname, canon) != 0;
-}
 
 static void fat_write_dir_data(uint32_t first, FatEnt *entries, int n, uint32_t selfFirst, uint32_t parentFirst, int isRoot) {
     uint8_t buf[64 * FAT_SECTOR];
@@ -650,12 +490,6 @@ static void fat_write_dir_data(uint32_t first, FatEnt *entries, int n, uint32_t 
     }
     int off = isRoot ? 0 : 64;
     for (int i = 0; i < n && off < (int)sizeof(buf) - 32; i++) {
-        if (entries[i].path[0]) {
-            const char *ln = fat_longname(entries[i].path);
-            if (fat_needs_lfn(ln, entries[i].name83))
-                off = fat_write_lfn_entries(buf, off, (int)sizeof(buf), ln, entries[i].name83);
-        }
-        if (off > (int)sizeof(buf) - 32) break;
         memcpy(buf + off, entries[i].name83, 11);
         buf[off + 11] = entries[i].isDir ? 0x10 : 0x20;
         buf[off + 26] = entries[i].first & 0xff;
@@ -738,7 +572,6 @@ static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
 /* amorce du volume : géométrie calculée pour contenir `bytes` de données
  * (FAT16, clusters 4-32 Ko, volume borné à ~511 Mo) */
 static void fat_bootstrap_for(size_t bytes, int ndirs) {
-    fatPartStart = (emuTarget == TGT_POKITTO) ? 0 : 2048; /* 1 Mio, alignement SD */
     /* FAT16 impose 4085..65000 clusters : choisit le spc en conséquence */
     uint32_t spc = 8; /* 4 Ko */
     double cl;
@@ -753,8 +586,7 @@ static void fat_bootstrap_for(size_t bytes, int ndirs) {
     if (clusters > 65000u) clusters = 65000u;
     fatClusterCount = clusters;
     uint32_t fatsz = (uint32_t)(((clusters + 2) * 2 + FAT_SECTOR - 1) / FAT_SECTOR);
-    uint32_t vol = 1 + 2 * fatsz + 32 + clusters * spc; /* secteurs du volume */
-    uint32_t total = fatPartStart + vol;                /* + table de partitions */
+    uint32_t total = 1 + 2 * fatsz + 32 + clusters * spc;
     fatSpc = spc;
     fatFatsz = fatsz;
     fatTotalSectors = (int)total;
@@ -770,51 +602,26 @@ static void fat_bootstrap_for(size_t bytes, int ndirs) {
     }
     fatTable[0] = 0xf8; fatTable[1] = 0xff;
     fatTable[2] = 0xff; fatTable[3] = 0xff;
-    /* --- secteur de boot de la partition (le driver du firmware ne lit
-     * que le champ 16 bits du total, fat_finish recopie les FAT) --- */
-    uint8_t *bs = fatImage + fatPartStart * FAT_SECTOR;
-    bs[0] = 0xeb; bs[1] = 0x3c; bs[2] = 0x90;
-    memcpy(bs + 3, "GBREMU", 6);
-    bs[0x0b] = 0x00; bs[0x0c] = 0x02; /* 512 octets/secteur */
-    bs[0x0d] = (uint8_t)spc;
-    bs[0x0e] = 0x01; bs[0x0f] = 0x00;
-    bs[0x10] = 0x02;
-    bs[0x11] = FAT_ROOT & 0xff; bs[0x12] = FAT_ROOT >> 8;
-    bs[0x15] = 0xf8;
-    bs[0x16] = fatsz & 0xff; bs[0x17] = (fatsz >> 8) & 0xff;
-    bs[0x18] = 32; bs[0x19] = 0;   /* secteurs/piste */
-    bs[0x1a] = 8; bs[0x1b] = 0;    /* têtes */
-    /* FAT16 : total du VOLUME en 16 bits (0x13) sous 65536 secteurs,
-     * sinon en 32 (0x20) */
-    if (vol < 65536u) {
-        bs[0x13] = vol & 0xff; bs[0x14] = (vol >> 8) & 0xff;
+    fatImage[0] = 0xeb; fatImage[1] = 0x3c; fatImage[2] = 0x90;
+    memcpy(fatImage + 3, "GBREMU", 6);
+    fatImage[0x0b] = 0x00; fatImage[0x0c] = 0x02; /* 512 octets/secteur */
+    fatImage[0x0d] = (uint8_t)spc;
+    fatImage[0x0e] = 0x01; fatImage[0x0f] = 0x00;
+    fatImage[0x10] = 0x02;
+    fatImage[0x11] = FAT_ROOT & 0xff; fatImage[0x12] = FAT_ROOT >> 8;
+    fatImage[0x15] = 0xf8;
+    fatImage[0x16] = fatsz & 0xff; fatImage[0x17] = (fatsz >> 8) & 0xff;
+    fatImage[0x18] = 32; fatImage[0x19] = 0;   /* secteurs/piste */
+    fatImage[0x1a] = 8; fatImage[0x1b] = 0;    /* têtes */
+    /* FAT16 : total en 16 bits (0x13) sous 65536 secteurs, sinon en 32
+     * (0x20) — le driver du firmware ne lit que le champ 16 bits */
+    if (total < 65536u) {
+        fatImage[0x13] = total & 0xff; fatImage[0x14] = (total >> 8) & 0xff;
     } else {
-        bs[0x20] = vol & 0xff; bs[0x21] = (vol >> 8) & 0xff;
-        bs[0x22] = (vol >> 16) & 0xff; bs[0x23] = (vol >> 24) & 0xff;
+        fatImage[0x20] = total & 0xff; fatImage[0x21] = (total >> 8) & 0xff;
+        fatImage[0x22] = (total >> 16) & 0xff; fatImage[0x23] = (total >> 24) & 0xff;
     }
-    bs[0x1c] = fatPartStart & 0xff; bs[0x1d] = (fatPartStart >> 8) & 0xff; /* secteurs cachés */
-    bs[0x1e] = (fatPartStart >> 16) & 0xff; bs[0x1f] = (fatPartStart >> 24) & 0xff;
-    bs[510] = 0x55; bs[511] = 0xaa;
-    /* --- MBR : une partition FAT16 occupant tout le reste --- */
-    fatImage[0x1be] = 0x00; /* non amorçable */
-    {   /* CHS calculés avec la géométrie du BPB (8 têtes, 32 secteurs/piste) ;
-         * les pilotes utilisent le champ LBA — le Codé CHS ne sert qu'aux
-         * outils de disque.  Au-delà de 1023 cylindres : forme saturée. */
-        uint32_t end = total - 1;
-        uint32_t cs = fatPartStart / 256, ce = end / 256;
-        fatImage[0x1bf] = (uint8_t)((fatPartStart / 32) % 8);
-        fatImage[0x1c0] = (uint8_t)((fatPartStart % 32 + 1) | ((cs >> 2) & 0xc0));
-        fatImage[0x1c1] = (uint8_t)cs;
-        fatImage[0x1c2] = 0x06; /* type FAT16 */
-        fatImage[0x1c3] = ce > 1023 ? 0xfe : (uint8_t)((end / 32) % 8);
-        fatImage[0x1c4] = ce > 1023 ? 0xff : (uint8_t)((end % 32 + 1) | ((ce >> 2) & 0xc0));
-        fatImage[0x1c5] = ce > 1023 ? 0xff : (uint8_t)ce;
-        fatImage[0x1c6] = fatPartStart & 0xff; fatImage[0x1c7] = (fatPartStart >> 8) & 0xff;
-        fatImage[0x1c8] = (fatPartStart >> 16) & 0xff; fatImage[0x1c9] = (fatPartStart >> 24) & 0xff;
-        fatImage[0x1ca] = vol & 0xff; fatImage[0x1cb] = (vol >> 8) & 0xff;
-        fatImage[0x1cc] = (vol >> 16) & 0xff; fatImage[0x1cd] = (vol >> 24) & 0xff;
-        fatImage[510] = 0x55; fatImage[511] = 0xaa;
-    }
+    fatImage[510] = 0x55; fatImage[511] = 0xaa;
 }
 
 static FatEnt *rootEnts; /* entrées de la racine, consommées par fat_finish */
@@ -829,12 +636,6 @@ static void fat_finish(const char *label) {
     uint8_t *rootBuf = calloc(FAT_ROOT * 32, 1);
     int off = 0;
     for (int i = 0; i < rootN; i++) {
-        if (rootEnts[i].path[0]) {
-            const char *ln = fat_longname(rootEnts[i].path);
-            if (fat_needs_lfn(ln, rootEnts[i].name83))
-                off = fat_write_lfn_entries(rootBuf, off, FAT_ROOT * 32, ln, rootEnts[i].name83);
-        }
-        if (off > FAT_ROOT * 32 - 32) break;
         memcpy(rootBuf + off, rootEnts[i].name83, 11);
         rootBuf[off + 11] = rootEnts[i].isDir ? 0x10 : 0x20;
         rootBuf[off + 26] = rootEnts[i].first & 0xff;
@@ -843,23 +644,11 @@ static void fat_finish(const char *label) {
         rootBuf[off + 30] = (rootEnts[i].size >> 16) & 0xff; rootBuf[off + 31] = (rootEnts[i].size >> 24) & 0xff;
         off += 32;
     }
-    uint32_t rootLba = fatPartStart + 1 + 2 * fatsz;
+    uint32_t rootLba = 1 + 2 * fatsz;
     memcpy(fatImage + rootLba * FAT_SECTOR, rootBuf, FAT_ROOT * 32);
-    memcpy(fatImage + (fatPartStart + 1) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
-    memcpy(fatImage + (fatPartStart + 1 + fatsz) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
+    memcpy(fatImage + FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
+    memcpy(fatImage + (1 + fatsz) * FAT_SECTOR, fatTable, fatsz * FAT_SECTOR);
     free(rootBuf); free(rootEnts); rootEnts = NULL; rootN = 0;
-#ifdef __EMSCRIPTEN__
-    /* restaure les fichiers modifiés lors d'une session précédente
-     * (localStorage, clé par jeu) */
-    for (int i = 0; i < fatFileCount; i++) {
-        if (!fatFiles[i].mem || !fatFiles[i].path[0]) continue;
-        int n = em_ls_get(em_save_key(fatFiles[i].path), fatFiles[i].mem,
-                          (int)fatFiles[i].bytes);
-        if (n > 0)
-            memcpy(fatImage + fatFiles[i].lba * FAT_SECTOR, fatFiles[i].mem,
-                   (size_t)n);
-    }
-#endif
     if (getenv("FAT_DUMP")) {
         FILE *g = fopen(getenv("FAT_DUMP"), "wb");
         if (g) { fwrite(fatImage, 1, fatImageSize, g); fclose(g);
@@ -993,19 +782,12 @@ static void sd_write_persist(uint32_t lba, const uint8_t *data) {
     for (int i = 0; i < fatFileCount; i++) {
         if (lba >= fatFiles[i].lba && (lba - fatFiles[i].lba) * 512 < fatFiles[i].bytes) {
             if (fatFiles[i].mem) {
-                /* fichier virtuel (navigateur) : écrit dans le tampon et
-                 * persiste le fichier complet en localStorage (clé par jeu) */
+                /* fichier virtuel (navigateur) : écrit dans le tampon ;
+                 * l'export inter-sessions est géré côté JS */
                 memcpy(fatFiles[i].mem + (lba - fatFiles[i].lba) * 512, data, 512);
-#ifdef __EMSCRIPTEN__
-                em_ls_set(em_save_key(fatFiles[i].path), fatFiles[i].mem,
-                          (int)fatFiles[i].bytes);
-#endif
             } else {
                 FILE *g = fopen(fatFiles[i].path, "r+b");
-                if (g) {
-                    fseek(g, (long)((lba - fatFiles[i].lba) * 512), SEEK_SET);
-                    fwrite(data, 1, 512, g); fclose(g);
-                }
+                if (g) { fwrite(data, 1, 512, g); fclose(g); }
             }
             return;
         }
@@ -1039,6 +821,7 @@ typedef struct { char name[1024]; const uint8_t *cdata; size_t csize; size_t usi
 static void reset_machine(void);
 static void load_firmware_data(const uint8_t *data, size_t len, const char *display);
 static int fwLoaded;
+static const char *fwName;
 
 /* parse le central directory ; renvoie le nombre d'entrées (fichiers) */
 static int zip_parse(const uint8_t *data, size_t len, ZipEnt *ents, int max) {
@@ -1143,17 +926,14 @@ static int zip_load_card(const uint8_t *data, size_t len) {
  * ====================================================================== */
 
 /* boutons : bit0 bas, 1 gauche, 2 droite, 3 haut, 4 A, 5 B, 6 MENU, 7 HOME
- * (actifs bas : 0 = enfoncé).  Ordre du registre à décalage physique du
- * META (MSB en premier : home..down), confirmé par le source du registre
- * gdl de lapinou : left,right,up,a,b,menu,down,home — même masque pour
- * les deux cibles. */
-#define BTN_LEFT   (1u << 0)
-#define BTN_RIGHT  (1u << 1)
-#define BTN_UP     (1u << 2)
-#define BTN_A      (1u << 3)
-#define BTN_B      (1u << 4)
-#define BTN_MENU   (1u << 5)
-#define BTN_DOWN   (1u << 6)
+ * (actifs bas : 0 = enfoncé) — même masque pour les deux cibles */
+#define BTN_DOWN   (1u << 0)
+#define BTN_LEFT   (1u << 1)
+#define BTN_RIGHT  (1u << 2)
+#define BTN_UP     (1u << 3)
+#define BTN_A      (1u << 4)
+#define BTN_B      (1u << 5)
+#define BTN_MENU   (1u << 6)
 #define BTN_HOME   (1u << 7)
 #define BTN_DIRMASK (BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_UP)
 
@@ -1333,8 +1113,7 @@ static void pk_sd_exec(uint32_t cmd, uint32_t arg) {
                    pk_sd_resp(r, 5); } break;
         case 59: pk_sd_checkCRC = arg != 0;
                  { uint8_t r = (uint8_t)(pk_sd_idle ? 1 : 0); pk_sd_resp(&r, 1); } break;
-        case 61: case 169: /* ACMD41 (41 + marqueur alt 0x80) : quitte l'idle
-                  * (la référence rendait {4}, ce qui
+        case 61: /* ACMD41 : quitte l'idle (la référence rendait {4}, ce qui
                   * empêchait toute init de carte réelle — ici la carte
                   * monte quand une image/un dossier est fourni) */
             pk_sd_idle = 0;
@@ -1922,12 +1701,12 @@ static uint32_t pk_reg_peek(uint32_t a) {
         uint32_t off = a - 0xA0000000u;
         if (off < 0x1000) { /* banque octet */
             uint32_t p, b;
-            if (off < 0x18) { p = 0; b = off; }
+            if (off < 0x18) { p = 0; b = off & 0x1C; }
             else if (off < 0x40) { p = 1; b = off - 0x20; }
             else if (off < 0x58) { p = 2; b = off - 0x40; }
             else return 0;
-            uint32_t bit = b; /* l'adresse octet encode déjà la broche */
-            return ((pk_pin[p] >> bit) & 1);
+            uint32_t bit = b + (a & 3);
+            return ((pk_pin[p] >> bit) & 1) << ((a & 3) << 3);
         }
         if (off < 0x2000) { /* banque mot */
             uint32_t p, bit;
@@ -2100,12 +1879,12 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
         uint32_t off = a - 0xA0000000u;
         if (off < 0x1000) { /* banque octet */
             uint32_t p, b;
-            if (off < 0x18) { p = 0; b = off; }
+            if (off < 0x18) { p = 0; b = off & 0x1C; }
             else if (off < 0x40) { p = 1; b = off - 0x20; }
             else if (off < 0x58) { p = 2; b = off - 0x40; }
             else return;
-            uint32_t bit = b; /* l'adresse octet encode déjà la broche */
-            if (v & 0xFF) pk_pout[p] |= 1u << bit;
+            uint32_t bit = b + (a & 3);
+            if ((v >> ((a & 3) << 3)) & 0xFF) pk_pout[p] |= 1u << bit;
             else pk_pout[p] &= ~(1u << bit);
             if (a == 0xA0000057u) pk_audio_gpio_write(); /* bit 23 latching */
             return;
@@ -2398,11 +2177,6 @@ static void pk_card_export(void) {
 
 
 static long stWrites = 0, ramwrTotal = 0;
-/* le panneau META est câblé BGR ; une init qui déclare MADCTL.BGR=1
- * (jeux maison à init custom, ex. lapinou : 0xC8) envoie des couleurs
- * d'ordre natif — l'émulateur doit inverser R/B à l'affichage.  La lib
- * standard ne déclare jamais BGR et pré-swappe elle-même. */
-static int lcdBgrSwapped;
 static uint8_t st7735_byte(uint8_t v) {
     if (portB_out & (1u << 22)) return 0xff; /* CS écran haut */
     stWrites++;
@@ -2410,13 +2184,7 @@ static uint8_t st7735_byte(uint8_t v) {
         lcd_lastCommand = v;
         lcd_argIndex = 0;            /* comme st7735.ts : reset à chaque commande */
         if (v == 0x2c) ramwrTotal++;
-        if (v == 0x36 && getenv("EMU_LCD_DEBUG")) fprintf(stderr, "[lcd] MADCTL cmd\n");
         return 0xff;
-    }
-    if (lcd_lastCommand == 0x36) {
-        if (v & 0x08) lcdBgrSwapped = 1;
-        if (getenv("EMU_LCD_DEBUG"))
-            fprintf(stderr, "[lcd] MADCTL <- %02x (BGR=%d, verrou=%d)\n", v, (v >> 3) & 1, lcdBgrSwapped);
     }
     { /* données */
         switch (lcd_lastCommand) {
@@ -2424,7 +2192,6 @@ static uint8_t st7735_byte(uint8_t v) {
                 if (lcd_argIndex % 2 == 0) lcd_tmp = v;
                 else {
                     uint16_t p = (uint16_t)((lcd_tmp << 8) | v);
-                    if (lcdBgrSwapped) p = (uint16_t)((p >> 11) | (p & 0x07e0u) | ((p & 0x1fu) << 11));
                     if (lcd_x < 160 && lcd_y < 128) pix[lcd_y * 160 + lcd_x] = p;
                     if (++lcd_x > lcd_xEnd) { lcd_x = lcd_xStart; if (++lcd_y > lcd_yEnd) lcd_y = lcd_yStart; }
                 }
@@ -2446,148 +2213,6 @@ static uint8_t st7735_byte(uint8_t v) {
 /* ------------------------------------------------------------ DMAC */
 
 static uint32_t dmac_baseAddr, dmac_wrbAddr, dmac_desc, dmac_chid;
-
-/* Canaux déclenchés par TC4 (audio META_AUDIO_DMA du firmware gbrecomp) :
- * suivis à part du hack « copie immédiate » ci-dessus, sinon leur chaîne
- * détourne dmac_desc et l'écran (canal 0) ne reçoit plus rien.  Un beat
- * par débordement TC4 ; le descripteur suivant est lu à la fin du courant
- * (invalide ou nul -> canal arrêté, comme une erreur de fetch). */
-#define DMAC_CHANNELS 12
-#define DMAC_TRIG_TC4_OVF 0x1bu /* TC4_DMAC_ID_OVF (SAMD21) */
-#define DMAC_TRIG_SERCOM4_TX 0x0au /* SERCOM4_DMAC_ID_TX (écran) */
-#define DMAC_TRIG_SERCOM4_RX 0x09u /* SERCOM4_DMAC_ID_RX (carte SD, lib récente) */
-/* DMA SPI cadencé : les beats sortent au rythme du baud SERCOM4 (le CPU
- * continue de tourner pendant le transfert — sur hardware le DMA écran
- * prend ~6,8 ms par demi-frame à 24 MHz, d'où les 40-55 fps réels) */
-static int      spiDmaCh = -1;   /* canal SERCOM4-TX en cours, -1 = aucun */
-static uint32_t spiBeatAcc;      /* accumulateur de ticks */
-static uint32_t spiBeatTicks = 7; /* ticks par beat (baud) */
-static uint32_t spiBaud;         /* SERCOM4 BAUD (f = 48 MHz / (2×(b+1))) */
-static uint8_t  dmaTrig[DMAC_CHANNELS], dmaOn[DMAC_CHANNELS];
-static uint8_t  dmacIntFlag[DMAC_CHANNELS]; /* INTFLAG par canal : TCMPL=0x02, SUSP=0x04 */
-static uint8_t  dmacIntEn[DMAC_CHANNELS];   /* CHINTENSET par canal (lecture) */
-static uint16_t dmaCtrl[DMAC_CHANNELS], dmaCnt[DMAC_CHANNELS], dmaIdx[DMAC_CHANNELS];
-static uint32_t dmaSrc[DMAC_CHANNELS], dmaDst[DMAC_CHANNELS], dmaNext[DMAC_CHANNELS];
-
-static uint16_t fetchHalf(uint32_t a);
-static uint32_t fetchWord(uint32_t a);
-static uint8_t fetchByte(uint32_t a);
-static void writeWord(uint32_t a, uint32_t v);
-static void writeHalf(uint32_t a, uint16_t v);
-static void writeByte(uint32_t a, uint8_t v);
-
-static void dma_sercom4_rx_beat(void);
-static int dmaBeatSkipSd; /* un beat DMA d'affichage ne doit pas horloger la carte */
-static int sdTxCh = -1;   /* canal TX de la carte SD pendant une écriture de secteur */
-static int dma_is_tc4(uint32_t ch) {
-    return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC4_OVF;
-}
-
-static void dma_load(uint32_t ch, uint32_t desc) {
-    uint16_t ctrl = desc ? fetchHalf(desc) : 0;
-    if (!(ctrl & 1u)) { /* VALID absent : fin de chaîne -> canal suspendu */
-        dmaOn[ch] = 0;
-        dmacIntFlag[ch] |= 0x04; /* SUSP */
-        dmacInterrupt = 1;
-        return;
-    }
-    dmaCtrl[ch] = ctrl;
-    dmaCnt[ch] = fetchHalf(desc + 0x02);
-    dmaSrc[ch] = fetchWord(desc + 0x04);
-    dmaDst[ch] = fetchWord(desc + 0x08);
-    dmaNext[ch] = fetchWord(desc + 0x0c);
-    dmaIdx[ch] = 0;
-    dmaOn[ch] = 1;
-}
-
-/* le matériel écrit le descripteur courant dans la banque WRB à chaque
- * fin de bloc (VALID effacé, BTCNT=0) — les libs pollent cette copie
- * pour savoir si un transfert est fini */
-static void dma_wrb_write(uint32_t ch) {
-    if (!dmac_wrbAddr || ch >= DMAC_CHANNELS) return;
-    uint32_t a = dmac_wrbAddr + ch * 0x10;
-    writeHalf(a, (uint16_t)(dmaCtrl[ch] & ~1u));
-    writeHalf(a + 2, 0);
-    writeWord(a + 4, dmaSrc[ch]);
-    writeWord(a + 8, dmaDst[ch]);
-    writeWord(a + 0xc, dmaNext[ch]);
-}
-
-static void dma_beat(uint32_t ch) {
-    if (!dmaOn[ch]) return;
-    if (dmaCnt[ch] == 0) { dma_wrb_write(ch); dma_load(ch, dmaNext[ch]); return; }
-    uint32_t size = 1u << ((dmaCtrl[ch] >> 8) & 3u);           /* BEATSIZE */
-    uint32_t src = dmaSrc[ch], dst = dmaDst[ch];
-    if (dmaCtrl[ch] & (1u << 10)) src += (dmaIdx[ch] - dmaCnt[ch]) * size; /* SRCINC */
-    if (dmaCtrl[ch] & (1u << 11)) dst += (dmaIdx[ch] - dmaCnt[ch]) * size; /* DSTINC */
-    static int dmaDbg = -1;
-    if (dmaDbg < 0) dmaDbg = getenv("EMU_DMA_DEBUG") ? 1 : 0;
-    if (dmaDbg && (dst == 0x42001828u || dst < 0x20000000u)) /* SPI ou canal égaré */
-        fprintf(stderr, "[dma] tick=%u ch=%u beat src=%x dst=%x ctrl=%04x idx=%u cnt=%u\n",
-                tickCount, ch, src, dst, dmaCtrl[ch], dmaIdx[ch], dmaCnt[ch]);
-    if (dst == 0x42001828u && size == 1) {
-        /* beat SPI : n'horloge la carte SD que pour un dummy 0xFF pendant
-         * une transaction active — sinon c'est un pixel du display, et le
-         * collisionneur viderait la file SD au milieu d'un échange CPU */
-        uint8_t b = fetchByte(src);
-        /* pendant l'écriture d'un secteur (CMD24), chaque beat du canal TX
-         * de la carte porte un octet de données ; les beats des autres
-         * canaux (affichage) ne doivent rien horloger ni perturber */
-        int sdClock = sd_selected() &&
-                      (sd_writing ? (int)ch == sdTxCh
-                                  : (b == 0xffu && (sd_outLen != 0 || sd_cmdIdx != 0)));
-        dmaBeatSkipSd = !sdClock;
-        writeByte(dst, b);
-        dmaBeatSkipSd = 0;
-        if (sdClock) dma_sercom4_rx_beat(); /* plein-duplex SD */
-    } else {
-        if (size == 1) writeByte(dst, fetchByte(src));
-        else if (size == 2) writeHalf(dst, fetchHalf(src));
-        else writeWord(dst, fetchWord(src));
-    }
-    if (++dmaIdx[ch] >= dmaCnt[ch]) {
-        /* TCMPL PAR DESCRIPTEUR : le matériel lève l'interruption à chaque
-         * fin de bloc (chaîné ou pas) — les libs comptent les descripteurs
-         * libres via les callbacks de l'ISR (dma_desc_free_count) */
-        dmacIntFlag[ch] |= 0x02;
-        dma_wrb_write(ch);
-        dmacInterrupt = 1;
-        dma_load(ch, dmaNext[ch]); /* suit la chaîne, ou suspend si invalide */
-    }
-}
-
-/* La lib récente lit la carte SD via un canal DMA déclenché par
- * SERCOM4_RX (SdSpiGamebuino.cpp : receive() arme rx = SPI.DATA -> buffer,
- * tx = n x 0xFF, puis attend les deux TCMPL).  Chaque beat TX horloge un
- * octet : le beat RX est son miroir plein-duplex (la réponse vient d'être
- * produite dans ser4_data). */
-static void dma_sercom4_rx_beat(void) {
-    for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++) {
-        /* canaux déclenchés SERCOM4_RX ou armés depuis un descripteur qui
-         * lit SPI.DATA (la lib récente prépare le RX en mémoire) */
-        if (!dmaOn[ch]) continue;
-        if (dmaTrig[ch] != DMAC_TRIG_SERCOM4_RX && dmaSrc[ch] != 0x42001828u) continue;
-        if (dmaCnt[ch] == 0) { dma_wrb_write(ch); dma_load(ch, dmaNext[ch]); continue; }
-        uint32_t size = 1u << ((dmaCtrl[ch] >> 8) & 3u);
-        uint32_t dst = dmaDst[ch];
-        if (dmaCtrl[ch] & (1u << 11)) dst += (dmaIdx[ch] - dmaCnt[ch]) * size;
-        if (size == 1) writeByte(dst, ser4_data);
-        else if (size == 2) writeHalf(dst, ser4_data);
-        else writeWord(dst, ser4_data);
-        if (++dmaIdx[ch] >= dmaCnt[ch]) {
-            dmacIntFlag[ch] |= 0x02;
-            dma_wrb_write(ch);
-            dmacInterrupt = 1;
-            dma_load(ch, dmaNext[ch]);
-        }
-    }
-}
-
-static int dma_tc4_active(void) {
-    for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
-        if (dmaOn[ch] && dmaTrig[ch] == DMAC_TRIG_TC4_OVF) return 1;
-    return 0;
-}
 
 static void irq_inject(uint32_t vector);
 
@@ -2627,53 +2252,19 @@ static uint32_t adc_random(void) {
 
 /* handlers de lecture périphériques enregistrés (comme le TS : consultés
  * pour les accès mot ET octet, jamais demi-mot).  0 = pas de handler. */
-static int dbg(void);
-extern int dbgDac;
 static uint32_t periph_read(uint32_t a, int *handled) {
     *handled = 0;
     if ((a & ~0x1fu) == 0x41004400u) { *handled = 1; return port_read(0, a & 0x1f); }
     if ((a & ~0x1fu) == 0x41004480u) { *handled = 1; return port_read(1, a & 0x1f); }
     if (a == 0x42001818u || a == 0x42001c18u) { *handled = 1; return 0x07; } /* SERCOM4/5 INTFLAG */
-    if (a == 0x42001828u) { *handled = 1;
-        if (dbg() && dbgDac < 6000 && ((portA_out >> 27) & 1) == 0) {
-            /* cartes sélectionnée seulement : le polling CS-haut noie tout */
-            fprintf(stderr, "[dbg] SPI DATA lu <- %02x pc=%x PA27=%d tick=%u\n", ser4_data, regs[15] - 2,
-                    (portA_out >> 27) & 1, tickCount);
-            dbgDac++;
-        }
-        return ser4_data; }                /* SERCOM4 DATA */
+    if (a == 0x42001828u) { *handled = 1; return ser4_data; }                /* SERCOM4 DATA */
     if (a == 0x42001c28u) { *handled = 1; return 0x80; }                     /* SERCOM5 DATA */
-    if (a == 0x4100484eu) { *handled = 1; return dmacIntFlag[dmac_chid & 0xfu]; } /* DMAC CHINTFLAG (fenêtre CHID) */
-    if (a >= 0x4100485eu && a < 0x41004900u && ((a - 0x4100484eu) & 0xfu) == 0) {
-        *handled = 1; return dmacIntFlag[(a - 0x4100484eu) >> 4]; } /* CHINTFLAG indexé (canaux 1+) */
-    if (a >= 0x4100485du && a < 0x41004900u && ((a - 0x4100484du) & 0xfu) == 0) {
-        *handled = 1; return dmacIntEn[(a - 0x4100484du) >> 4]; } /* CHINTENSET indexé */
-    if (a == 0x41004820u) { /* INTPEND : premier canal avec un drapeau levé */
-        *handled = 1;
-        for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++) {
-            if (dmacIntFlag[ch]) {
-                return (ch & 0xfu) | ((dmacIntFlag[ch] & 1u) << 4)
-                     | (((dmacIntFlag[ch] >> 2) & 1u) << 5)
-                     | (((dmacIntFlag[ch] >> 1) & 1u) << 6);
-            }
-        }
-        return 0;
-    }
-    if (a == 0x4200300du) { *handled = 1; return tc4IntEnMask; }             /* TC4 INTENSET */
-    if (a == 0x4200300eu) { *handled = 1; return tc4IntFlagMask; }           /* TC4 INTFLAG */
-    if (a == 0x41004840u && dma_is_tc4(dmac_chid)) {                         /* CHCTRLA ENABLE */
-        *handled = 1; return dmaOn[dmac_chid] ? 0x02 : 0; }
+    if (a == 0x4100484eu) { *handled = 1; return 0x02; }                     /* DMAC CHINTFLAG TCMPL */
     return 0;
 }
 
-static uint32_t periph_read(uint32_t a, int *handled);
-/* alias physique de la flash (0x00400000) : certaines libs y accèdent
- * directement pour leurs données (images embarquées streamees en DMA) */
-#define FLASH_PHYS_BASE 0x00400000u
-
 static uint32_t fetchWord(uint32_t a) {
     if (emuTarget == TGT_POKITTO) return pk_read_word(a);
-    if (a >= FLASH_PHYS_BASE && a < FLASH_PHYS_BASE + FLASH_SIZE) a -= FLASH_PHYS_BASE;
     if (a < 0x20000000u) { if (a + 4 > FLASH_SIZE) return 0;
         return (uint32_t)flash[a] | ((uint32_t)flash[a+1] << 8) |
                ((uint32_t)flash[a+2] << 16) | ((uint32_t)flash[a+3] << 24); }
@@ -2690,25 +2281,17 @@ static uint32_t fetchWord(uint32_t a) {
 
 static uint16_t fetchHalf(uint32_t a) {
     if (emuTarget == TGT_POKITTO) return pk_read_half(a);
-    if (a >= FLASH_PHYS_BASE && a < FLASH_PHYS_BASE + FLASH_SIZE) a -= FLASH_PHYS_BASE;
     if (a < 0x20000000u) { if (a + 2 > FLASH_SIZE) return 0;
         return (uint16_t)(flash[a] | (flash[a+1] << 8)); }
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return 0;
         return (uint16_t)(sram[a] | (sram[a+1] << 8)); }
-    /* demi-mot : le TS ne consultait que l'ADC, mais la lib officielle lit
-     * DMAC INTPEND en ldrh (0x41004820) pour retrouver le canal à service —
-     * les périphériques passent donc par periph_read aussi */
-    if (a >= 0x40000000u && a < 0x60000000u) {
-        if (a == 0x4200401au) return (uint16_t)adc_random();
-        int handled; uint32_t v = periph_read(a & ~1u, &handled);
-        return (uint16_t)v;
-    }
+    /* demi-mot : le TS ne consulte que le hack ADC RESULT */
+    if (a == 0x4200401au) return (uint16_t)adc_random();
     return 0;
 }
 
 static uint8_t fetchByte(uint32_t a) {
     if (emuTarget == TGT_POKITTO) return pk_read_byte(a);
-    if (a >= FLASH_PHYS_BASE && a < FLASH_PHYS_BASE + FLASH_SIZE) a -= FLASH_PHYS_BASE;
     if (a < 0x20000000u) return RD8(a);
     if (a < 0x40000000u) return RD8S(a - 0x20000000u);
     if (a == 0x40000c00u) return 0;           /* GCLK CTRL : pas de reset en cours */
@@ -2723,8 +2306,7 @@ static void writeWord(uint32_t a, uint32_t v);
 static void writeHalf(uint32_t a, uint16_t v);
 static void writeByte(uint32_t a, uint8_t v);
 
-int dbgDac = 0;
-static int dbgTc4Cfg = 0;
+static int dbgTc4Cfg = 0, dbgDac = 0;
 static int dbgEnabled = -1; /* EMU_DEBUG=1 : traces de config périphériques */
 static int dbg(void) {
     if (dbgEnabled < 0) dbgEnabled = getenv("EMU_DEBUG") ? 1 : 0;
@@ -2735,49 +2317,12 @@ static long millisWrites;
 /* montre générique d'écriture (WATCH_ADDR), pour le débogage */
 static long usbWatch;
 static uint32_t watchAddr = 0;
-static uint32_t prevInstPc;  /* PC à l'entrée du pas courant (la boucle le tient à jour) */
-/* programmation flash (auto-patch des loaders) : effet net du NVMCTRL —
- * la valeur écrite est stockée en flash et le code fraîchement écrit est
- * exécuté aux pas suivants.  Les commandes du contrôleur (0x41004000+)
- * restent des no-ops : sur circuit le jeu prépare ses pages puis les
- * programme ; ici seule l'écriture effective compte.  L'alias physique
- * 0x00400000 est accepté en écriture aussi.
- *
- * Build wasm : écritures simplement IGNORÉES (comportement d'avant) — la
- * distribution web privilégie le démarrage partout ; les écrans de boot
- * sont identiques, seuls les auto-patchs des loaders restent inertes. */
-#ifdef __EMSCRIPTEN__
-static void flash_store(uint32_t a, uint32_t v, int bytes) {
-    (void)a; (void)v; (void)bytes;
-}
-#else
-static void flash_store(uint32_t a, uint32_t v, int bytes) {
-    if (a >= FLASH_PHYS_BASE) a -= FLASH_PHYS_BASE;
-    if (a + (uint32_t)bytes > FLASH_SIZE) return;
-    static int nvmDbg = -1;
-    if (nvmDbg < 0) nvmDbg = getenv("NVM_DEBUG") ? 1 : 0;
-    if (nvmDbg) {
-        static int n; if (n < 300) fprintf(stderr, "[nvm] tick=%u pc=%x flash[%x] <- %0*x (%d o)\n",
-                                          tickCount, prevInstPc, a, bytes * 2,
-                                          v & ((1u << (bytes * 8)) - 1), bytes);
-        n++;
-    }
-    uint8_t *p = flash + a;
-    if (bytes == 4) {
-        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-        p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-    } else if (bytes == 2) {
-        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-    } else p[0] = (uint8_t)v;
-}
-#endif /* __EMSCRIPTEN__ */
-
 static void writeWord(uint32_t a, uint32_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_word(a, v); return; }
     if (a == millisWatchAddr) millisWrites++;
-    if (watchAddr && a == watchAddr && usbWatch < 4000)
+    if (watchAddr && a == watchAddr && usbWatch < 40)
         fprintf(stderr, "[watch %x] tick=%u pc=%x val=%08x\n", a, tickCount, regs[15] - 2, v);
-    if (a < 0x20000000u) { flash_store(a, v, 4); return; }
+    if (a < 0x20000000u) return;
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 4 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff;
         sram[a+2] = (v >> 16) & 0xff; sram[a+3] = (v >> 24) & 0xff; return; }
@@ -2785,145 +2330,21 @@ static void writeWord(uint32_t a, uint32_t v) {
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     if (a == 0x42001828u) { sercom4_write((uint8_t)v); return; } /* SERCOM4 DATA */
     if (a == 0x42004808u) { dac_write((uint16_t)v); return; }    /* DAC DATA */
-    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
     if (a == 0x42003018u) { tc4Top = v; return; }                /* TC4 CC0 */
-    if (a == 0x4200300cu) { tc4IntEnMask &= (uint8_t)~v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENCLR */
-    if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET : OVF=0x01 (jeux maison), MC0=0x10 (lib standard) */
-    if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG (acquittement) */
-    /* GCLK GENDIV/GENCTRL : sans effet (la cadence TC4 est dérivée de
-     * CTRLA/CC0, et la fréquence du générateur vaut 48 MHz pour les
-     * configurations audio rencontrées — lib standard comme jeux maison) */
-    if (a == 0x40000c04u || a == 0x40000c08u) return;
+    if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; }/* TC4 INTENSET */
     if (a == 0x41004834u) { dmac_baseAddr = v; return; }
     if (a == 0x41004838u) { dmac_wrbAddr = v; return; }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
-    /* la lib officielle adresse les canaux en INDEXÉ — 16 octets par canal :
-     * Channel[n] = 0x41004840 + n*16, CHCTRLA@+0, CHCTRLB@+4, CHINTENCLR@+C,
-     * CHINTENSET@+D, CHINTFLAG@+E.  Les canaux 1+ (0x50+) arrivent ici ; les
-     * adresses 0x40-0x4F sont la fenêtre CHID (= canal 0 pour la lib, qui
-     * n'écrit jamais CHID) et passent par les handlers CHID ci-dessous. */
-    if (a >= 0x41004850u && a < 0x41004900u) {
-        uint32_t ch = (a - 0x41004840u) >> 4;
-        uint32_t off = (a - 0x41004840u) & 0xfu;
-        if (ch < DMAC_CHANNELS && (off == 0 || off == 4 || (off >= 0xc && off <= 0xe))) {
-            if (off == 0) { /* CHCTRLA */
-                if ((v & 0x03u) == 0x02u) {
-                    uint32_t desc = dmac_baseAddr ? dmac_baseAddr + ch * 0x10 : 0;
-                    if (desc) dma_load(ch, desc);
-                } else dmaOn[ch] = 0; /* SWRST / disable */
-                return;
-            }
-            if (off == 4) { dmaTrig[ch] = (uint8_t)((v >> 8) & 0x3fu); return; } /* CHCTRLB.TRIGSRC */
-            if (off == 0xc) { dmacIntEn[ch] = (uint8_t)~v; return; }  /* CHINTENCLR */
-            if (off == 0xd) { dmacIntEn[ch] = (uint8_t)v; return; }   /* CHINTENSET */
-            if (off == 0xe) {
-                dmacIntFlag[ch] = 0; /* CHINTFLAG (acquitter) */
-                for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-                    if (k != ch && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
-                return;
-            }
-        }
-        return;
-    }
-    if (a == 0x41004844u && dmac_chid < DMAC_CHANNELS) { /* CHCTRLB */
-        /* comme le TS : seul TRIGSRC est retenu ; CMD (RESUME/retigger) est
-         * ignoré — le transfert part de l'écriture CHCTRLA=ENABLE, le
-         * curseur de descripteurs tournant (anneau de la lib) fait le reste */
-        dmaTrig[dmac_chid] = (uint8_t)((v >> 8) & 0x3fu);
-        return;
-    }
-    if (a == 0x4100484eu && dmac_chid < DMAC_CHANNELS) { /* CHINTFLAG : acquittement */
-        dmacIntFlag[dmac_chid] &= (uint8_t)~v;
-        /* l'interruption DMAC est level-triggered sur le hardware : tant
-         * qu'un autre canal attend, le NVIC ré-entre dans le handler — la
-         * lib ne lit INTPEND qu'une fois par entrée */
-        for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-            if (k != dmac_chid && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
-        return;
-    }
-    if (a == 0x41004840u && dma_is_tc4(dmac_chid)) { /* canal audio (TC4) */
-        if ((v & 0x03u) == 0x02u) { if (!dmaOn[dmac_chid]) dma_load(dmac_chid, dmac_baseAddr + dmac_chid * 0x10); }
-        else dmaOn[dmac_chid] = 0; /* SWRST ou désactivation */
-        return;
-    }
-    if (a == 0x41004840u && (v & 0x03u) != 0x02u && spiDmaCh == (int)dmac_chid) {
-        spiDmaCh = -1; dmaOn[dmac_chid] = 0; /* SWRST/désactivation du canal SPI */
-        return;
-    }
-    if (a == 0x41004840u && (v & 0x03u) != 0x02u && dmaTrig[dmac_chid & 0xfu] == DMAC_TRIG_SERCOM4_RX) {
-        dmaOn[dmac_chid & 0xfu] = 0; /* désactivation du canal RX SD */
-        return;
-    }
     if (a == 0x41004840u) { /* CHCTRLA == 2 : transfert via descripteur */
         if (v == 0x02) {
             if (!dmac_desc) dmac_desc = dmac_baseAddr + dmac_chid * 0x10;
-            if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_RX) {
-                /* réception SD : armé seulement — les beats arrivent au
-                 * rythme des octets envoyés (miroir plein-duplex), une
-                 * copie instantanée lirait ici 512x le même octet */
-                dma_load(dmac_chid, dmac_desc);
-                dmac_desc = 0;
-                return;
-            }
-            uint16_t pctrl = fetchHalf(dmac_desc);
-            uint32_t pdst = fetchWord(dmac_desc + 0x08);
-            if (sd_writing) {
-                /* écriture de secteur en cours : l'armement du canal TX de
-                 * la carte doit passer (ce sont ses beats qui portent les
-                 * données) ; ceux de l'affichage seront sautés au beat */
-                if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX || pdst == 0x42001828u)
-                    sdTxCh = (int)dmac_chid;
-            }
-            if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX || pdst == 0x42001828u) {
-                /* écran : beats cadencés par le baud SPI, le CPU vit pendant */
-                dma_load(dmac_chid, dmac_desc);
-                if (dmaOn[dmac_chid]) {
-                    uint32_t b = (spiBaud & 0xFFu) + 1;
-                    spiBeatTicks = (b * 20u + 1u) / 3u; /* 8 bits @ f/2(1+b), 20000 ticks/ms */
-                    if (spiBeatTicks < 1) spiBeatTicks = 1;
-                    spiBeatAcc = 0;
-                    spiDmaCh = (int)dmac_chid;
-                    { static int n; if (n++ < 6)
-                        fprintf(stderr, "[dma spi] ch=%u ctrl=%04x src=%x dst=%x n=%u beats=%u t\n",
-                                (unsigned)dmac_chid, dmaCtrl[dmac_chid], dmaSrc[dmac_chid],
-                                dmaDst[dmac_chid], dmaCnt[dmac_chid], spiBeatTicks); }
-                } else {
-                    static int n; if (n++ < 4)
-                        fprintf(stderr, "[dma spi] ch=%u : descripteur INVALIDE\n", (unsigned)dmac_chid);
-                }
-                dmac_desc = 0;
-                return;
-            }
-            uint16_t ctrl = fetchHalf(dmac_desc);
             uint16_t btcnt = fetchHalf(dmac_desc + 0x02);
             uint32_t src = fetchWord(dmac_desc + 0x04);
             uint32_t dst = fetchWord(dmac_desc + 0x08);
             uint32_t nxt = fetchWord(dmac_desc + 0x0c);
-            /* SAMD21 : SRCADDR/DSTADDR sont des adresses de FIN ; les
-             * drapeaux SRCINC/DSTINC disent si l'on remonte.  BEATSIZE
-             * (octet/demi/mot) respecté — memset32 du jeu (beats mot,
-             * source fixe) sinon n'écrit que 4 octets. */
-            uint32_t size = 1u << ((ctrl >> 8) & 3u);
-            int srcinc = ctrl & (1u << 10), dstinc = ctrl & (1u << 11);
-            if (getenv("EMU_DMA_DEBUG") && btcnt > 100) {
-                unsigned h = 0x811c9dc5;
-                for (uint32_t k = 0; k < btcnt; k++) {
-                    uint32_t s = srcinc ? src + (k - btcnt) * size : src;
-                    if (size == 1) h = (h ^ fetchByte(s)) * 0x01000193u;
-                    else if (size == 2) h = (h ^ fetchHalf(s)) * 0x01000193u;
-                    else h = (h ^ fetchWord(s)) * 0x01000193u;
-                }
-                fprintf(stderr, "[dma] ch=%u src=%x dst=%x n=%u sz=%u lcd_y=%u tick=%u hash=%08x\n",
-                        (unsigned)dmac_chid, src, dst, btcnt, size, lcd_y, tickCount, h);
-            }
-            for (uint16_t i = 0; i < btcnt; i++) {
-                uint32_t s = srcinc ? src + (i - btcnt) * size : src;
-                uint32_t d = dstinc ? dst + (i - btcnt) * size : dst;
-                if (size == 1) writeByte(d, fetchByte(s));
-                else if (size == 2) writeHalf(d, fetchHalf(s));
-                else writeWord(d, fetchWord(s));
-            }
-            dma_wrb_write(dmac_chid);
+            for (uint16_t i = 0; i < btcnt; i++)
+                writeByte(dst, fetchByte(src + i - btcnt));
             dmac_desc = nxt;
             dmacInterrupt = 1; /* verrouillé, traité au prochain step (TS) */
         }
@@ -2933,19 +2354,14 @@ static void writeWord(uint32_t a, uint32_t v) {
 
 static void writeHalf(uint32_t a, uint16_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_half(a, v); return; }
-    if (a < 0x20000000u) { flash_store(a, v, 2); return; }
-    if (watchAddr && a == watchAddr && usbWatch < 4000)
-        fprintf(stderr, "[watch-h %x] tick=%u pc=%x val=%04x\n", a, tickCount, prevInstPc, v);
+    if (a < 0x20000000u) return;
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 2 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff; return; }
     if (a == 0x42004808u) { if (dbg() && dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
-    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
     if (a == 0x42003018u) { tc4Top = v; return; }
-    if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; }
-    if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; }
-    if (a == 0x40000c02u) { if (dbg() && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v); dbgTc4Cfg++; } return; }
-    if (a == 0x40000c04u) { fprintf(stderr, "[gclk] GENDIV <- %x\n", v); return; }
-    if (a == 0x40000c08u) { fprintf(stderr, "[gclk] GENCTRL <- %x\n", v); return; }
+    if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; }
+    if (a == 0x40000c02u) return;                                /* GCLK CLKCTRL */
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     writeWord(a, v);
@@ -2953,18 +2369,11 @@ static void writeHalf(uint32_t a, uint16_t v) {
 
 static void writeByte(uint32_t a, uint8_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_byte(a, v); return; }
-    if (a < 0x20000000u) { flash_store(a, v, 1); return; }
+    if (a < 0x20000000u) return;
     if (a < 0x40000000u) { uint32_t sa = a - 0x20000000u; if (sa < SRAM_SIZE) sram[sa] = v; return; }
-    if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET */
-    if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
+    if (a == 0x4200300du) { if (v & 0x10) tc4Armed = 1; return; } /* TC4 INTENSET */
+    if (a == 0x4200300eu) return;                                 /* TC4 INTFLAG */
     if (a == 0x42001828u) { sercom4_write(v); return; }
-    if (a == 0x4200180au) { spiBaud = v; return; } /* SERCOM4 BAUD (SPI) */
-    if (a == 0x4100484eu) { /* DMAC CHINTFLAG acquittement (fenêtre, octet) */
-        dmacIntFlag[dmac_chid & 0xfu] &= (uint8_t)~v;
-        for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-            if (k != (dmac_chid & 0xfu) && dmacIntFlag[k]) { dmacInterrupt = 1; break; }
-        return;
-    }
     if (a == 0x4100483fu) { dmac_chid = v; return; }
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
@@ -2978,22 +2387,14 @@ static void writeByte(uint32_t a, uint8_t v) {
 
 static void buttons_apply(void);
 
-static uint8_t serLast[8]; static long serIdx; static long serNz;
 static void sercom4_write(uint8_t v) {
-    if (v) serNz++;
-    if (getenv("EMU_DMA_DEBUG")) { serLast[serIdx++ & 7] = v; }
     /* ordre du TypeScript (écran, boutons, carte SD) ; l'octet de réponse
      * repart à 0x80 à chaque échange, les périphériques sélectionnés le
-     * remplacent (sercom-register.ts : this.data = 0x80 puis listeners).
-     * Boutons : PB03 (lib standard) ; PA25 accepté aussi — même registre à
-     * décalage sur le bus, certains jeux maison le pilotent en direct. */
+     * remplacent (sercom-register.ts : this.data = 0x80 puis listeners) */
     ser4_data = 0x80;
     st7735_byte(v);
-    if ((portB_out & (1u << 3)) == 0 || (portA_out & (1u << 25)) == 0)
-        ser4_data = buttonData; /* boutons : PB03 (lib standard) ou PA25
-                                 * (certains jeux maison pilotent ce CS en
-                                 * direct — même registre à décalage) */
-    if (!dmaBeatSkipSd) sd_byte(v);
+    if ((portB_out & (1u << 3)) == 0) ser4_data = buttonData; /* boutons PB03 */
+    sd_byte(v);
 }
 
 /* ---------------------------------------------------------------- CPU */
@@ -3004,41 +2405,20 @@ static void incrementPc(void) {
     regs[15] += 2;
 
     if (emuTarget == TGT_POKITTO) return; /* timers LPC dans pk_machine_step */
-    if (tc4Enabled && tc4Top > 0 && !tc4Armed && dma_tc4_active()) {
-        /* TC4 sans interruption, lu par DMA : cadence fixe, 1 ms = 20000
-         * ticks (SysTick émulé), donc 907 ticks par échantillon à 22 kHz */
-        if (++tc4Counter >= 907u) {
-            tc4Counter = 0;
-            tc4Fires++;
-            for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
-                if (dmaTrig[ch] == DMAC_TRIG_TC4_OVF) dma_beat(ch);
+    if (tc4Enabled && tc4Armed && tc4Top > 0) {
+        /* régulateur du TS : la carte doit produire ~369 échantillons par
+         * frame ; aucun attente -> rapproche les tirs, trop -> les espace */
+        tc4Window++;
+        if (tc4Window >= 4000000u) {
+            uint32_t holds = tc4Fires - tc4Writes;
+            if (holds == 0 && tc4Period > 300) tc4Period -= 10;
+            else if (holds > tc4Fires * 0.6 && tc4Period < 20000) tc4Period += 10;
+            tc4Window = 0; tc4Fires = 0; tc4Writes = 0;
         }
-    } else if (tc4Enabled && tc4Armed && tc4Top > 0) {
-        /* cadence dérivée de la vraie config (MFRQ) : F = GCLK_TC4 /
-         * (prescale × (CC0+1)) ; GCLK audio = 48 MHz (lib standard et jeux
-         * maison), domaine de ticks de l'ému : 20000/ms → période =
-         * prescale × (CC0+1) × 20000/48 = ×5/12.  L'ancien gouverneur
-         * heuristique du TS comprimait la période quand le jeu sert chaque
-         * interruption immédiatement (son qui accélère à l'infini). */
-        static const uint16_t prescTab[8] = {1, 2, 4, 8, 16, 64, 256, 1024};
-        uint32_t cfg = (uint32_t)prescTab[(tc4CtrlA >> 8) & 7u] * (tc4Top + 1) * 5u / 12u;
-        tc4Period = cfg < 2 ? 2 : cfg;
         if (++tc4Counter >= tc4Period) {
             tc4Counter = 0;
             tc4Fires++;
-            tc4IntFlagMask |= tc4IntEnMask & 0x11u; /* OVF/MC0 posés, lus par le handler */
             tc4Interrupt = 1;
-        }
-    }
-    if (spiDmaCh >= 0) { /* beats SPI : un octet tous les spiBeatTicks */
-        if (!dmaOn[spiDmaCh]) { spiDmaCh = -1; }
-        else if (++spiBeatAcc >= spiBeatTicks) {
-            spiBeatAcc = 0;
-            dma_beat(spiDmaCh);
-            if (!dmaOn[spiDmaCh]) { /* bloc terminé : TCMPL */
-                spiDmaCh = -1;
-                dmacInterrupt = 1;
-            }
         }
     }
 }
@@ -3052,9 +2432,7 @@ static uint32_t popStack(void) { uint32_t v = fetchWord(regs[13]); regs[13] += 4
 static uint32_t state_hash(void) {
     uint32_t h = 0x811c9dc5u;
     for (int i = 0; i < 16; i++) { h = (h ^ regs[i]) * 0x01000193u; }
-    /* 32 Ko seulement : comparable au harnais TS (la SRAM étendue au-delà
-     * de 0x8000 ne sert qu'aux buffers SD des libs récentes) */
-    for (uint32_t i = 0; i < 0x8000u; i++) { h = (h ^ sram[i]) * 0x01000193u; }
+    for (int i = 0; i < SRAM_SIZE; i++) { h = (h ^ sram[i]) * 0x01000193u; }
     if (emuTarget == TGT_POKITTO) {
         for (size_t i = 0; i < sizeof pk_sram1; i++) { h = (h ^ pk_sram1[i]) * 0x01000193u; }
         for (size_t i = 0; i < sizeof pk_usbsram; i++) { h = (h ^ pk_usbsram[i]) * 0x01000193u; }
@@ -3084,50 +2462,7 @@ static uint32_t addSetCond(uint32_t a, uint32_t b, int carry) {
 
 static void irq_inject(uint32_t vector);
 
-static uint32_t lastExecPc;  /* PC de l'instruction exécutée au pas précédent */
-
-/* TRACE_TAIL=<n> : tampon circulaire des n dernières lignes de trace ;
- * déversé quand un PC fou est détecté (le tick du crash varie selon les
- * runs) — TRACE_TAIL_OUT=<fichier>, sinon stderr */
-#define TRACE_TAIL_LINES 8192
-static char *traceTail[TRACE_TAIL_LINES];
-static unsigned traceTailCount, traceTailNext, traceTailLen;
-static int traceTailOn = -1;
-
-static void trace_tail_init(void) {
-    const char *e = getenv("TRACE_TAIL");
-    traceTailOn = e ? atoi(e) : 0;
-    if (traceTailOn > TRACE_TAIL_LINES) traceTailOn = TRACE_TAIL_LINES;
-}
-
-static void trace_tail_push(const char *fmt, ...) {
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-    free(traceTail[traceTailNext]);
-    traceTail[traceTailNext] = strdup(buf);
-    traceTailNext = (traceTailNext + 1) % (unsigned)traceTailOn;
-    if (traceTailLen < (unsigned)traceTailOn) traceTailLen++;
-    traceTailCount++;
-}
-
-static void trace_tail_dump(void) {
-    FILE *f = stderr;
-    const char *out = getenv("TRACE_TAIL_OUT");
-    if (out) { f = fopen(out, "w"); if (!f) f = stderr; }
-    fprintf(f, "--- trace_tail (%u lignes) ---\n", traceTailLen);
-    for (unsigned i = 0; i < traceTailLen; i++) {
-        unsigned idx = (traceTailNext + (unsigned)traceTailOn - traceTailLen + i) % (unsigned)traceTailOn;
-        if (traceTail[idx]) fputs(traceTail[idx], f), fputc('\n', f);
-    }
-    if (f != stderr) fclose(f);
-}
-
 static void step(void) {
-    lastExecPc = prevInstPc;
-    prevInstPc = regs[15] - 2;
     /* trace instruction par instruction (comparaison TS) : avant toute
      * injection, état = ce qui va s'exécuter */
     static long stepNo = 0;
@@ -3140,43 +2475,23 @@ static void step(void) {
                 regs[0], regs[1], regs[2], regs[3],
                 regs[4], regs[5], regs[6], regs[7],
                 regs[8], regs[9], regs[10], regs[11], regs[12], regs[14]);
-    if (traceTailOn > 0) /* initialisation paresseuse au premier appel */
-        trace_tail_push("%ld %u %x %04x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x", stepNo, tickCount,
-                regs[15] - 2, fetchHalf(regs[15] - 2), regs[13],
-                regs[0], regs[1], regs[2], regs[3],
-                regs[4], regs[5], regs[6], regs[7],
-                regs[8], regs[9], regs[10], regs[11], regs[12], regs[14]);
-    else if (traceTailOn < 0)
-        trace_tail_init();
     stepNo++;
     if (emuTarget == TGT_POKITTO) {
         /* SysTick, CT32B0/1, broches et SYSRESETREQ (ordre de la référence) */
         pk_machine_step();
     } else {
-        /* CPSID masque les interruptions (PRIMASK) : les sections critiques
-         * du jeu (écritures flash, caches FS) doivent s'exécuter sans
-         * injection — sinon les handlers corrompent ce qu'elles modifient.
-         * Les drapeaux restent posés : le handler part au CPSIE. */
-        if (!primask) {
-            if (tc4Interrupt) {
-                tc4Interrupt = 0;
-                irq_inject(tc4Vector);
-            }
-            if (dmacInterrupt) {
-                dmacInterrupt = 0;
-                irq_inject(dmacVector);
-            }
+        if (tc4Interrupt) {
+            tc4Interrupt = 0;
+            irq_inject(tc4Vector);
         }
-        /* SysTick indépendant du DMAC : la chaîne `else if` du TS affamait
-         * Millis dès qu'une lib streame l'écran en DMA continu (dmacInterrupt
-         * posé à chaque pas) — gb.update() ne s'ouvrait plus jamais */
-        if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
-            if (!primask) {
-                sysTickTrigger = 0;
-                sysTickEntries++;
-                irq_inject(sysTickVector);
-            }
-            /* masqué : le compteur attend, une seule entrée au CPSIE */
+        if (dmacInterrupt) {
+            dmacInterrupt = 0;
+            irq_inject(dmacVector);
+        }
+        else if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
+            sysTickTrigger = 0;
+            sysTickEntries++;
+            irq_inject(sysTickVector);
         }
     }
 
@@ -3217,32 +2532,12 @@ static void step(void) {
     }
     if (emuTarget == TGT_META && instAddr >= 0x42000000u) { /* PC fou : le TS planterait ici — log fort */
         static int wildLogged = 0;
-        if (wildLogged < 3)
+        if (wildLogged < 10)
             fprintf(stderr, "[pc fou] tick=%u pc=%x lr=%x sp=%x\n",
                     tickCount, instAddr, regs[14], regs[13]);
         wildLogged++;
-        if (wildLogged == 1) trace_tail_dump();
-        tickCount += 2; /* pas d'instruction exécutée : avance artificielle,
-                         * sinon les interruptions se figent avec le tick */
         regs[15] = vectorBase + fetchWord(vectorBase + 4);
         return;
-    }
-    /* PC hors flash (et hors SRAM exécutable) : log de diagnostic avec le PC
-     * de l'instruction précédente — WILD_RESET=1 reprend sur le vecteur de
-     * reset au lieu d'exécuter les mauvaises herbes (comportement TS = non) */
-    if (emuTarget == TGT_META && instAddr >= 0x00040000u &&
-        !(instAddr >= 0x20000000u && instAddr < 0x20000000u + SRAM_SIZE)) {
-        static int wildFlashLogged = 0;
-        static int wildReset = -1;
-        if (wildReset < 0) wildReset = getenv("WILD_RESET") ? 1 : 0;
-        if (wildFlashLogged < 3)
-            fprintf(stderr, "[pc fou flash] tick=%u pc=%x prev=%x lr=%x sp=%x r0=%x r1=%x r2=%x r3=%x\n",
-                    tickCount, instAddr, lastExecPc, regs[14], regs[13],
-                    regs[0], regs[1], regs[2], regs[3]);
-        wildFlashLogged++;
-        if (wildFlashLogged == 1) trace_tail_dump();
-        tickCount += 2;
-        if (wildReset) { regs[15] = vectorBase + fetchWord(vectorBase + 4); return; }
     }
     uint16_t inst = fetchHalf(instAddr);
     static int trace = -1;
@@ -3569,13 +2864,9 @@ static void step(void) {
         uint16_t nextInst = fetchHalf(instAddr + 2);
         setReg((nextInst >> 8) & 0xF, regs[13]);
     }
-    else if ((op & 0xf800) == 0xf000) { /* espace 32 bits 0xF000-0xF7FF */
+    else if ((op & 0xf800) == 0xf000) { /* BL : second demi-mot lu paresseusement */
         uint16_t nextInst = fetchHalf(instAddr + 2);
         if ((nextInst & 0xf800) == 0xf800) {
-            /* BL : LR doit pointer APRÈS la paire (bit Thumb posé) — le TS
-             * fixe LR au second demi-mot, l'ancien port laissait
-             * LR = PC + off1<<12 en corrompant tout retour bx lr.
-             * La paire coûte 3 ticks et finit avec PC = cible+2 (état TS). */
             int32_t off1 = op & 0x7ff;
             if (off1 & 0x400) off1 |= ~0x7ff;
             int32_t off2 = nextInst & 0x7ff;
@@ -3595,25 +2886,11 @@ static void step(void) {
             incrementPc(); /* second demi-mot : PC = cible+2 */
             incrementPc(); /* troisième tick de la paire (pas du second demi-mot) */
             regs[15] -= 2; /* état final du TS */
-        } else {
-            /* MRS (0xF3EF 0x8xxx) : Rd <- 0 — mode thread (IPSR = 0) ; les
-             * libs testent « suis-je dans une ISR ? » avec.  MSR, DSB/DMB
-             * et autres 0xF0xx-0xF7FF : paire consommée sans effet.  SANS
-             * ÇA le second demi-mot s'exécutait comme instruction 16 bits
-             * fantôme (STRH sauvage en flash, registres écrasés, tests
-             * IPSR déraillant — écran noir des jeux lib récente). */
-            if ((op & 0xfff0) == 0xf3e0 && (nextInst & 0xf000) == 0x8000)
-                setReg((nextInst >> 8) & 0xF, 0);
-            incrementPc(); /* consomme le second demi-mot */
         }
+        /* demi-mot 0xf0xx isolé : non décodé, on continue (comme le TS) */
     }
-    else if (op == 0xb672) { primask = 1; }  /* CPSID i */
-    else if (op == 0xb662) { primask = 0; }  /* CPSIE i */
-    else if ((op & 0xf000) == 0xe800 || (op & 0xf800) == 0xf800) {
-        /* reste de l'espace 32 bits (0xE800-0xEFFF, 0xF800-0xFFFF : ldr.w,
-         * str.w, udiv… ) : paire consommée comme no-op — le second demi-mot
-         * ne doit jamais s'exécuter seul */
-        incrementPc();
+    else if (op == 0xf3bf || (op & 0xffe0) == 0xf3e0) { /* DMB/MRS : no-op ; le TS ajoute un tick pour DMB seul */
+        if (op == 0xf3bf) incrementPc();
     }
     else {
         /* instruction non décodée : comme le TS, on continue */
@@ -3749,7 +3026,6 @@ static uint8_t key_bit(SDL_Keycode sym) {
 
 static void btn_press(uint8_t mask) {
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 1); return; }
-    if (getenv("EMU_DEBUG")) fprintf(stderr, "[btn] press mask=%02x -> buttonData=%02x\n", mask, (uint8_t)(buttonData & ~mask));
     buttonData &= (uint8_t)~mask;
     if (mask & BTN_HOME) homeHeld = SDL_GetTicks();
 }
@@ -3821,6 +3097,7 @@ static uint8_t joy_hat_bits(SDL_Joystick *joy) {
 }
 
 static char fwPath[1024];
+static const char *fwName = NULL;
 static int fwLoaded;
 static int sd_explicit; /* carte passée explicitement en ligne de commande */
 static int fwNeedsBoot; /* un zip a chargé un firmware : vecteurs à remettre */
@@ -3858,30 +3135,17 @@ static void reset_core(void) {
     memset(regs, 0, sizeof regs);
     memset(regD, 0, sizeof regD);
     fN = fZ = fC = fV = 0;
-    primask = 0;
     tickCount = 0; sysTickTrigger = 0; sysTickEntries = 0;
     sysTickVector = dmacVector = tc4Vector = 0;
     dmacInterrupt = tc4Interrupt = 0;
     dmac_baseAddr = dmac_wrbAddr = dmac_desc = dmac_chid = 0;
-    memset(dmaTrig, 0, sizeof dmaTrig); memset(dmaOn, 0, sizeof dmaOn);
-    /* PA27 (CS carte SD) et PA25 (CS boutons) hauts : lignes désélectionnées
-     * (pull-ups réelles), les périphériques n'écoutent le bus SPI que si le
-     * firmware les sélectionne.  Les jeux sans lib standard (pas de pinMode
-     * early) restent sinon « sélectionnés » en permanence et le trafic SPI
-     * écran part dans la machine SD. */
-    portA_out = (1u << 27) | (1u << 25); /* PA27 (SD) et PA25 (boutons) hauts */
-    portB_out = portA_dir = portB_dir = 0;
+    portA_out = portB_out = portA_dir = portB_dir = 0;
     ser4_data = 0x80;
     tc4Enabled = tc4Armed = 0;
-    tc4IntEnMask = tc4IntFlagMask = 0;
-    tc4CtrlA = 0;
-    spiDmaCh = -1; spiBeatAcc = 0; spiBeatTicks = 7; spiBaud = 0;
-    memset(dmacIntFlag, 0, sizeof dmacIntFlag);
     tc4Top = tc4Counter = 0; tc4Period = 907;
     tc4Window = tc4Fires = tc4Writes = 0;
     lcd_xStart = lcd_xEnd = lcd_yStart = lcd_yEnd = lcd_x = lcd_y = 0;
     lcd_argIndex = lcd_lastCommand = lcd_tmp = 0;
-    lcdBgrSwapped = 0;
     memset(pix, 0, sizeof pix);
     millisWrites = 0;
     aq_head = aq_tail = 0; audioHold = 0;
@@ -4459,13 +3723,7 @@ int main(int argc, char **argv) {
                     for (; k < 16; k++) if (seen[k] == srcp[i]) break;
                     if (k == 16) distinct++;
                 }
-                uint32_t nz = 0;
-                for (unsigned q = 0; q < SCR_W * SCR_H; q += 7) if (srcp[q]) nz++;
-                            fprintf(stderr, "  derniers octets SPI: %02x %02x %02x %02x %02x %02x %02x %02x (nz=%ld/%ld)\n",
-                        serLast[0], serLast[1], serLast[2], serLast[3],
-                        serLast[4], serLast[5], serLast[6], serLast[7], serNz, stWrites);
-                fprintf(stderr, "[frame %u] hash=%08x distinct<=%d nz=%u stWr=%ld ramwr=%ld x=%u y=%u cmd=%02x\n",
-                        frame, h, distinct, nz, stWrites, ramwrTotal, lcd_x, lcd_y, lcd_lastCommand);
+                fprintf(stderr, "[frame %u] hash=%08x distinct<=%d\n", frame, h, distinct);
             }
         }
         /* temps réel : une frame = 1/59,7 s, jamais plus vite.  Échéance
@@ -4505,11 +3763,6 @@ int main(int argc, char **argv) {
     pk_debug_dump();
     pk_eeprom_save();
     pk_card_export();
-    { const char *fd = getenv("FLASH_DUMP"); /* flash après auto-patch du jeu */
-      if (fd && emuTarget == TGT_META) {
-        FILE *g = fopen(fd, "wb");
-        if (g) { fwrite(flash, 1, FLASH_SIZE, g); fclose(g); }
-      } }
     if (audioDev) SDL_CloseAudioDevice(audioDev);
     SDL_DestroyRenderer(emuRen); SDL_DestroyTexture(tex); SDL_DestroyWindow(emuWin);
     SDL_Quit();
@@ -4645,22 +3898,6 @@ static unsigned seenEpoch = 0;
 static double wasmLastFrame = 0;
 static Uint32 hudMs; /* dernier push du HUD dans la page */
 
-static int wasmPaused; /* bouton pause de la page */
-
-EMSCRIPTEN_KEEPALIVE
-void emu_pause(int on) { wasmPaused = on ? 1 : 0; }
-
-EMSCRIPTEN_KEEPALIVE
-void emu_pause_toggle(void) { wasmPaused = !wasmPaused; } /* source de vérité unique : la page relit emu_paused() */
-
-EMSCRIPTEN_KEEPALIVE
-int emu_paused(void) { return wasmPaused; }
-
-EMSCRIPTEN_KEEPALIVE
-void emu_restart(void) {
-    if (fwLoaded) fw_restart(); /* ⏹ de la page : redémarre le jeu courant */
-}
-
 static void wasm_loop(void) {
     if (!poll_events()) emscripten_cancel_main_loop();
     update_diagnostics(wasmFrame);
@@ -4678,7 +3915,7 @@ static void wasm_loop(void) {
     if (wasmLastFrame == 0) wasmLastFrame = now;
     int due = (int)((now - wasmLastFrame) / frameMs);
     if (due > 4) { due = 1; wasmLastFrame = now; }
-    if (fwLoaded && booted && !wasmPaused) {
+    if (fwLoaded && booted) {
         for (int i = 0; i < due; i++) run_emulated_frame();
         wasmFrame += (Uint32)due;
     }
