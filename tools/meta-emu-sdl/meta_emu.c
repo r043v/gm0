@@ -356,6 +356,12 @@ static void sd_process(uint8_t v) {
         if (sd_writeIdx >= 515) {
             sd_writing = 0;
             uint8_t *card = sd_card_data();
+            { static int wd2 = -1;
+              if (wd2 < 0) wd2 = getenv("SD_DEBUG") ? (getenv("SD_DEBUG")[0] == '2' ? 1 : 0) : 0;
+              if (wd2) {
+                fprintf(stderr, "[wr-done] t=%u lba=%u octets[0..23]=", tickCount, sd_writeLba);
+                for (int i = 1; i <= 24; i++) fprintf(stderr, "%02x", sd_writeBuf[i]);
+                fprintf(stderr, "\n"); } }
             if (card && sd_writeBuf[0] == 0xfe) {
                 memcpy(card + (size_t)sd_writeLba * 512, sd_writeBuf + 1, 512);
                 sd_write_persist(sd_writeLba, card + (size_t)sd_writeLba * 512);
@@ -2401,7 +2407,10 @@ static void dma_beat(uint32_t ch) {
          * une transaction active — sinon c'est un pixel du display, et le
          * collisionneur viderait la file SD au milieu d'un échange CPU */
         uint8_t b = fetchByte(src);
-        int sdClock = b == 0xffu && sd_selected() && (sd_outLen != 0 || sd_cmdIdx != 0);
+        /* pendant l'écriture d'un secteur (CMD24), chaque beat porte un
+         * octet de données : tous doivent horloger, pas seulement les 0xFF */
+        int sdClock = sd_selected() &&
+                      (sd_writing || (b == 0xffu && (sd_outLen != 0 || sd_cmdIdx != 0)));
         dmaBeatSkipSd = !sdClock;
         writeByte(dst, b);
         dmaBeatSkipSd = 0;

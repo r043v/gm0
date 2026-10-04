@@ -249,13 +249,22 @@ manquaient, toutes côté émulateur :
 - **acquittement fenêtre** : le clear CHINTFLAG par la fenêtre CHID
   (0x4100484E, octet) était jeté lui aussi.
 
-Reste ouvert : les **deux loaders du site** (Cats & Coins, GB Theft
-Auto) montent la carte (MBR + partition + FAT) puis leur init SD
-maison se fige après CMD8 — elle n'enchaîne pas sur ACMD41.  Leurs
-assets (`CatsAndCoinsDemo/`…) ne sont de toute façon pas distribués
-avec les .bin.  Le TS de référence reste pris en défaut sur ces jeux
-indépendamment (closures de décodage périmées après auto-patch flash)
-: le C est le seul des deux à pouvoir les exécuter.
+Reste ouvert, deux couches :
+- **Yatzy/Reuben** : l'init SD passe (« SD INIT... OK! »), la création
+  de la sauvegarde boucle (écritures FAT/répertoire identiques répétées)
+  — la couche FS du jeu s'attend visiblement à une géométrie ou un
+  format de carte différent (entrées LFN ? racine dans la zone de
+  données ?) ; à rapprocher du format exact des cartes du site ;
+- **les deux loaders** (Cats & Coins, GB Theft Auto) montent la carte
+  puis leur init SD maison se fige après CMD8 (pas d'enchaînement
+  ACMD41).  Leur écran de chargement (motif diagonal répété) est dessiné
+  tel quel par le jeu : trois vérifications indépendantes (réalignment
+  d'un octet par ligne sans effet, pas de dérive constante par ligne,
+  sprites intacts) confirment que le flux SPI est fidèle à ce que le jeu
+  dessine.  Leurs assets (`CatsAndCoinsDemo/`…) ne sont de toute façon
+  pas distribués avec les .bin.  Le TS de référence reste pris en défaut
+  sur ces jeux indépendamment (closures périmées après auto-patch
+  flash) : le C est le seul des deux à pouvoir les exécuter.
 
 Le boot est **paritairement validé contre le fork TypeScript** : mêmes
 hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,
