@@ -400,8 +400,15 @@ static void sd_process(uint8_t v) {
                 memcpy(card + (size_t)sd_writeLba * 512, sd_writeBuf + 1, 512);
                 sd_write_persist(sd_writeLba, card + (size_t)sd_writeLba * 512);
             }
-            /* accepté, puis busy (comme sdcard.ts) */
-            sd_out_push(0x05); sd_out_push(0x00);
+            /* accepté, puis busy (comme sdcard.ts).  Le token de réponse est
+             * déposé dans sd_pending — donc conduit DO dès l'échange suivant —
+             * car la lib officielle (SdFat, SdSpiCard::writeData) lit la
+             * réponse d'écriture en UN seul échange après le CRC ; le décalage
+             * d'un échange du modèle lui faisait lire 0xFF, jugeait l'écriture
+             * échouée et réécrivait le secteur en boucle (« SAVE ERROR Invalid
+             * save file. ») */
+            sd_pending = 0x05;
+            sd_out_push(0x00);
             sd_out_push(0x00); sd_out_push(0xff);
         }
         return;
@@ -595,7 +602,10 @@ static int fat_write_lfn_entries(uint8_t *buf, int off, int cap, const char *lon
         if (off > cap - 32) return off; /* plus de place : sans LFN */
         uint8_t *e = buf + off;
         memset(e, 0xff, 32);
-        e[0] = (uint8_t)(k == 1 ? 0x41 : k);
+        /* l'indicateur « dernière partie » (0x40) marque la PREMIÈRE entrée
+         * physique, qui porte l'ordre le plus haut (spéc FAT, et le SdFat du
+         * guest l'exige : FatFileLFN.cpp refuse une chaîne sans lui) */
+        e[0] = (uint8_t)(k == nents ? 0x40 | nents : k);
         uint16_t chars[13];
         for (int i = 0; i < 13; i++) {
             int idx = (k - 1) * 13 + i;
@@ -4575,6 +4585,11 @@ int main(int argc, char **argv) {
       if (fd && emuTarget == TGT_META) {
         FILE *g = fopen(fd, "wb");
         if (g) { fwrite(flash, 1, FLASH_SIZE, g); fclose(g); }
+      } }
+    { const char *fd = getenv("FAT_DUMP_EXIT"); /* carte SD après la session */
+      if (fd && sd_card_data()) {
+        FILE *g = fopen(fd, "wb");
+        if (g) { fwrite(sd_card_data(), 1, sd_card_size(), g); fclose(g); }
       } }
     if (audioDev) SDL_CloseAudioDevice(audioDev);
     SDL_DestroyRenderer(emuRen); SDL_DestroyTexture(tex); SDL_DestroyWindow(emuWin);

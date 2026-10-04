@@ -1,7 +1,7 @@
 # NOTES — SD / lib officielle / loaders du site (meta-emu-sdl)
 
 > Fichier de travail : À LIRE EN PREMIER à la prochaine session sur ce sujet.
-> Dernière mise à jour : 2026-10-04 (état = modèle précis par défaut, wasm inclus).
+> Dernière mise à jour : 2026-10-04 (état = « SAVE ERROR Invalid save file. » CORRIGÉ).
 
 ## Objectif
 
@@ -9,21 +9,40 @@ Faire démarrer les jeux du site (lib officielle Gamebuino META) dans
 meta-emu-sdl : `wasm/games/*.bin` (Yatzy, Reuben Quest, Cats & Coins,
 GB Theft Auto). Lapinou (homebrew sans lib) fonctionne depuis longtemps.
 
-## ÉTAT ACTUEL (après toutes les corrections de cette session)
+## ÉTAT ACTUEL (après la correction « Invalid save file » du 2026-10-04)
 
-- **Yatzy / Reuben Quest** : « SD INIT... OK! » + création du fichier de
-  sauvegarde (CMD24 vers FAT 2049 et répertoire 2179) — puis
-  **« SAVE ERROR Invalid save file. »** : la couche FS du jeu boucle
-  (réécritures identiques du secteur 2179/2049).  Le protocole SD est
-  bon (mount OK) ; c'est la sémantique FS/geometry qui diverge.
-- **Cats & Coins / GB Theft Auto (loaders)** : montent la carte
-  (MBR+partition+FAT lues) puis gèlent après CMD8 dans leur init SD
-  maison (pas d'ACMD41 derrière).  Leur écran « loading » (motif
-  diagonal bleu/marron) est dessiné tel quel par le jeu — vérifié 3 fois
-  (réalignement octet/ligne sans effet, pas de dérive constante, sprites
-  intacts) : CE N'EST PAS un décalage du flux SPI.
-- **Lapinou, GB loader Zelda** : non-régression OK (25 / 4 couleurs).
-- wasm = même modèle précis que le natif (voir « modèle site » plus bas).
+- **« SAVE ERROR Invalid save file. » : CORRIGÉ** (voir cause racine plus
+  bas).  **Reuben Quest : EN JEU** (scène de ville jouable, vérifié par
+  capture 3600 frames).  **Yatzy** : SD INIT OK, crée son dossier
+  `/YATZY` + `SAVE.SAV` (« YATZ », 64 blocs) + `/SETTINGS.SAV`
+  (170 o, 32 blocs — cohérents avec la lib), atteint sa boucle de
+  menu/titre (PC 0x26ce-0x29f6, E/S SD terminées en ~2 frames) mais
+  **l'écran reste sur le logo boot** : le premier flush LCD du jeu ne
+  passe pas (sujet OUVERT, pas lié au save — EMU_PRESS_A sans effet
+  visible).  Cats & Coins / GB Theft Auto : inchangés (leur init SD
+  maison sans ACMD41, sujet 3 plus bas).
+- **Cause racine du SAVE ERROR** : `SdSpiCard::writeData` (SdFat) lit la
+  réponse d'un CMD24 en **UN seul** échange après le CRC.  Le modèle SD
+  (hérité de sdcard.ts) délivre l'octet « décidé » à l'échange N lors de
+  l'échange N+1 : la réponse 0x05 poussée à la fin du 515e octet n'était
+  lisible qu'à l'échange N+2 — le guest lisait 0xFF, jugeait l'écriture
+  échouée (`error(SD_CARD_ERROR_WRITE)`) et la couche FS réécrivait le
+  secteur 2179 en boucle (168 écritures identiques observées), puis
+  `Save::openFile` relisait des checkbytes faux → « Invalid save file ».
+  **Fix** : à la complétion CMD24, `sd_pending = 0x05` (le token conduit
+  DO dès l'échange suivant) + busy [0x00,0x00,0xFF] en file.
+- **Fix LFN (bonus, vérifié par le SdFat du guest)** : l'indicateur 0x40
+  « dernière partie » était posé sur la DERNIÈRE entrée physique
+  (ord=0x41 sur la partie 1) au lieu de la PREMIÈRE (ord=0x40|nents).
+  FatFileLFN.cpp du guest refuse une chaîne sans le flag → tout open()
+  par nom long aurait échoué (assets des jeux).  Corrigé dans
+  `fat_write_lfn_entries`.
+- **Lapinou (25 couleurs), GB loader Zelda (4 couleurs), `ctest -R meta`
+  8/8** : non-régression OK.  ATTENTION invocation zedtest : firmware
+  PUIS dossier — `./meta_emu wasm/zedtest/firmware.bin wasm/zedtest`
+  (un seul arg dossier = carte sans firmware, écran noir).
+- wasm et meta-emu-standalone.html reconstruits avec le fix (make wasm +
+  make single).
 
 ## Les 3 causes racines historiques (toutes corrigées, à ne pas casser)
 
@@ -107,28 +126,34 @@ GARDER mais ne pas activer par défaut ; le modèle précis est meilleur.
 
 ## Pistes pour la suite (ordre proposé)
 
-1. **Obtenir un .zip réel du site** (page de téléchargement du jeu,
+1. **Yatzy — premier flush LCD** : le jeu atteint son menu (code de
+   dessin + attente boutons en 0x26ce-0x29f6, plus aucune E/S SD après
+   ~2 frames) mais l'écran reste sur le logo boot.  Chercher pourquoi le
+   premier `display.update` du jeu ne sort pas (DMA display armé et
+   déclenché ? attente TCMPL ?).  EMU_PRESS_A=<frame> existe pour
+   piloter le menu en headless (6 frames d'appui).
+2. **Obtenir un .zip réel du site** (page de téléchargement du jeu,
    bouton « télécharger ») : il contient les assets
    (`CatsAndCoinsDemo/TITLESCREEN.BMP`…) et surtout la carte/structure
    telle que le site la sert.  Comparer la géométrie et les entrées
    (LFN présentes ?) avec notre constructeur.
-2. **Yatzy save loop** : la couche FS du jeu réécrit des secteurs
-   identiques → comparer notre secteur 2179 écrit avec ce que SdFat
-   écrirait (entrées LFN « YATZY », « SETTINGS » présentes dans le
-   flux !) — peut-être lié au (1).
-3. **Loaders CMD8** : leur script n'enchaîne pas d'ACMD41 ; tracer
-   l'interpréteur (0xa67c) avec la table de commandes construite
-   dynamiquement (pas de table statique dans le .bin — vérifié).
-4. **Skip du loader** (dernier recours, demandé par l'utilisateur mais
-   « pas une vraie solution ») : nécessite l'analyse par binaire du
-   point d'entrée du jeu derrière le loader.
+3. **Loaders CMD8** (Cats & Coins, GB Theft Auto) : leur script
+   n'enchaîne pas d'ACMD41 ; tracer l'interpréteur (0xa67c) avec la
+   table de commandes construite dynamiquement (pas de table statique
+   dans le .bin — vérifié).
+4. **Input dans Reuben (et les jeux lib officielle)** : vérifier que les
+   boutons passent en jeu (le rendu est bon ; le chemin boutons est le
+   même que lapinou mais non testé sur ces jeux).
 
 ## Outils de débogage (dans meta_emu.c, natif)
 
 - `SD_DEBUG=1` : toutes les commandes SD.  `SD_DEBUG=2` : échange octet
   par octet (`[sdx]`) + contenu des secteurs écrits (`[wr-done]`).
 - `NVM_DEBUG=1` : écritures flash.  `FLASH_DUMP=fichier` : dump flash
-  fin de run.  `FAT_DUMP=fichier` : dump de la carte construite.
+  fin de run.  `FAT_DUMP=fichier` : dump de la carte à la construction.
+  `FAT_DUMP_EXIT=fichier` : dump de la carte EN FIN de run (état après
+  les écritures du guest — c'est lui qui montre les fichiers créés).
+- `EMU_PRESS_A=<frame>` : appuie sur A pendant 6 frames (menus headless).
 - `EMU_SITE=1` : modèle d'appareil du site v12 (expérimental, noir sur
   les loaders).  `EMU_DMA_DEBUG=1` : beats DMA.  `EMU_TRACE=1` :
   échantillonnage PC ; `TRACE_ALL=1 TRACE_FROM=t` : trace 1:1 (format
@@ -141,11 +166,14 @@ GARDER mais ne pas activer par défaut ; le modèle précis est meilleur.
 
     cd tools/meta-emu-sdl
     make && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-      ./meta_emu wasm/games/yatzy.bin wasm/games --frames 1800 \
-      --shot /tmp/y.ppm
-    # attendu : « GAMEBUINO / SD INIT... OK! » (+ SAVE ERROR, open item)
+      ./meta_emu wasm/games/reuben-quest-lost-between-times.bin wasm/games \
+      --frames 3600 --shot /tmp/r.ppm
+    # attendu : scène de ville jouable (le save se crée sans SAVE ERROR)
     SD_DEBUG=1 ./meta_emu wasm/games/yatzy.bin wasm/games --frames 900
-    # attendu : CMD0, CMD8, CMD41, CMD58, CMD17 (0, 2048, 2179, 2049), CMD24…
+    # attendu : mount, puis création /YATZY + SAVE.SAV + /SETTINGS.SAV
+    # (CMD24 2179/2049/2114 + clusters data), PLUS AUCUNE boucle CMD24 2179
+    # (le yatzy reste sur le logo boot — open item « premier flush LCD »)
 
-Non-régression : lapinou 25 couleurs, GB loader Zelda (wasm/zedtest)
-4 couleurs, Pokitto = parité baseline, `ctest -R meta` 8/8.
+Non-régression : lapinou 25 couleurs, GB loader Zelda 4 couleurs
+(`./meta_emu wasm/zedtest/firmware.bin wasm/zedtest`, firmware PUIS
+dossier), `ctest -R meta` 8/8.
