@@ -283,19 +283,18 @@ protocole DMA réel de la lib, désormais modélisé (datasheet SAM-D21) :
   statut après chaque écriture, « illegal command » bouclait le CMD24
   (« SAVE ERROR »).
 
-Reste ouvert, deux couches :
-- **Yatzy** : « SD INIT... OK! » s'affiche désormais mais le menu n'est
-  toujours pas dessiné (open item « premier flush ») ;
-- **les deux loaders** (Cats & Coins, GB Theft Auto) montent la carte
-  puis leur init SD maison se fige après CMD8 (pas d'enchaînement
-  ACMD41).  Leur écran de chargement (motif diagonal répété) est dessiné
-  tel quel par le jeu : trois vérifications indépendantes (réalignment
-  d'un octet par ligne sans effet, pas de dérive constante par ligne,
-  sprites intacts) confirment que le flux SPI est fidèle à ce que le jeu
-  dessine.  Leurs assets (`CatsAndCoinsDemo/`…) ne sont de toute façon
-  pas distribués avec les .bin.  Le TS de référence reste pris en défaut
-  sur ces jeux indépendamment (closures périmées après auto-patch
-  flash) : le C est le seul des deux à pouvoir les exécuter.
+**Cats and Coins, Picomon, Yatzy : fonctionnels** (écrans titre/menus,
+puis jeu — voir NOTES, « Le bug BLX »).  Deux correctifs décisifs du
+2026-10-05 :
+
+- **BLX rm** : le registre était lu sur 3 bits au lieu de 4 — tout
+  `blx r8..r15` (idiome des appels virtuels GCC : `mov ip, r1 ;
+  blx ip`) sautait vers r0-r7 et plongeait dans la flash effacée
+  (écran figé sans message).  C'était LA cause des « jeux bloqués » ;
+- **TC5 (0x42003400, IRQ20)** : l'audio de la lib officielle
+  (`Sound::begin`, streaming WAV dans l'ISR) ; les jeux lib à musique
+  attendaient leur tampon pour toujours.  Modélisé en miroir de TC4,
+  sortie SDL calée sur sa cadence (44,1 kHz −250 ppm pour Picomon).
 
 Le boot est **paritairement validé contre le fork TypeScript** : mêmes
 hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,

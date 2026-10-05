@@ -222,7 +222,13 @@ CMD8), pas des chemins de chargement.
 
 ## ANALYSES DÉTAILLÉES DES ÉTATS OUVERTS
 
-### Yatzy — menu noir (pipeline OK, contenu vide)
+### Yatzy — menu noir (pipeline OK, contenu vide) — RÉSOLU 2026-10-05
+
+**Cause racine (voir « Le bug BLX » plus bas) : le décodeur `blx rm`
+lisaient rm sur 3 bits — `blx ip` (r12) exécutait `blx r4`.** Avec le
+fix, Yatzy affiche son menu (SOLO GAME / PLAYER GAME / SCORES) dès
+900 frames (2 couleurs au banc : texte blanc sur noir, c'est l'écran
+du menu).
 
 - Séquence : boot lib (logo + « SD INIT... OK! ») → mount ✓ → création
   /YATZY + SETTINGS.SAV ✓ → relecture du save (LBA 3451..3458) ✓ →
@@ -236,7 +242,23 @@ CMD8), pas des chemins de chargement.
   les .bin des jeux) — **obtenir le .zip officiel de Yatzy** et
   re-tester avant d'instrumenter plus.
 
-### Picomon — écran noir après validation du titre
+### Picomon — écran noir après validation du titre — RÉSOLU 2026-10-05
+
+Deux causes, toutes côté émulateur :
+
+1. **Le bug BLX** (voir plus bas) — l'appui sur A menait à un appel
+   virtuel `blx ip` exécuté `blx r4` (r4=1 → PC=0 → flash effacée).
+2. **TC5 non modélisé** : l'audio de la lib officielle tourne sur TC5
+   (0x42003400, IRQ20 — `Sound::begin` → `tcConfigure` : COUNT16 MFRQ
+   DIV1, CC0 = 48 MHz/SOUND_FREQ − 1 (44100), INTENSET.MC0 ;
+   `TC5_Handler` = `Audio_Handler` qui mixe et **stream les WAV depuis
+   la SD** dans l'ISR).  Sans TC5, plus aucun accès SD après l'appui et
+   le jeu attend son tampon audio pour toujours.  Modélisé en miroir de
+   TC4 (registres +0x400, cadence `tc5_period_ticks`, sortie SDL
+   ré-ouverte à 44040 Hz = 44100 −250 ppm, trigger DMA TC5_OVF 0x1C).
+
+Résultat : titre animé (16 couleurs au banc — la valeur de référence),
+A → sauvegarde puis ÉCRAN DE JEU (« ×RINGRING× »), DAC à 44100/s.
 
 - .bin ou .zip (réparé) : titre animé ✓ (sprites, crédits, 60 fps).
 - `EMU_PRESS_A` (validation ; MENU est sans effet) → écran 100 % noir
@@ -271,7 +293,17 @@ CMD8), pas des chemins de chargement.
 - wasm et meta-emu-standalone.html reconstruits avec le fix (make wasm +
   make single).
 
-### Cats and Coins (démo) — gel après « SD INIT... OK! » (analyse 2026-10-05)
+### Cats and Coins (démo) — gel après « SD INIT... OK! » — RÉSOLU 2026-10-05 (bug BLX)
+
+**La plongée dans la flash effacée était un `blx ip` décodé `blx r4`
+(le bug BLX, voir plus bas) — pas un état de jeu ni des assets
+manquants.**  Avec le fix : écran titre complet (artwork « CATS and
+COINS »), A → menu « PLAY MODE » (Move/Jump/Crouch/Drop down/Switch to
+edit mode).  Le bin n'a jamais eu besoin d'autres fichiers.
+
+L'analyse ci-dessous (conservée pour le journal) avait correctement
+identifié le round-trip SD exact et le point de rupture, mais avait
+mal interprété la destination du saut :
 
 - Le bin du site est **identique** à notre copie (MD5
   00a9f5dca572c0a53e461346386aeab2, servi sans AUCUN asset :
@@ -297,6 +329,23 @@ CMD8), pas des chemins de chargement.
 - État accepté : 4 couleurs au banc (logo + SD INIT OK), déterministe
   (3 runs, même hash). Réessayer si un zip officiel complet refait
   surface (le « Download » du site sert le projet source, pas le bin).
+
+## Le bug BLX (2026-10-05 — cause racine de TOUS les « états ouverts »)
+
+Le décodeur `BLX rm` (format T2, 0x47C0..0x47FF) lisait le registre sur
+**3 bits** (`(op >> 3) & 7`) au lieu de **4** ([6:3]) : tout
+`blx r8..r15` exécutait `blx r0..r7`.  L'idiome GCC des appels
+virtuels — `ldr r1, [r3, #0x14] ; mov ip, r1 ; blx ip` — sautait donc
+vers **r4** (souvent 1 ou une valeur sans rapport) : PC=0, puis
+exécution de la flash effacée sous 0x4000, écran figé sans aucun
+message.  BX haut (0x4D) et MOV haut étaient corrects ; seul BLX était
+cassé.  Les jeux touchés : Cats (boot), Picomon (après A), Yatzy
+(menu) — tous « bloqués » dans les analyses antérieures pour de
+mauvaises raisons (assets, FS, géométrie carte).  Fix : `& 0xF`.
+
+Enseignement : quand un jeu « se fige sans message », vérifier
+d'abord PC < 0x4000 (flash effacée) — signature d'un saut folle — avant
+d'incriminer les périphériques.
 
 ## Les 3 causes racines historiques (toutes corrigées, à ne pas casser)
 

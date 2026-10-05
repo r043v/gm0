@@ -93,7 +93,7 @@ static int fN, fZ, fC, fV;
 static uint32_t tickCount;
 static int sysTickTrigger;
 static uint32_t vectorBase;
-static uint32_t sysTickVector, dmacVector, tc4Vector;
+static uint32_t sysTickVector, dmacVector, tc4Vector, tc5Vector;
 static int dmacInterrupt, tc4Interrupt;
 static long sysTickEntries;
 
@@ -113,9 +113,20 @@ static uint8_t  tc4IntEnMask, tc4IntFlagMask; /* INTENSET/INTFLAG lisibles (jeux
 static int      primask; /* CPSID/CPSIE : masque les injections d'interruptions */
 static int      sysTickCountFlag; /* SysTick CSR.COUNTFLAG : wrap CVR depuis la dernière lecture */
 static uint32_t tc4CtrlA; /* valeur complète de CTRLA (prescaler bits 8-10) */
-static uint32_t tc4Top, tc4Counter, tc4Period = 2177;
+static uint32_t tc4Top, tc4Counter, tc4Period = 907;
 static uint32_t tc4Window, tc4Fires, tc4Writes;
 static int      tc4Interrupt;
+
+/* TC5 (0x42003400, IRQ20) : l'audio de la lib officielle (Sound::begin →
+ * tcConfigure, TC5_Handler = Audio_Handler, INTENSET.MC0, CC0 =
+ * 48 MHz/SOUND_FREQ − 1).  Sound_Handler_Wav::update stream les WAV
+ * depuis cette ISR : sans elle, les jeux lib à musique (Picomon) vident
+ * leur tampon et attendent pour toujours — écran noir après le titre. */
+static int      tc5Enabled, tc5Armed;
+static uint8_t  tc5IntEnMask, tc5IntFlagMask;
+static uint32_t tc5CtrlA, tc5Top, tc5Counter, tc5Period;
+static uint32_t tc5Fires;
+static int      tc5Interrupt;
 
 /* ST7735 */
 static uint16_t pix[MAX_SCREEN_W * MAX_SCREEN_H];
@@ -338,15 +349,17 @@ static double emuDacRate = 22049.0;
 static void meta_audio_reopen(double freq); /* défini avec le bloc SDL */
 #define AUDIO_CONSUME_SLIP 0.9975 /* −250 ppm : récupération du ring, pitch +0,25 % (inaudible) */
 
-/* période TC4 en ticks émulés : prescale × (CC0+1) cycles du GCLK 48 MHz,
- * ramenés au domaine de ticks (× emuTicksPerUs/48, arrondi au plus
- * proche ; ×1 au domaine natif 48 MHz, ×5/12 dans le domaine TS 20 MHz) */
-static uint32_t tc4_period_ticks(void) {
+/* période TC4/TC5 en ticks émulés : prescale × (CC0+1) cycles du GCLK
+ * 48 MHz, ramenés au domaine de ticks (× emuTicksPerUs/48, arrondi au
+ * plus proche ; ×1 au domaine natif 48 MHz, ×5/12 dans le domaine TS) */
+static uint32_t tc_period_ticks(uint32_t ctrlA, uint32_t top) {
     static const uint16_t prescTab[8] = {1, 2, 4, 8, 16, 64, 256, 1024};
-    uint32_t cycles = (uint32_t)prescTab[(tc4CtrlA >> 8) & 7u] * (tc4Top + 1u);
+    uint32_t cycles = (uint32_t)prescTab[(ctrlA >> 8) & 7u] * (top + 1u);
     uint32_t per = (uint32_t)(((uint64_t)cycles * emuTicksPerUs + 24u) / 48u);
     return per < 2 ? 2 : per;
 }
+static uint32_t tc4_period_ticks(void) { return tc_period_ticks(tc4CtrlA, tc4Top); }
+static uint32_t tc5_period_ticks(void) { return tc_period_ticks(tc5CtrlA, tc5Top); }
 
 static double tc4_config_rate(void) {
     return ticks_per_sec() / (double)tc4_period_ticks() * AUDIO_CONSUME_SLIP;
@@ -2653,6 +2666,7 @@ static uint32_t dmac_baseAddr, dmac_wrbAddr, dmac_desc, dmac_chid;
  * (invalide ou nul -> canal arrêté, comme une erreur de fetch). */
 #define DMAC_CHANNELS 12
 #define DMAC_TRIG_TC4_OVF 0x1bu /* TC4_DMAC_ID_OVF (SAMD21) */
+#define DMAC_TRIG_TC5_OVF 0x1cu /* TC5_DMAC_ID_OVF */
 #define DMAC_TRIG_SERCOM4_TX 0x0au /* SERCOM4_DMAC_ID_TX (écran) */
 #define DMAC_TRIG_SERCOM4_RX 0x09u /* SERCOM4_DMAC_ID_RX (carte SD, lib récente) */
 /* DMA SPI cadencé : les beats sortent au rythme du baud SERCOM4 (le CPU
@@ -2683,6 +2697,9 @@ static int emuSiteModel = -1; /* modèle d'appareil du site (v12) : runtime, tes
 static int sdTxCh = -1;   /* canal TX de la carte SD pendant une écriture de secteur */
 static int dma_is_tc4(uint32_t ch) {
     return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC4_OVF;
+}
+static int dma_is_tc5(uint32_t ch) {
+    return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC5_OVF;
 }
 
 static void dma_load(uint32_t ch, uint32_t desc) {
@@ -2923,6 +2940,8 @@ static uint32_t periph_read(uint32_t a, int *handled) {
     }
     if (a == 0x4200300du) { *handled = 1; return tc4IntEnMask; }             /* TC4 INTENSET */
     if (a == 0x4200300eu) { *handled = 1; return tc4IntFlagMask; }           /* TC4 INTFLAG */
+    if (a == 0x4200340du) { *handled = 1; return tc5IntEnMask; }             /* TC5 INTENSET */
+    if (a == 0x4200340eu) { *handled = 1; return tc5IntFlagMask; }           /* TC5 INTFLAG */
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) {                         /* CHCTRLA ENABLE */
         *handled = 1; return dmaOn[dmac_chid] ? 0x02 : 0; }
     return 0;
@@ -3074,6 +3093,11 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == 0x42004808u) { if (emuSiteModel <= 0) dac_write((uint16_t)v); return; }    /* DAC DATA */
     if (a == 0x42003000u) { if (emuSiteModel > 0) return; if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
     if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }                /* TC4 CC0 */
+    if (a == 0x42003400u) { if (emuSiteModel > 0) return; tc5CtrlA = v; tc5Enabled = (v & 0x02) != 0; if (!tc5Enabled) tc5Counter = 0; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks() * AUDIO_CONSUME_SLIP; if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }  /* TC5 CTRLA */
+    if (a == 0x42003418u) { tc5Top = v; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks() * AUDIO_CONSUME_SLIP; if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }  /* TC5 CC0 */
+    if (a == 0x4200340cu) { tc5IntEnMask &= (uint8_t)~v; tc5Armed = (tc5IntEnMask & 0x33) != 0; return; } /* TC5 INTENCLR */
+    if (a == 0x4200340du) { tc5IntEnMask |= (uint8_t)v; tc5Armed = (tc5IntEnMask & 0x33) != 0; return; } /* TC5 INTENSET : MC0=0x10 (lib) */
+    if (a == 0x4200340eu) { tc5IntFlagMask &= (uint8_t)~v; return; }             /* TC5 INTFLAG */
     if (a == 0x4200300cu) { tc4IntEnMask &= (uint8_t)~v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENCLR */
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET : OVF=0x01 (jeux maison), MC0=0x10 (lib standard) */
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG (acquittement) */
@@ -3305,6 +3329,10 @@ static void writeHalf(uint32_t a, uint16_t v) {
     if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; }
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; }
+    if (a == 0x42003400u) { if (emuSiteModel > 0) return; tc5CtrlA = v; tc5Enabled = (v & 0x02) != 0; if (!tc5Enabled) tc5Counter = 0; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks() * AUDIO_CONSUME_SLIP; if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
+    if (a == 0x42003418u) { tc5Top = v; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks() * AUDIO_CONSUME_SLIP; if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
+    if (a == 0x4200340du) { tc5IntEnMask |= (uint8_t)v; tc5Armed = (tc5IntEnMask & 0x33) != 0; return; }
+    if (a == 0x4200340eu) { tc5IntFlagMask &= (uint8_t)~v; return; }
     if (a == 0x40000c02u) { if (dbg() && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v); dbgTc4Cfg++; } return; }
     if (a == 0x40000c04u) { fprintf(stderr, "[gclk] GENDIV <- %x\n", v); return; }
     if (a == 0x40000c08u) { fprintf(stderr, "[gclk] GENCTRL <- %x\n", v); return; }
@@ -3321,7 +3349,9 @@ static void writeByte(uint32_t a, uint8_t v) {
     if (a < 0x40000000u) { uint32_t sa = a - 0x20000000u; if (sa < SRAM_SIZE) sram[sa] = v; return; }
     if (emuSiteModel > 0) return; /* modèle du site */
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET */
-    if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
+    if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; }
+    if (a == 0x4200340du) { tc5IntEnMask |= (uint8_t)v; tc5Armed = (tc5IntEnMask & 0x33) != 0; return; } /* TC5 INTENSET */
+    if (a == 0x4200340eu) { tc5IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
     if (a == 0x42001828u) { sercom4_write(v); return; }
     if (a == 0x4200180cu || a == 0x4200180au) { spiBaud = v; return; } /* SERCOM4 BAUD (SPI : 0x0C ; 0x0A = compat TS) */
     if (a == 0x4100484eu) { /* DMAC CHINTFLAG acquittement (fenêtre, octet) */
@@ -3413,7 +3443,29 @@ static void incrementPc(void) {
             for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
                 if (dmaTrig[ch] == DMAC_TRIG_TC4_OVF) dma_beat(ch);
         }
-    } else if (tc4Enabled && tc4Armed && tc4Top > 0) {
+    }
+    if (tc5Enabled && tc5Top > 0 && !tc5Armed && dma_is_tc5(dmac_chid)) {
+        /* TC5 lu par DMA (audio DMA lib) : même cadence que TC4 */
+        uint32_t per = tc5_period_ticks();
+        if (++tc5Counter >= per) {
+            tc5Counter = 0;
+            tc5Fires++;
+            for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
+                if (dmaTrig[ch] == DMAC_TRIG_TC5_OVF) dma_beat(ch);
+        }
+    }
+    if (tc5Enabled && tc5Armed && tc5Top > 0) {
+        /* interruption TC5 : l'audio de la lib (Audio_Handler → mixer +
+         * streaming WAV depuis la SD) */
+        tc5Period = tc5_period_ticks();
+        if (++tc5Counter >= tc5Period) {
+            tc5Counter = 0;
+            tc5Fires++;
+            tc5IntFlagMask |= tc5IntEnMask & 0x11u; /* OVF/MC0 */
+            tc5Interrupt = 1;
+        }
+    }
+    if (tc4Enabled && tc4Armed && tc4Top > 0) {
         /* cadence dérivée de la vraie config (MFRQ) : F = GCLK_TC4 /
          * (prescale × (CC0+1)) ; GCLK audio = 48 MHz (lib standard et jeux
          * maison).  L'ancien gouverneur heuristique du TS comprimait la
@@ -3570,6 +3622,10 @@ static void step(void) {
             if (tc4Interrupt) {
                 tc4Interrupt = 0;
                 irq_inject(tc4Vector);
+            }
+            if (tc5Interrupt) {
+                tc5Interrupt = 0;
+                irq_inject(tc5Vector);
             }
             if (dmacInterrupt) {
                 dmacInterrupt = 0;
@@ -3819,7 +3875,10 @@ static void step(void) {
                                  * (IAP/division) interceptée avant le saut */
                 if (emuTarget == TGT_POKITTO) { pk_blx(op); break; }
                 setReg(14, (regs[15] - 2) | 1);
-                setReg(15, regs[(op >> 3) & 7] & ~1u);
+                /* rm est sur 4 bits [6:3] : les appels virtuels du GCC
+                 * (`mov ip, r1 ; blx ip`) visaient r0-r7 (ip=r12 lu r4) et
+                 * atterrissaient dans le vide — écran noir Picomon/Cats */
+                setReg(15, regs[(op >> 3) & 0xFu] & ~1u);
                 incrementPc();
                 break;
         }
@@ -4266,7 +4325,7 @@ static void reset_core(void) {
     fN = fZ = fC = fV = 0;
     primask = 0;
     tickCount = 0; sysTickTrigger = 0; sysTickEntries = 0;
-    sysTickVector = dmacVector = tc4Vector = 0;
+    sysTickVector = dmacVector = tc4Vector = tc5Vector = 0;
     dmacInterrupt = tc4Interrupt = 0;
     dmac_baseAddr = dmac_wrbAddr = dmac_desc = dmac_chid = 0;
     for (uint32_t k = 0; k < DMAC_CHANNELS; k++) {
@@ -4285,6 +4344,10 @@ static void reset_core(void) {
     tc4Enabled = tc4Armed = 0;
     tc4IntEnMask = tc4IntFlagMask = 0;
     tc4CtrlA = 0;
+    tc5Enabled = tc5Armed = 0;
+    tc5IntEnMask = tc5IntFlagMask = 0;
+    tc5CtrlA = tc5Top = tc5Counter = 0;
+    tc5Fires = 0; tc5Interrupt = 0;
     spiDmaCh = -1; spiBeatAcc = 0; spiBeatTicks = 7; spiBaud = 0;
     memset(dmacIntFlag, 0, sizeof dmacIntFlag);
     tc4Top = tc4Counter = 0; tc4Period = 907;
@@ -4456,8 +4519,9 @@ static void boot_vectors(void) {
     sysTickVector = fetchWord(vectorBase + 0x3c) & ~1u;
     dmacVector = fetchWord(vectorBase + 0x58) & ~1u;
     tc4Vector = fetchWord(vectorBase + 0x8c) & ~1u;
-    fprintf(stderr, "SP=%08x PC=%08x systick=%08x dmac=%08x tc4=%08x\n",
-            regs[13], regs[15], sysTickVector, dmacVector, tc4Vector);
+    tc5Vector = fetchWord(vectorBase + 0x90) & ~1u;
+    fprintf(stderr, "SP=%08x PC=%08x systick=%08x dmac=%08x tc4=%08x tc5=%08x\n",
+            regs[13], regs[15], sysTickVector, dmacVector, tc4Vector, tc5Vector);
 }
 
 static void refresh_title(void) {
