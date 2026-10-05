@@ -1756,6 +1756,8 @@ static uint32_t pk_aqStart, pk_aqEnd, pk_aqSize;
 static float pk_audioHoldF;
 static uint8_t pk_prevData = 0xFF;
 static uint32_t pk_prevTicks;
+static unsigned long pk_latchCount, pk_ctIrqCount, pk_ctCross, pk_irq34, pk_latchMid, pk_latchSound;
+#define QADDR 0x20000000u /* .bss_ram1 : pokitto_audio_q (tail, head, ring) */
 
 
 enum { PK_HLE_DETECT, PK_HLE_DISABLED, PK_HLE_ENABLED };
@@ -1800,6 +1802,14 @@ static void pk_audio_gpio_write(void);
 static void pk_audio_write(uint8_t data) {
     if (pk_hleState == PK_HLE_ENABLED) return;
     pk_prevData = data;
+    pk_latchCount++;
+    if (pk_latchCount > 44000) { /* après le boot : ce qui est réellement joué */
+        if (data == 128) pk_latchMid++;
+        else { pk_latchSound++;
+            if (pk_latchSound == 1 || pk_latchSound == 1000 || pk_latchSound == 100000)
+                fprintf(stderr, "[val] latch#%lu val=%u tick=%u\n", pk_latchSound, data, tickCount);
+        }
+    }
     float clock = (float)pk_core_hz();
     float delta = (float)(uint32_t)(tickCount - pk_prevTicks) / clock;
     pk_prevTicks = tickCount;
@@ -2035,6 +2045,7 @@ static uint32_t pk_ct_tick(struct pk_ct *ct, uint32_t num, uint32_t delta) {
         uint32_t mri = 1u << (m * 3), mrr = 1u << (m * 3 + 1), mrs = 1u << (m * 3 + 2);
         uint32_t mr = ct->r[6 + (uint32_t)m];
         if (oldTC < mr && ct->r[PK_CT_TC] >= mr) {
+            if (num == 0 && m == 1) pk_ctCross++;
             if (ct->r[5] & mri) {
                 ct->r[PK_CT_IR] |= 1u << m;
                 uint32_t t = (mr - ct->r[PK_CT_TC]) * pr;
@@ -2049,6 +2060,7 @@ static uint32_t pk_ct_tick(struct pk_ct *ct, uint32_t num, uint32_t delta) {
     }
 
     if (ct->r[PK_CT_IR] && armIrqEnable) {
+        if (num == 0) pk_irq34++;
         pk_interrupt(34 + num);
     }
     return tti;
@@ -5118,7 +5130,9 @@ static void update_title_pct(void) {
         double wallMs = (double)(nowMs - titleMs);
         int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
         if (pct < 0) pct = 0;
-        if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
+        /* PAS d'écrêtage à 100 : un dépassement (EMU_NOPACE, vieux binaire
+         * face à des firmwares récents) doit se VOIR dans le titre. */
+        if (pct > 999) pct = 999;
         titlePct = pct;
         snprintf(titleBuf, sizeof(titleBuf), "%.900s", fwName);
         snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %%", fwName, pct);
@@ -5402,6 +5416,10 @@ int main(int argc, char **argv) {
 
     }
 
+    if (ENVFLAG("EMU_DMA_TRACE") && emuTarget == TGT_POKITTO)
+        fprintf(stderr, "[audio] FIN irq_block=%lu irq34=%lu crosses=%lu latches=%lu (muets=%lu son=%lu) tick=%u qtail=%u qhead=%u\n",
+                pk_ctIrqCount, pk_irq34, pk_ctCross, pk_latchCount, pk_latchMid, pk_latchSound, tickCount,
+                pk_read_half(QADDR), pk_read_half(QADDR + 2));
     if (shotPath[0]) {
         FILE *sf = fopen(shotPath, "wb");
         if (sf) {

@@ -82,10 +82,13 @@ sans garantie de parité TS.
   et tout drop de firmware rebascule la carte sur son répertoire.
 - La fenêtre est **redimensionnable** (échelle entière, pixels carrés) et
   la **barre de titre** affiche le **% de vitesse** (ticks émulés / temps
-  réel, mis à jour toutes les 500 ms, borné à 100 %).  Le pacing est une
-  échéance par frame sans dette : jamais plus vite que le temps réel, et
-  un ralentissement (drag de fenêtre, stall) ne déclenche pas de
-  rattrapage accéléré.
+  réel, mis à jour toutes les 500 ms).  Le pacing est une échéance par
+  frame sans dette : jamais plus vite que le temps réel, et un
+  ralentissement (drag de fenêtre, stall) ne déclenche pas de rattrapage
+  accéléré.  **Le % n'est plus borné à 100** : s'il affiche 160 ou 200,
+  la machine tourne trop vite — binaire périmé face aux firmwares
+  (l'ancien modèle cadençait le pokitto à 45 MHz : un jeu 72 MHz y allait
+  à 160 %), ou `EMU_NOPACE=1` dans l'environnement.
 
     SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu \
       out/<Jeu>/.pio/build/meta/firmware.bin output/sd-card \
