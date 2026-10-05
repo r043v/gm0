@@ -4545,6 +4545,7 @@ static uint32_t emu_nextFrameTick = 334860u; /* pas initial (frame_ticks suit la
 static Uint32 titleMs;
 static uint32_t titleTick;
 static char titleBuf[1200]; /* dernier titre construit (HUD wasm) */
+static char hudTitle[1240]; /* titre de la fenêtre native : jeu + % */
 static int titlePct;      /* dernier % (HUD wasm) */
 
 /* décharge la carte SD courante (image ou image FAT d'un répertoire) */
@@ -5020,10 +5021,12 @@ static void update_title_pct(void) {
         if (pct > 100) pct = 100; /* jamais plus vite que le temps réel */
         titlePct = pct;
         snprintf(titleBuf, sizeof(titleBuf), "%.900s", fwName);
+        snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %%", fwName, pct);
     } else {
         snprintf(titleBuf, sizeof(titleBuf), "déposez un firmware .bin");
+        snprintf(hudTitle, sizeof(hudTitle), "%s", titleBuf);
     }
-    SDL_SetWindowTitle(emuWin, titleBuf);
+    SDL_SetWindowTitle(emuWin, hudTitle);
     titleMs = nowMs;
     titleTick = tickCount;
 }
@@ -5037,9 +5040,14 @@ static void run_emulated_frame(void) {
      * cœur restait au compilateur de base Liftoff (~30 % plus lent) */
     static void (*volatile stepFn)(void) = step;
     void (*fn)(void) = stepFn;
-    while (tickCount < target) fn();
+    while ((int32_t)(tickCount - target) < 0) fn();
 #else
-    while (tickCount < target) step();
+    /* tickCount est un u32 qui wrappe (2^32 à 48 MHz ≈ 89,5 s) : la cible
+     * calculée par la frame précédente peut se retrouver EN DEÇA du tick
+     * courant après le passage — comparaison signée de la différence, comme
+     * sur le compteur (qui wrappe) du Cortex-M0+ ; la forme « tick < cible »
+     * non signée gelait l'émulateur pour de bon (lapinou, frame ~7000). */
+    while ((int32_t)(tickCount - target) < 0) step();
 #endif
     /* re-base sur tickCount : l'ancien `+= frame_ticks()` laissait
      * emu_nextFrameTick franchir 2^32 UNE frame avant tickCount — le
