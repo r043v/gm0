@@ -1218,21 +1218,10 @@ static int zip_load_card(const uint8_t *data, size_t len) {
         size_t l = strlen(ents[i].name);
         if (fwb < 0 && l > 4 && strcasecmp(ents[i].name + l - 4, ".bin") == 0) fwb = i;
     }
-    /* les jeux ouvrent leurs assets en relatif à la RACINE de la carte
-     * (layout « contenu du zip collé à la racine de la SD ») : le dossier
-     * du .bin est retiré des chemins, sinon la recherche d'assets boucle
-     * (Picomon : re-lecture du dossier /PICOMON sans fin, écran boot) */
-    if (fwb >= 0) {
-        char prefix[1024];
-        const char *slash = strrchr(ents[fwb].name, '/');
-        if (slash) {
-            size_t pl = (size_t)(slash - ents[fwb].name) + 1; /* inclut le '/' */
-            snprintf(prefix, sizeof(prefix), "%.*s", (int)pl, ents[fwb].name);
-            for (int i = 0; i < n; i++)
-                if (strncmp(ents[i].name, prefix, pl) == 0)
-                    memmove(ents[i].name, ents[i].name + pl, strlen(ents[i].name + pl) + 1);
-        }
-    }
+    /* PAS d'aplatissement : les jeux ouvrent leurs assets avec le préfixe
+    * de leur dossier (PICOMON/MUSICS/...), comme dans le dossier posé
+    * à la racine de la carte ; l'ancien retrait du préfixe tuait la
+    * musique du cas zip (la « boucle /PICOMON » d'avant était le bug BLX) */
     reset_machine();
     if (fwb >= 0) {
         char base[1024];
@@ -1245,6 +1234,14 @@ static int zip_load_card(const uint8_t *data, size_t len) {
         free(datas[i]);
     }
     if (nvfiles > 0) fat_build_from_vfiles();
+    { /* EMU_DUMP_CARD=<fichier> : image FAT construite, pour audit de chaîne */
+        const char *dc = getenv("EMU_DUMP_CARD");
+        if (dc && fatImage) {
+            FILE *df = fopen(dc, "wb");
+            if (df) { fwrite(fatImage, 1, fatImageSize, df); fclose(df); }
+            fprintf(stderr, "carte dumped : %s (%zu o)\n", dc, fatImageSize);
+        }
+    }
     printf("carte SD : zip (%d fichiers)", n);
     if (fwLoaded) printf(" + firmware %s", fwName);
     printf("\n");
