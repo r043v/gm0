@@ -103,6 +103,13 @@ en plus des options META existantes (`--wav`, `--frames`, `--shot`).
 
 Touches META : flèches, ZQSD/WASD, **Entrée**=Start (MENU), **Espace**=A,
 **Ctrl**=B, **\***=Select (HOME), ou J=A, K=B, U=MENU, I=HOME.
+Ordre du registre à décalage : il dépend de la **vitesse SPI de la
+lecture du pad** — à 12 MHz (BAUD=1, jeux lib : Celeste, Reuben, GBTA...)
+l'ordre est celui de la lib (down,left,right,up,a,b,menu,home), à
+24 MHz (BAUD=0, ex. lapinou) l'ordre historique des jeux maison
+(left,right,up,a,b,menu,down,home).  L'émulateur bascule automatiquement
+d'après le registre BAUD du SERCOM4 au moment de la lecture ;
+**EMU_BTN_ORDER=lapinou** force l'ordre 24 MHz si besoin.
 Touches Pokitto : **I/K/J/L** ou flèches = directions, **A**=A,
 **S/B**=B, **D/C**=C, **F**=D (éclairage).  **F5** redémarre le jeu
 (les deux cibles ; la carte SD et l'EEPROM Pokitto sont conservées).
@@ -202,7 +209,10 @@ transfert immédiat hérité du TS (firmwares 0.1.0 : sortie identique).
 **Jeux du site META (lib récente, cf. github.com/Gamebuino/Gamebuino-META)**
 : le boot est **réparé** — écran « GAMEBUINO / SD INIT... » et écrans
 loaders affichés, init SD complète (CMD0 → CMD8 → ACMD41 → CMD58 →
-CMD17).  Trois causes racines, toutes corrigées :
+CMD17).  **Celeste (zip du site) : EN JEU** — boot, « SD INIT... OK! »,
+save créée sans erreur, écran titre et niveau 1 jouable (appui A/B).
+Quatre causes racines corrigées, toutes côté émulateur (détail dans
+NOTES-SD-LIB-OFFICIELLE.md) :
 
 - **carte SD sans table de partitions** : la carte construite depuis un
   dossier était une superfloppy (boot sector en LBA 0) ; la lib officielle
@@ -254,12 +264,27 @@ manquaient, toutes côté émulateur :
 - **acquittement fenêtre** : le clear CHINTFLAG par la fenêtre CHID
   (0x4100484E, octet) était jeté lui aussi.
 
+Session Celeste (zip du site, lib officielle en mode INDEX) — le
+protocole DMA réel de la lib, désormais modélisé (datasheet SAM-D21) :
+
+- **CHCTRLA relu** : la lib lit `CHCTRLA.bit.ENABLE` avant de réarmer ;
+  renvoyer 0 la faisait réarmer en plein vol → bloc tronqué, lignes
+  décalées, écran figé.  Lecture = état réel ; CHCTRLA=2 sur un canal
+  déjà actif = ignoré (no-op matériel) ;
+- **BLOCKACT=suspend après bloc** (descripteurs 0x0419/0x04f9 de la
+  lib) : le canal se suspend à chaque fin de bloc et attend
+  **CHCTRLB.CMD=RESUME** — plus d'anneau libre entre les trames (fin de
+  la dérive et des octets parasites) ;
+- **CHCTRLB relu** : le RESUME du guest est un RMW ; la lecture à 0 lui
+  faisait écrire une valeur sans TRIGSRC qui effaçait le déclencheur du
+  canal (canal RX SD mort) ;
+- **CMD13 (SEND_STATUS)** répondu (R2=00 00) : le SdFat interroge le
+  statut après chaque écriture, « illegal command » bouclait le CMD24
+  (« SAVE ERROR »).
+
 Reste ouvert, deux couches :
-- **Yatzy/Reuben** : l'init SD passe (« SD INIT... OK! »), la création
-  de la sauvegarde boucle (écritures FAT/répertoire identiques répétées)
-  — la couche FS du jeu s'attend visiblement à une géométrie ou un
-  format de carte différent (entrées LFN ? racine dans la zone de
-  données ?) ; à rapprocher du format exact des cartes du site ;
+- **Yatzy** : « SD INIT... OK! » s'affiche désormais mais le menu n'est
+  toujours pas dessiné (open item « premier flush ») ;
 - **les deux loaders** (Cats & Coins, GB Theft Auto) montent la carte
   puis leur init SD maison se fige après CMD8 (pas d'enchaînement
   ACMD41).  Leur écran de chargement (motif diagonal répété) est dessiné
@@ -314,6 +339,21 @@ SRAM) ; sans effet observé sur l'écran ni l'audio.
 - `EMU_DMA_DEBUG=1` : chaque transfert DMA instantané (canal, src, dst,
   taille, beats, position LCD, hachure du contenu) — pour auditer le
   chemin d'affichage DMA d'un jeu maison.
+- `EMU_DESC_DEBUG=1` : chargements de descripteurs DMAC (`[desc]`),
+  armements CHCTRLA (`[arm]`) et écritures CHID (`[chid]`) — le protocole
+  réel de la lib officielle (BLOCKACT=suspend après bloc, reprise par
+  CHCTRLB.CMD=RESUME) se lit là.
+- `EMU_FB_DUMP=<fichier>` (+ `EMU_FB_DUMP_START=<tick>`) : dump du flux
+  RAMWR brut (pixels 565).  **`EMU_FB_FD=<n>`** : même dump via un
+  descripteur hérité (`3>/tmp/dump.raw`) — à privilégier dans les
+  environnements sableux où les fwrite vers un fichier créé par le
+  processus lui-même sont avalées.  `EMU_WIN_DEBUG=1` (+ 
+  `EMU_WIN_DEBUG_LIMIT=<n>`) : commandes/fenêtres LCD ;
+  `EMU_BYTES_FROM=<tick>` (+ `EMU_BYTES_TO`) : octets du panneau avec
+  l'état D/C ; `EMU_CHUNK_DEBUG=1` : premiers octets de chaque bloc.
+- `EMU_BTN_DEBUG=1` : lectures du registre à décalage pendant un appui ;
+  `EMU_BTN_ORDER=lapinou` : ordre boutons des jeux maison (défaut = ordre
+  lib/TS, voir « Touches META »).
 - `EMU_LCD_DEBUG=1` : trace les écritures MADCTL (ordre des composantes
   déclaré au panneau et verrou d'inversion).
 - `STATE_HASH=1` (+ `HASH_INTERVAL=<ticks>`) : hachage FNV-1a des

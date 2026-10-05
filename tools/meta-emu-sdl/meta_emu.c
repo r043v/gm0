@@ -23,6 +23,7 @@
 #include <zlib.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -106,14 +107,17 @@ static uint8_t  buttonData = 0xff;
 static int      tc4Enabled, tc4Armed;
 static uint8_t  tc4IntEnMask, tc4IntFlagMask; /* INTENSET/INTFLAG lisibles (jeux maison) */
 static int      primask; /* CPSID/CPSIE : masque les injections d'interruptions */
+static int      sysTickCountFlag; /* SysTick CSR.COUNTFLAG : wrap CVR depuis la dernière lecture */
 static uint32_t tc4CtrlA; /* valeur complète de CTRLA (prescaler bits 8-10) */
-static uint32_t tc4Top, tc4Counter, tc4Period = 907;
+static uint32_t tc4Top, tc4Counter, tc4Period = 2177;
 static uint32_t tc4Window, tc4Fires, tc4Writes;
 static int      tc4Interrupt;
 
 /* ST7735 */
 static uint16_t pix[MAX_SCREEN_W * MAX_SCREEN_H];
 static int lcd_xStart, lcd_xEnd, lcd_yStart, lcd_yEnd, lcd_x, lcd_y;
+static uint32_t nvmAddr;         /* NVMCTRL ADDR (0x41004008) */
+static uint8_t nvmIntFlag = 1;   /* INTFLAG (0x41004014) : bit0 READY */
 static int lcd_argIndex, lcd_lastCommand, lcd_tmp;
 static int ramwrCount; /* compte les RAMWR : ~32 par frame rendue */
 
@@ -356,6 +360,10 @@ static void sd_command(uint8_t cmd, uint32_t arg) {
                  sd_out_push(0x00); sd_out_push(0x00);
                  sd_out_push(0x00); break;
         case 16: sd_out_push(0x00); break;
+        case 13: /* SEND_STATUS (R2) : le SdFat du guest interroge le statut
+                  * après chaque écriture — « illegal command » (0x04) le
+                  * faisait boucler sur la réécriture du secteur */
+            sd_out_push(0x00); sd_out_push(0x00); break;
         case 17: { /* lecture d'un secteur */
             size_t base = (size_t)arg * 512;
             uint8_t *card = sd_card_data();
@@ -1120,6 +1128,21 @@ static int zip_load_card(const uint8_t *data, size_t len) {
         size_t l = strlen(ents[i].name);
         if (fwb < 0 && l > 4 && strcasecmp(ents[i].name + l - 4, ".bin") == 0) fwb = i;
     }
+    /* les jeux ouvrent leurs assets en relatif à la RACINE de la carte
+     * (layout « contenu du zip collé à la racine de la SD ») : le dossier
+     * du .bin est retiré des chemins, sinon la recherche d'assets boucle
+     * (Picomon : re-lecture du dossier /PICOMON sans fin, écran boot) */
+    if (fwb >= 0) {
+        char prefix[1024];
+        const char *slash = strrchr(ents[fwb].name, '/');
+        if (slash) {
+            size_t pl = (size_t)(slash - ents[fwb].name) + 1; /* inclut le '/' */
+            snprintf(prefix, sizeof(prefix), "%.*s", (int)pl, ents[fwb].name);
+            for (int i = 0; i < n; i++)
+                if (strncmp(ents[i].name, prefix, pl) == 0)
+                    memmove(ents[i].name, ents[i].name + pl, strlen(ents[i].name + pl) + 1);
+        }
+    }
     reset_machine();
     if (fwb >= 0) {
         char base[1024];
@@ -1153,19 +1176,58 @@ static int zip_load_card(const uint8_t *data, size_t len) {
  * ====================================================================== */
 
 /* boutons : bit0 bas, 1 gauche, 2 droite, 3 haut, 4 A, 5 B, 6 MENU, 7 HOME
- * (actifs bas : 0 = enfoncé).  Ordre du registre à décalage physique du
- * META (MSB en premier : home..down), confirmé par le source du registre
- * gdl de lapinou : left,right,up,a,b,menu,down,home — même masque pour
- * les deux cibles. */
-#define BTN_LEFT   (1u << 0)
-#define BTN_RIGHT  (1u << 1)
-#define BTN_UP     (1u << 2)
-#define BTN_A      (1u << 3)
-#define BTN_B      (1u << 4)
-#define BTN_MENU   (1u << 5)
-#define BTN_DOWN   (1u << 6)
+ * (actifs bas : 0 = enfoncé).  Ordre du fork TS de référence et de la
+ * lib officielle (Buttons.h : down=0, left, right, up, a, b, menu, home),
+ * c'est lui qui fait répondre les jeux lib (Celeste, Reuben...) ;
+ * lapinou (homebrew) lit un ordre propre, cf. EMU_BTN_ORDER plus bas. */
+#define BTN_DOWN   (1u << 0)
+#define BTN_LEFT   (1u << 1)
+#define BTN_RIGHT  (1u << 2)
+#define BTN_UP     (1u << 3)
+#define BTN_A      (1u << 4)
+#define BTN_B      (1u << 5)
+#define BTN_MENU   (1u << 6)
 #define BTN_HOME   (1u << 7)
 #define BTN_DIRMASK (BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_UP)
+
+/* ordre alternatif historique (jeux maison lus dans l'ordre
+ * left,right,up,a,b,menu,down,home — ex. lapinou) : EMU_BTN_ORDER=lapinou.
+ * La correspondance se fait au moment de l'injection (btn_press/btn_release). */
+static int btnOrderLapinou = -1;
+/* octet boutons réordonné pour un pad lu à 24 MHz (ordre historique des
+ * jeux maison : left,right,up,a,b,menu,down,home) ; l'entrée b = ordre lib
+ * (down,left,right,up,a,b,menu,home) */
+static uint8_t pad_byte_24(uint8_t b) {
+    uint8_t r = 0;
+    if (b & 0x01u) r |= 1u << 6;   /* down */
+    if (b & 0x02u) r |= 1u << 0;   /* left */
+    if (b & 0x04u) r |= 1u << 1;   /* right */
+    if (b & 0x08u) r |= 1u << 2;   /* up */
+    if (b & 0x10u) r |= 1u << 3;   /* a */
+    if (b & 0x20u) r |= 1u << 4;   /* b */
+    if (b & 0x40u) r |= 1u << 5;   /* menu */
+    if (b & 0x80u) r |= 1u << 7;   /* home */
+    return r;
+}
+
+static uint8_t btn_remap(uint8_t mask) {
+    if (btnOrderLapinou < 0)
+        btnOrderLapinou = getenv("EMU_BTN_ORDER") &&
+                          getenv("EMU_BTN_ORDER")[0] == 'l' ? 1 : 0;
+    if (!btnOrderLapinou) return mask;
+    /* bit lib -> bit lapinou : down0->6 left1->0 right2->1 up3->2
+     * a4->3 b5->4 menu6->5 home7->7 */
+    uint8_t r = 0;
+    if (mask & BTN_DOWN)  r |= 1u << 6;
+    if (mask & BTN_LEFT)  r |= 1u << 0;
+    if (mask & BTN_RIGHT) r |= 1u << 1;
+    if (mask & BTN_UP)    r |= 1u << 2;
+    if (mask & BTN_A)     r |= 1u << 3;
+    if (mask & BTN_B)     r |= 1u << 4;
+    if (mask & BTN_MENU)  r |= 1u << 5;
+    if (mask & BTN_HOME)  r |= 1u << 7;
+    return r;
+}
 
 static SDL_GameController *pad; /* définitions complètes dans la section SDL */
 static SDL_Joystick *joyFb;
@@ -2416,6 +2478,18 @@ static int lcdBgrSwapped;
 static uint8_t st7735_byte(uint8_t v) {
     if (portB_out & (1u << 22)) return 0xff; /* CS écran haut */
     stWrites++;
+    { /* trace D/C + octet (débogage flux LCD) */
+        static int bFrom = -1, bTo = -1;
+        if (bFrom < 0) {
+            const char *s = getenv("EMU_BYTES_FROM");
+            const char *e = getenv("EMU_BYTES_TO");
+            bFrom = s ? (int)atoi(s) : 0x7fffffff;
+            bTo = e ? (int)atoi(e) : 0x7fffffff;
+        }
+        if ((int)tickCount >= bFrom && (int)tickCount <= bTo)
+            fprintf(stderr, "[b] t=%u dc=%d v=%02x\n", tickCount,
+                    (portB_out >> 23) & 1, v);
+    }
     if (!(portB_out & (1u << 23))) { /* commande */
         lcd_lastCommand = v;
         lcd_argIndex = 0;            /* comme st7735.ts : reset à chaque commande */
@@ -2433,7 +2507,38 @@ static uint8_t st7735_byte(uint8_t v) {
             case 0x2c: /* RAMWR */
                 if (lcd_argIndex % 2 == 0) lcd_tmp = v;
                 else {
+                    /* dump du flux RAMWR : fichier (EMU_FB_DUMP) ou descripteur
+                     * hérité (EMU_FB_FD=<n>, ex. `3>/tmp/dump.raw`) — le fd
+                     * contourne le bac à sable qui avale les fwrite vers un
+                     * fichier créé par le processus lui-même */
+                    static FILE *fbDump; static int fbFd = -1;
+                    static unsigned fbPx; static int fbDone;
+                    static int fbStartTick = -1;
+                    if (fbStartTick < 0) {
+                        const char *st = getenv("EMU_FB_DUMP_START");
+                        const char *fde = getenv("EMU_FB_FD");
+                        fbStartTick = st ? (int)atoi(st) : 0;
+                        fbFd = fde ? atoi(fde) : -1;
+                    }
+                    if (!fbDump && fbFd < 0) {
+                        const char *p = getenv("EMU_FB_DUMP");
+                        if (p && (int)tickCount >= fbStartTick) {
+                            fbDump = fopen(p, "wb");
+                            if (fbDump) setvbuf(fbDump, NULL, _IONBF, 0);
+                        }
+                        else if (!p) fbDone = 1;
+                    }
                     uint16_t p = (uint16_t)((lcd_tmp << 8) | v);
+                    if (!fbDone && (int)tickCount >= fbStartTick) {
+                        if (fbDump) {
+                            fwrite(&p, 2, 1, fbDump);
+                            if (++fbPx >= 20480 * 2) { fclose(fbDump); fbDump = NULL; fbDone = 1; }
+                        } else if (fbFd >= 0) {
+                            unsigned char b[2] = { (unsigned char)(p >> 8), (unsigned char)p };
+                            if (write(fbFd, b, 2) != 2) fbDone = 1;
+                            if (++fbPx >= 20480 * 2) fbDone = 1;
+                        }
+                    }
                     if (lcdBgrSwapped) p = (uint16_t)((p >> 11) | (p & 0x07e0u) | ((p & 0x1fu) << 11));
                     if (lcd_x < 160 && lcd_y < 128) pix[lcd_y * 160 + lcd_x] = p;
                     if (++lcd_x > lcd_xEnd) { lcd_x = lcd_xStart; if (++lcd_y > lcd_yEnd) lcd_y = lcd_yStart; }
@@ -2447,6 +2552,25 @@ static uint8_t st7735_byte(uint8_t v) {
                 if (lcd_argIndex == 1) lcd_yStart = lcd_y = v;
                 else if (lcd_argIndex == 3) lcd_yEnd = v;
                 break;
+        }
+        if (getenv("EMU_WIN_DEBUG")) {
+            static uint32_t winRamwr;
+            static int wnRemain = -2;
+            static long wnTotal;
+            if (wnRemain == -2) {
+                const char *wl = getenv("EMU_WIN_DEBUG_LIMIT");
+                wnRemain = wl ? atoi(wl) : 120;
+            }
+            if (lcd_lastCommand == 0x2c && (lcd_argIndex & 1)) winRamwr++;
+            if (lcd_lastCommand != 0x2c || (lcd_argIndex == 0 && winRamwr)) {
+                if (wnRemain > 0 || (wnTotal % 200) == 0)
+                    fprintf(stderr, "[win] t=%u cmd=%02x arg=%d v=%02x fen(x %d-%d, y %d-%d) ramwr=%u\n",
+                            tickCount, lcd_lastCommand, lcd_argIndex, v,
+                            lcd_xStart, lcd_xEnd, lcd_yStart, lcd_yEnd, winRamwr);
+                if (wnRemain > 0) wnRemain--;
+                wnTotal++;
+                if (lcd_lastCommand != 0x2c) winRamwr = 0;
+            }
         }
         lcd_argIndex++;
     }
@@ -2476,6 +2600,8 @@ static uint32_t spiBaud;         /* SERCOM4 BAUD (f = 48 MHz / (2×(b+1))) */
 static uint8_t  dmaTrig[DMAC_CHANNELS], dmaOn[DMAC_CHANNELS];
 static uint8_t  dmacIntFlag[DMAC_CHANNELS]; /* INTFLAG par canal : TCMPL=0x02, SUSP=0x04 */
 static uint8_t  dmacIntEn[DMAC_CHANNELS];   /* CHINTENSET par canal (lecture) */
+static uint32_t dmaResumeAt[DMAC_CHANNELS]; /* descripteur à charger au prochain RESUME (suspend après bloc, BLOCKACT 0x2/0x3) */
+static uint8_t  dmaSkipSuspend[DMAC_CHANNELS]; /* RESUME reçu pendant un bloc : le prochain suspend est sauté */
 static uint16_t dmaCtrl[DMAC_CHANNELS], dmaCnt[DMAC_CHANNELS], dmaIdx[DMAC_CHANNELS];
 static uint32_t dmaSrc[DMAC_CHANNELS], dmaDst[DMAC_CHANNELS], dmaNext[DMAC_CHANNELS];
 
@@ -2496,10 +2622,13 @@ static int dma_is_tc4(uint32_t ch) {
 
 static void dma_load(uint32_t ch, uint32_t desc) {
     uint16_t ctrl = desc ? fetchHalf(desc) : 0;
-    if (!(ctrl & 1u)) { /* VALID absent : fin de chaîne -> canal suspendu */
+    if (!(ctrl & 1u)) { /* VALID absent : fin de chaîne -> canal suspendu ;
+                         * le RESUME matériel re-fetch CE descripteur (le
+                         * driver le réécrit avant de reprendre) */
         dmaOn[ch] = 0;
         dmacIntFlag[ch] |= 0x04; /* SUSP */
         dmacInterrupt = 1;
+        dmaResumeAt[ch] = desc;
         return;
     }
     dmaCtrl[ch] = ctrl;
@@ -2509,6 +2638,13 @@ static void dma_load(uint32_t ch, uint32_t desc) {
     dmaNext[ch] = fetchWord(desc + 0x0c);
     dmaIdx[ch] = 0;
     dmaOn[ch] = 1;
+    if (getenv("EMU_DESC_DEBUG") && (dmaDst[ch] == 0x42001828u || dmaSrc[ch] == 0x42001828u || dmaTrig[ch] == DMAC_TRIG_SERCOM4_TX)) {
+        static int dn;
+        if (dn < 4000)
+            fprintf(stderr, "[desc] t=%u ch=%u desc=%x ctrl=%04x n=%u src=%x dst=%x nxt=%x\n",
+                    tickCount, ch, desc, dmaCtrl[ch], dmaCnt[ch], dmaSrc[ch], dmaDst[ch], dmaNext[ch]);
+        dn++;
+    }
 }
 
 /* le matériel écrit le descripteur courant dans la banque WRB à chaque
@@ -2563,7 +2699,18 @@ static void dma_beat(uint32_t ch) {
         dmacIntFlag[ch] |= 0x02;
         dma_wrb_write(ch);
         dmacInterrupt = 1;
-        dma_load(ch, dmaNext[ch]); /* suit la chaîne, ou suspend si invalide */
+        /* BLOCKACT (datasheet 20.6.3.2) : 0x2/0x3 suspend le canal après le
+         * bloc (lib officielle : descripteurs 0x0419/0x04f9) — il reste
+         * activé mais hors arbitrage jusqu'au CHCTRLB.CMD=RESUME ; sinon
+         * chaînage automatique vers le descripteur suivant */
+        if (((dmaCtrl[ch] >> 3) & 3u) >= 0x2u && !dmaSkipSuspend[ch]) {
+            dmaOn[ch] = 0;
+            dmacIntFlag[ch] |= 0x04; /* SUSP (sans ré-armement : pas de tempête) */
+            dmaResumeAt[ch] = dmaNext[ch];
+        } else {
+            dmaSkipSuspend[ch] = 0;
+            dma_load(ch, dmaNext[ch]); /* suit la chaîne, ou suspend si invalide */
+        }
     }
 }
 
@@ -2658,11 +2805,22 @@ static uint32_t periph_read(uint32_t a, int *handled) {
         }
         return ser4_data; }                /* SERCOM4 DATA */
     if (a == 0x42001c28u) { *handled = 1; return 0x80; }                     /* SERCOM5 DATA */
-    if (a == 0x41004840u) { /* CHCTRLA : « activé » en modèle site ; natif : état réel du canal */
+    if (a == 0x41004840u) { /* CHCTRLA : « activé » en modèle site ; natif : état réel du canal.
+                             * La lib officielle lit ENABLE avant de réarmer (sendBuffer :
+                             * start = !(CHCTRLA.bit.ENABLE)) — renvoyer 0 pendant un
+                             * transfert la poussait à réarmer en plein vol, tronquant
+                             * le bloc en cours (écran cisaillé/frozen des jeux INDEX). */
         *handled = 1;
         if (emuSiteModel > 0) return 2;
-        if (dma_is_tc4(dmac_chid)) return dmaOn[dmac_chid] ? 2 : 0;
-        return 0;
+        return dmaOn[dmac_chid] ? 2 : 0;
+    }
+    if (a == 0x41004844u) { /* CHCTRLB : TRIGSRC relu — le guest fait
+                             * « CHCTRLB.reg |= CMD_RESUME » en RMW ; renvoyer 0
+                             * lui faisait écrire une valeur sans TRIGSRC, qui
+                             * effaçait le déclencheur du canal (RX SD mort). */
+        *handled = 1;
+        if (emuSiteModel > 0) return 0;
+        return (uint32_t)dmaTrig[dmac_chid & 0xfu] << 8;
     }
     if (emuSiteModel > 0) { *handled = 1; return 0; } /* modèle du site : rien d'autre */
     if (a == 0x4100484eu) { *handled = 1; return dmacIntFlag[dmac_chid & 0xfu]; } /* DMAC CHINTFLAG (fenêtre CHID) */
@@ -2670,13 +2828,30 @@ static uint32_t periph_read(uint32_t a, int *handled) {
         *handled = 1; return dmacIntFlag[(a - 0x4100484eu) >> 4]; } /* CHINTFLAG indexé (canaux 1+) */
     if (a >= 0x4100485du && a < 0x41004900u && ((a - 0x4100484du) & 0xfu) == 0) {
         *handled = 1; return dmacIntEn[(a - 0x4100484du) >> 4]; } /* CHINTENSET indexé */
-    if (a == 0x41004820u) { /* INTPEND : premier canal avec un drapeau levé */
+    if (a == 0x41004014u) { *handled = 1; return nvmIntFlag; }  /* NVM INTFLAG : READY */
+    /* SysTick système (0xE000E010+) : le micros() du core Arduino le lit
+     * (GSFX du port Picomon notamment) — CSR avec COUNTFLAG, RVR, CVR */
+    if (a == 0xe000e010u) { /* CSR : ENABLE|TICKINT (+ COUNTFLAG si wrap) */
+        *handled = 1;
+        uint32_t v = 0x7u;
+        if (sysTickCountFlag) { v |= 1u << 16; sysTickCountFlag = 0; }
+        return v;
+    }
+    if (a == 0xe000e014u) { *handled = 1; return 19999u; }      /* RVR : 20000 ticks/ms */
+    if (a == 0xe000e018u) { *handled = 1; return 19999u - (sysTickTrigger % 20000u); } /* CVR */
+    if (a == 0xe000e01cu) { *handled = 1; return 0; }           /* CALIB */
+    if (a == 0x41004018u) { *handled = 1; return 0; }           /* NVM STATUS */
+    if (a == 0x41004820u) { /* INTPEND : premier canal avec un drapeau levé
+                             * (datasheet : bit4 TCMPL, bit5 SUSP, bit6 TERR —
+                             * l'ancien encodage mettait TCMPL en bit6, le guest
+                             * y lisait TERR et partait dans son chemin d'erreur) */
         *handled = 1;
         for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++) {
             if (dmacIntFlag[ch]) {
-                return (ch & 0xfu) | ((dmacIntFlag[ch] & 1u) << 4)
-                     | (((dmacIntFlag[ch] >> 2) & 1u) << 5)
-                     | (((dmacIntFlag[ch] >> 1) & 1u) << 6);
+                return (ch & 0xfu)
+                     | (((dmacIntFlag[ch] >> 1) & 1u) << 4)  /* TCMPL */
+                     | (((dmacIntFlag[ch] >> 2) & 1u) << 5)  /* SUSP */
+                     | ((dmacIntFlag[ch] & 1u) << 6);        /* TERR */
             }
         }
         return 0;
@@ -2758,12 +2933,15 @@ static long millisWrites;
 static long usbWatch;
 static uint32_t watchAddr = 0;
 static uint32_t prevInstPc;  /* PC à l'entrée du pas courant (la boucle le tient à jour) */
+static uint32_t nvmAddr;         /* NVMCTRL ADDR (0x41004008) */
 /* programmation flash (auto-patch des loaders) : effet net du NVMCTRL —
  * la valeur écrite est stockée en flash et le code fraîchement écrit est
- * exécuté aux pas suivants.  Les commandes du contrôleur (0x41004000+)
- * restent des no-ops : sur circuit le jeu prépare ses pages puis les
- * programme ; ici seule l'écriture effective compte.  L'alias physique
- * 0x00400000 est accepté en écriture aussi.
+ * exécuté aux pas suivants.  Le contrôleur (0x41004000+) est modélisé au
+ * strict minimum : ADDR retenu, commande EP (effacement de page de 64 o)
+ * appliquée, INTFLAG relu avec READY=1 — les installeurs des loaders
+ * sondent READY avant de rendre la main (Picomon rend le CPSID sans le
+ * CPSIE si le sondage ne passe pas : interruptions mortes, écran noir).
+ * L'alias physique 0x00400000 est accepté en écriture aussi.
  *
  * Build wasm : écritures simplement IGNORÉES (comportement d'avant) — la
  * distribution web privilégie le démarrage partout ; les écrans de boot
@@ -2771,6 +2949,9 @@ static uint32_t prevInstPc;  /* PC à l'entrée du pas courant (la boucle le tie
 #ifdef __EMSCRIPTEN__
 static void flash_store(uint32_t a, uint32_t v, int bytes) {
     (void)a; (void)v; (void)bytes;
+}
+static void nvmctrl_write(uint32_t a, uint32_t v) {
+    (void)a; (void)v; /* wasm : pas d'auto-patch, pas de contrôleur */
 }
 #else
 static void flash_store(uint32_t a, uint32_t v, int bytes) {
@@ -2792,6 +2973,23 @@ static void flash_store(uint32_t a, uint32_t v, int bytes) {
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
     } else p[0] = (uint8_t)v;
 }
+
+/* NVMCTRL minimal (0x41004000+) : ADDR + commande EP (effacement de page
+ * de 64 o) ; INTFLAG relu avec READY — les installeurs des loaders
+ * sondent ce drapeau avant de réactiver les interruptions */
+static void nvmctrl_write(uint32_t a, uint32_t v) {
+    if (a == 0x41004008u) { nvmAddr = v; return; }             /* ADDR */
+    if (a == 0x41004004u || a == 0x41004005u) {                /* CTRLB.CMD */
+        uint32_t cmd = (a == 0x41004004u) ? (v & 0x7fu) : (v >> 8) & 0x7fu;
+        if (cmd == 0x03u && nvmAddr < FLASH_SIZE) {            /* EP */
+            uint32_t page = nvmAddr & ~63u;
+            if (page + 64 <= FLASH_SIZE) memset(flash + page, 0xff, 64);
+        }
+        nvmIntFlag = 1; /* commande acceptée : READY */
+        return;
+    }
+    if (a == 0x41004014u) { nvmIntFlag = 1; return; }          /* INTFLAG clear */
+}
 #endif /* __EMSCRIPTEN__ */
 
 static void writeWord(uint32_t a, uint32_t v) {
@@ -2800,6 +2998,7 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == millisWatchAddr) millisWrites++;
     if (watchAddr && a == watchAddr && usbWatch < 4000)
         fprintf(stderr, "[watch %x] tick=%u pc=%x val=%08x\n", a, tickCount, regs[15] - 2, v);
+    if (a >= 0x41004000u && a < 0x41004020u && emuTarget != TGT_POKITTO) { nvmctrl_write(a, v); return; }
     if (a < 0x20000000u) { if (emuSiteModel <= 0) flash_store(a, v, 4); return; } /* site : jettées */
     if (a < 0x40000000u) { a -= 0x20000000u; if (a + 4 > SRAM_SIZE) return;
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff;
@@ -2819,7 +3018,7 @@ static void writeWord(uint32_t a, uint32_t v) {
     if (a == 0x40000c04u || a == 0x40000c08u) return;
     if (a == 0x41004834u) { dmac_baseAddr = v; return; }
     if (a == 0x41004838u) { dmac_wrbAddr = v; return; }
-    if (a == 0x4100483fu) { dmac_chid = v; return; }
+    if (a == 0x4100483fu) { dmac_chid = v; if (getenv("EMU_DESC_DEBUG")) fprintf(stderr, "[chid] t=%u chid=%u\n", tickCount, v); return; }
     /* la lib officielle adresse les canaux en INDEXÉ — 16 octets par canal :
      * Channel[n] = 0x41004840 + n*16, CHCTRLA@+0, CHCTRLB@+4, CHINTENCLR@+C,
      * CHINTENSET@+D, CHINTFLAG@+E.  Les canaux 1+ (0x50+) arrivent ici ; les
@@ -2849,9 +3048,30 @@ static void writeWord(uint32_t a, uint32_t v) {
         return;
     }
     if (a == 0x41004844u && dmac_chid < DMAC_CHANNELS) { /* CHCTRLB */
-        /* comme le TS : seul TRIGSRC est retenu ; CMD (RESUME/retigger) est
-         * ignoré — le transfert part de l'écriture CHCTRLA=ENABLE, le
-         * curseur de descripteurs tournant (anneau de la lib) fait le reste */
+        /* CMD (bits 25:24, datasheet 20.8.19) : RESUME=0x2 charge le
+         * descripteur en attente (suspend après bloc) ; reçu pendant un
+         * bloc, il saute le prochain suspend (20.6.3.3).  SUSPEND=0x1 :
+         * le canal s'arrête à la fin du bloc en cours. */
+        uint32_t cmd = (v >> 24) & 3u;
+        if (cmd == 0x2u) {
+            if (dmaOn[dmac_chid]) dmaSkipSuspend[dmac_chid] = 1;
+            else if (dmaResumeAt[dmac_chid]) {
+                uint32_t at = dmaResumeAt[dmac_chid];
+                dmaResumeAt[dmac_chid] = 0;
+                dma_load(dmac_chid, at);
+                /* bloc SPI : ré-armer le cadencement des beats (le RESUME
+                 * sort le canal de sa suspension après bloc) */
+                if (dmaOn[dmac_chid] && (dmaDst[dmac_chid] == 0x42001828u || dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX)) {
+                    uint32_t b = (spiBaud & 0xFFu) + 1;
+                    spiBeatTicks = (b * 20u + 1u) / 3u;
+                    if (spiBeatTicks < 1) spiBeatTicks = 1;
+                    spiBeatAcc = 0;
+                    spiDmaCh = (int)dmac_chid;
+                }
+            }
+        }
+        /* comme le TS : seul TRIGSRC est retenu (le reste du champ est
+         * reconstitué par les écritures du guest) */
         dmaTrig[dmac_chid] = (uint8_t)((v >> 8) & 0x3fu);
         return;
     }
@@ -2906,7 +3126,21 @@ static void writeWord(uint32_t a, uint32_t v) {
     }
     if (a == 0x41004840u) { /* CHCTRLA == 2 : transfert via descripteur */
         if (v == 0x02) {
+            if (getenv("EMU_DESC_DEBUG"))
+                fprintf(stderr, "[arm] t=%u chid=%u on=%u trig=%u desc=%x res=%x\n",
+                        tickCount, dmac_chid, dmaOn[dmac_chid], dmaTrig[dmac_chid],
+                        dmac_desc, dmaResumeAt[dmac_chid]);
+            /* matériel : ENABLE sur un canal déjà actif est sans effet —
+             * recharge partir du descripteur de tête tronquerait le
+             * transfert en cours (octets perdus -> lignes décalées) */
+            if (dmaOn[dmac_chid]) return;
             if (!dmac_desc) dmac_desc = dmac_baseAddr + dmac_chid * 0x10;
+            /* suspend après bloc en attente : la reprise se fait à la
+             * position du canal, pas à la tête de la chaîne */
+            if (dmaResumeAt[dmac_chid]) {
+                dmac_desc = dmaResumeAt[dmac_chid];
+                dmaResumeAt[dmac_chid] = 0;
+            }
             if (dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_RX) {
                 /* réception SD : armé seulement — les beats arrivent au
                  * rythme des octets envoyés (miroir plein-duplex), une
@@ -2937,6 +3171,17 @@ static void writeWord(uint32_t a, uint32_t v) {
                         fprintf(stderr, "[dma spi] ch=%u ctrl=%04x src=%x dst=%x n=%u beats=%u t\n",
                                 (unsigned)dmac_chid, dmaCtrl[dmac_chid], dmaSrc[dmac_chid],
                                 dmaDst[dmac_chid], dmaCnt[dmac_chid], spiBeatTicks); }
+                    if (getenv("EMU_CHUNK_DEBUG") && dmaCnt[dmac_chid] == 320) {
+                        static int cn;
+                        uint32_t base = dmaSrc[dmac_chid] - 320; /* SRCINC : base du bloc */
+                        if (cn < 300 || (cn % 64) == 0) {
+                            fprintf(stderr, "[chunk %u] t=%u base=%x b0..23:", cn, tickCount, base);
+                            for (int k = 0; k < 24; k++)
+                                fprintf(stderr, " %02x", fetchByte(base + k));
+                            fprintf(stderr, "\n");
+                        }
+                        cn++;
+                    }
                 } else {
                     static int n; if (n++ < 4)
                         fprintf(stderr, "[dma spi] ch=%u : descripteur INVALIDE\n", (unsigned)dmac_chid);
@@ -2983,6 +3228,7 @@ static void writeWord(uint32_t a, uint32_t v) {
 
 static void writeHalf(uint32_t a, uint16_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_half(a, v); return; }
+    if (a >= 0x41004000u && a < 0x41004020u && emuTarget != TGT_POKITTO) { nvmctrl_write(a, v); return; }
     if (a < 0x20000000u) { if (emuSiteModel <= 0) flash_store(a, v, 2); return; } /* site : jettées */
     if (watchAddr && a == watchAddr && usbWatch < 4000)
         fprintf(stderr, "[watch-h %x] tick=%u pc=%x val=%04x\n", a, tickCount, prevInstPc, v);
@@ -3005,20 +3251,21 @@ static void writeHalf(uint32_t a, uint16_t v) {
 static void writeByte(uint32_t a, uint8_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_byte(a, v); return; }
     if (a == 0x41004840u) { static int n; if (n < 6) fprintf(stderr, "[WB-40] t=%u v=%02x site=%d\n", tickCount, v, emuSiteModel); n++; }
+    if (a >= 0x41004000u && a < 0x41004020u && emuTarget != TGT_POKITTO) { nvmctrl_write(a, v); return; }
     if (a < 0x20000000u) { if (emuSiteModel <= 0) flash_store(a, v, 1); return; } /* site : jettées */
     if (a < 0x40000000u) { uint32_t sa = a - 0x20000000u; if (sa < SRAM_SIZE) sram[sa] = v; return; }
     if (emuSiteModel > 0) return; /* modèle du site */
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET */
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG */
     if (a == 0x42001828u) { sercom4_write(v); return; }
-    if (a == 0x4200180au) { spiBaud = v; return; } /* SERCOM4 BAUD (SPI) */
+    if (a == 0x4200180cu || a == 0x4200180au) { spiBaud = v; return; } /* SERCOM4 BAUD (SPI : 0x0C ; 0x0A = compat TS) */
     if (a == 0x4100484eu) { /* DMAC CHINTFLAG acquittement (fenêtre, octet) */
         dmacIntFlag[dmac_chid & 0xfu] &= (uint8_t)~v;
         for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
             if (k != (dmac_chid & 0xfu) && (dmacIntFlag[k] & 0x02u)) { dmacInterrupt = 1; break; }
         return;
     }
-    if (a == 0x4100483fu) { dmac_chid = v; return; }
+    if (a == 0x4100483fu) { dmac_chid = v; if (getenv("EMU_DESC_DEBUG")) fprintf(stderr, "[chid] t=%u chid=%u\n", tickCount, v); return; }
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     writeWord(a, v);
@@ -3058,10 +3305,26 @@ static void sercom4_write(uint8_t v) {
      * décalage sur le bus, certains jeux maison le pilotent en direct. */
     ser4_data = 0x80;
     st7735_byte(v);
-    if ((portB_out & (1u << 3)) == 0 || (portA_out & (1u << 25)) == 0)
-        ser4_data = buttonData; /* boutons : PB03 (lib standard) ou PA25
-                                 * (certains jeux maison pilotent ce CS en
-                                 * direct — même registre à décalage) */
+    if ((portB_out & (1u << 3)) == 0 || (portA_out & (1u << 25)) == 0) {
+        /* boutons : PB03 (lib standard) ou PA25 (certains jeux maison
+         * pilotent ce CS en direct — même registre à décalage).  L'ordre
+         * des bits dépend de la vitesse SPI de la lecture : 12 MHz
+         * (BAUD=1, jeux lib) = ordre lib ; 24 MHz (BAUD=0, ex. lapinou)
+         * = ordre historique des jeux maison. */
+        int order24 = (spiBaud & 0xffu) != 1u;
+        static int orderForce = -1;
+        if (orderForce < 0)
+            orderForce = getenv("EMU_BTN_ORDER") && getenv("EMU_BTN_ORDER")[0] == 'l' ? 1 : 0;
+        if (orderForce) order24 = 1;
+        ser4_data = order24 ? pad_byte_24(buttonData) : buttonData;
+        if (getenv("EMU_BTN_DEBUG") && buttonData != 0xffu) {
+            static int bn;
+            if (bn++ < 40)
+                fprintf(stderr, "[btnread] t=%u v=%02x boutons=%02x PB03=%d PA25=%d baud=%u\n",
+                        tickCount, v, buttonData, (portB_out >> 3) & 1,
+                        (portA_out >> 25) & 1, spiBaud & 0xFF);
+        }
+    }
     if (!dmaBeatSkipSd) sd_byte(v);
 }
 
@@ -3250,6 +3513,7 @@ static void step(void) {
             if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
                 sysTickTrigger = 0;
                 sysTickEntries++;
+                sysTickCountFlag = 1;
                 irq_inject(sysTickVector);
             }
         }
@@ -3824,6 +4088,8 @@ static uint8_t key_bit(SDL_Keycode sym) {
 
 static void btn_press(uint8_t mask) {
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 1); return; }
+    /* buttonData reste toujours en ordre lib ; la conversion (pad lu à
+     * 24 MHz) se fait à la réponse, cf. sercom4_write */
     if (getenv("EMU_DEBUG")) fprintf(stderr, "[btn] press mask=%02x -> buttonData=%02x\n", mask, (uint8_t)(buttonData & ~mask));
     buttonData &= (uint8_t)~mask;
     if (mask & BTN_HOME) homeHeld = SDL_GetTicks();
@@ -3938,6 +4204,10 @@ static void reset_core(void) {
     sysTickVector = dmacVector = tc4Vector = 0;
     dmacInterrupt = tc4Interrupt = 0;
     dmac_baseAddr = dmac_wrbAddr = dmac_desc = dmac_chid = 0;
+    for (uint32_t k = 0; k < DMAC_CHANNELS; k++) {
+        dmaResumeAt[k] = 0;
+        dmaSkipSuspend[k] = 0;
+    }
     memset(dmaTrig, 0, sizeof dmaTrig); memset(dmaOn, 0, sizeof dmaOn);
     /* PA27 (CS carte SD) et PA25 (CS boutons) hauts : lignes désélectionnées
      * (pull-ups réelles), les périphériques n'écoutent le bus SPI que si le
@@ -4370,18 +4640,54 @@ static void run_emulated_frame(void) {
 
 #if defined(EMU_NODE_HEADLESS)
 /* ------------------------------------------- node headless (debug) --- */
+/* prog firmware.bin carte_dir|.zip [frames] [capture.ppm] — la capture
+ * permet de vérifier l'écran du jeu dans le cœur wasm exact du build
+ * navigateur (mêmes sources, sans SDL initialisée). */
 
 int main(int argc, char **argv) {
     memset(sram, 0xff, SRAM_SIZE);
     hashMode = 1;
     hashInterval = 5000000;
     ihashOn = 1;
-    if (argc < 3) { fprintf(stderr, "usage: prog firmware.bin carte_dir [frames]\n"); return 1; }
-    load_firmware(argv[1], 0);
-    if (fwLoaded) boot_vectors();
+    if (argc < 3) { fprintf(stderr, "usage: prog firmware.bin|.zip carte_dir|.zip [frames] [capture.ppm]\n"); return 1; }
+    { /* argv[1] = zip (PK) : carte+firmware, comme le drop du navigateur */
+        FILE *z = fopen(argv[1], "rb");
+        int iszip = 0;
+        if (z) { unsigned char sig[2] = {0,0}; iszip = fread(sig, 1, 2, z) == 2 && sig[0] == 'P' && sig[1] == 'K'; fclose(z); }
+        if (iszip) {
+            load_sd_from_path(argv[1]);
+            if (fwLoaded) boot_vectors();
+        } else {
+            load_firmware(argv[1], 0);
+            if (fwLoaded) boot_vectors();
+            if (argc > 2) load_sd_from_path(argv[2]);
+        }
+    }
     int frames = argc > 3 ? atoi(argv[3]) : 700;
     for (int f = 0; f < frames; f++) run_emulated_frame();
     fprintf(stderr, "FINAL %u %08x\n", tickCount, state_hash());
+    uint32_t h = 0x811c9dc5u;
+    int nz = 0;
+    for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
+        h = (h ^ pix[i]) * 0x01000193u;
+        if (pix[i]) nz++;
+    }
+    fprintf(stderr, "ECRAN %08x nz=%d\n", h, nz);
+    if (argc > 4) {
+        FILE *g = fopen(argv[4], "wb");
+        if (g) {
+            fprintf(g, "P6\n%d %d\n255\n", SCR_W, SCR_H);
+            for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
+                uint16_t p = pix[i];
+                unsigned char rgb[3] = {
+                    (unsigned char)(((p >> 11) & 0x1f) * 255 / 31),
+                    (unsigned char)(((p >> 5) & 0x3f) * 255 / 63),
+                    (unsigned char)((p & 0x1f) * 255 / 31) };
+                fwrite(rgb, 1, 3, g);
+            }
+            fclose(g);
+        }
+    }
     return 0;
 }
 
@@ -4506,11 +4812,20 @@ int main(int argc, char **argv) {
         if (maxFrames && frame >= maxFrames) break;
 #ifdef __EMSCRIPTEN__
 #else
-        /* test headless : EMU_PRESS_A=<frame> appuie sur A 6 frames */
+        /* test headless : EMU_PRESS_A=<frame> appuie sur A 6 frames
+         * (idem EMU_PRESS_B / EMU_PRESS_MENU — « A+B » des titres, Start) */
         static int pressA = -1;
+        static int pressB = -1;
+        static int pressM = -1;
         if (pressA < 0) pressA = getenv("EMU_PRESS_A") ? atoi(getenv("EMU_PRESS_A")) : 0;
+        if (pressB < 0) pressB = getenv("EMU_PRESS_B") ? atoi(getenv("EMU_PRESS_B")) : 0;
+        if (pressM < 0) pressM = getenv("EMU_PRESS_MENU") ? atoi(getenv("EMU_PRESS_MENU")) : 0;
         if (pressA && (frame == pressA)) btn_press(BTN_A);
         if (pressA && (frame == pressA + 6)) btn_release(BTN_A);
+        if (pressB && (frame == pressB)) btn_press(BTN_B);
+        if (pressB && (frame == pressB + 6)) btn_release(BTN_B);
+        if (pressM && (frame == pressM)) btn_press(BTN_MENU);
+        if (pressM && (frame == pressM + 6)) btn_release(BTN_MENU);
 #endif
 
         if (fwLoaded) run_emulated_frame();
@@ -4669,9 +4984,18 @@ EMSCRIPTEN_KEEPALIVE
 int emu_select_game(const char *name) {
     for (int i = 0; i < nvfiles; i++) {
         if (strcasecmp(vfiles[i].path, name) != 0) continue;
-        if (!vfile_is_game(&vfiles[i])) return 0;
+        size_t nl = strlen(vfiles[i].path);
+        int iszip = nl > 4 && strcasecmp(vfiles[i].path + nl - 4, ".zip") == 0;
+        if (!iszip && !vfile_is_game(&vfiles[i])) return 0;
         reset_core();
         booted = 0;
+        if (iszip) {
+            /* zip = carte complète + son premier .bin comme firmware
+             * (même chemin que le drop navigateur, aplatissement inclus) */
+            if (!zip_load_card(vfiles[i].data, vfiles[i].size)) return 0;
+            emu_boot();
+            return 1;
+        }
         char base[1024];
         const char *sl = strrchr(name, '/');
         snprintf(base, sizeof(base), "%s", sl ? sl + 1 : name);

@@ -4,9 +4,12 @@
  * Le standalone embarque automatiquement tous ces fichiers en base64. */
 window.OFFLINE_GAMES = [
   { n: '🐰 Lapinou', f: 'lapinou.bin' },
-  /* jeux du site META (bins de l'émulateur intégré, servis offline) */
+  /* jeux du site META vérifiés dans le cœur wasm (voir NOTES-SD-LIB-OFFICIELLE.md) */
+  { n: '⛰ Celeste', f: 'celeste.zip' },
+  { n: '👾 Picomon', f: 'picomon.zip' },
   { n: '🚗 GB Theft Auto', f: 'games/gamebuino-theft-auto.bin' },
-  { n: '🎲 Yatzy', f: 'games/yatzy.bin' },
   { n: '⚔ Reuben Quest', f: 'games/reuben-quest-lost-between-times.bin' },
+  /* démarrent (boot + SD OK) mais leur contenu demande les assets du site */
+  { n: '🎲 Yatzy', f: 'games/yatzy.bin' },
   { n: '🐱 Cats & Coins', f: 'games/cats-and-coins.bin' },
 ];
