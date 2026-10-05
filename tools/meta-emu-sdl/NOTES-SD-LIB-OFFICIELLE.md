@@ -330,6 +330,27 @@ mal interprété la destination du saut :
   (3 runs, même hash). Réessayer si un zip officiel complet refait
   surface (le « Download » du site sert le projet source, pas le bin).
 
+## Le bruit parasite permanent (2026-10-05 — DAC mappé avec wrap int16)
+
+Tous les jeux lib (Celeste comprise, « sans son ») émettaient un bruit
+permanent : `Sound::begin` arme TC5 dès le boot et `Audio_Handler`
+écrit `analogWrite(A0, 0)` au repos (« output 0 when not in use »,
+Sound.cpp ; `flowdown` ne monte vers 512 que quand du son joue).  Le
+mapping `s = (v - 511) * 96` casté int16 wrappait ce 0 : (0−511)×96 =
+−49056 → **+16480** (rail de DC à 50 % sous tout le son des jeux lib ;
+les bips de Pong descendaient du rail au lieu d'être centrés).
+
+Fix dans `dac_write` :
+- **saturation int16** (fini le wrap) ;
+- **passe-haut 1er ordre (~35 Hz)** modelant le couplage AC de l'ampli
+  META : le 0 V au repos est du silence, tout DC est bloqué, le plop de
+  convergence est évité en initialisant le filtre sur la première
+  valeur.
+
+Mesures : Celeste → silence parfait (dc 0.000, peak 0) ; Pong → 8,8 %
+d'échantillons actifs = uniquement les bips ; Lapinou → dc −0.004
+(le DC de repos +96 disparaît, musique intacte).
+
 ## Le bug BLX (2026-10-05 — cause racine de TOUS les « états ouverts »)
 
 Le décodeur `BLX rm` (format T2, 0x47C0..0x47FF) lisait le registre sur

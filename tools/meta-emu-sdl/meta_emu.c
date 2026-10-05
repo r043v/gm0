@@ -391,10 +391,22 @@ static void wav_finish(void) {
 static void dac_write(uint16_t v) {
     tc4Writes++;
     v &= 0x3ffu; /* le TS masque sur 10 bits (DAC->DATA & 0x3ff) */
-    /* v : 256..766 (milieu 512) -> s16 */
-    int16_t s = (int16_t)((v - 511) * 96);
-    audio_push(s);
-    wav_put(s);
+    /* v : 256..766 (milieu 512) -> s16, SATURÉ : la lib officielle écrit
+     * DATA=0 au repos (« output 0 when not in use », Sound.cpp) et le
+     * cast int16 wrappait -49056 en +16480 — un rail de DC à 50 % sous
+     * tout jeu lib : LE bruit parasite permanent (Celeste comprise). */
+    int s = (v - 511) * 96;
+    if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
+    /* couplage AC de l'ampli META : le 0 V au repos est du silence, pas
+     * un rail ; un passe-haut 1er ordre (~35 Hz) bloque la composante
+     * continue de n'importe quel jeu sans toucher le signal */
+    static float dcX, dcY; static int dcInit;
+    if (!dcInit) { dcX = (float)s; dcInit = 1; } /* pas de plop au boot */
+    dcY = 0.995f * dcY + (float)s - dcX;
+    dcX = (float)s;
+    int16_t out = (int16_t)(dcY > 32767.f ? 32767.f : (dcY < -32768.f ? -32768.f : dcY));
+    audio_push(out);
+    wav_put(out);
 }
 
 /* --------------------------------------------------- carte SD (PA27) */
@@ -4586,7 +4598,7 @@ static void meta_audio_reopen(double freq) {
     audioHold = 0;
     audioPending = 1; /* re-prébuffer avant de reparler */
     SDL_PauseAudioDevice(dev, 0);
-    fprintf(stderr, "audio : %d Hz (cadence TC4 du jeu −250 ppm)\n", (int)(freq + 0.5));
+    fprintf(stderr, "audio : %d Hz (cadence timer du jeu −250 ppm)\n", (int)(freq + 0.5));
 }
 
 static int noPad(void) {
