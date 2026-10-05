@@ -4467,6 +4467,13 @@ static void pk_audio_cb(Uint8 *stream, int len) {
     float err = 0;
     for (int i = 0; i < len; i++) {
         if (pk_aqSize < (uint32_t)len) {
+            /* à sec : la production (temps émulé) va un peu moins vite que la
+             * consommation (temps réel) dès que le pacing passe sous 100 % —
+             * sans resynchro la file restait vide pour toujours (silence) et
+             * le retour du son donnait des plages étirées.  On saute au
+             * présent : ~600 latches d'avance, comme la reprise franche META. */
+            pk_aqStart = (pk_aqEnd + PK_AQ_SIZE - 600) & PK_AQ_MASK;
+            pk_aqSize = (PK_AQ_SIZE - 600) & PK_AQ_MASK;
             for (; i < len; i++) stream[i] = (uint8_t)pk_audioHoldF;
             return;
         }
