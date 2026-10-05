@@ -5371,9 +5371,14 @@ int main(int argc, char **argv) {
         if (emuTarget == TGT_POKITTO && ENVFLAG("EMU_DMA_TRACE") && (frame % 300) == 0) {
             uint32_t msc = pk_rd32le(sram + (0x10005c64u - 0x10000000u));
             uint32_t gframe = pk_rd32le(sram + (0x10000508u - 0x10000000u));
-            fprintf(stderr, "[derive] f=%u tick=%u ms=%u (%.1f Hz) gbf=%u (%.2f fps)\n",
-                    frame, tickCount, msc, (double)msc * pk_core_hz() / (double)tickCount,
-                    gframe, (double)gframe * pk_core_hz() / (double)tickCount);
+            static Uint32 w0 = 0; if (!w0) w0 = SDL_GetTicks();
+            Uint32 w = SDL_GetTicks() - w0;
+            fprintf(stderr, "[derive] f=%u tick=%u wall=%.2fs ms=%u (%.1f Hz emu | %.1f Hz wall) gbf=%u (%.2f fps emu | %.2f fps wall)\n",
+                    frame, tickCount, w / 1000.0, msc,
+                    (double)msc * pk_core_hz() / (double)tickCount,
+                    (double)msc * 1000.0 / (double)w,
+                    gframe, (double)gframe * pk_core_hz() / (double)tickCount,
+                    (double)gframe * 1000.0 / (double)w);
         }
 
         if (emuTarget == TGT_POKITTO) pk_adc_frame();
