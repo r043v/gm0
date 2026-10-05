@@ -2442,26 +2442,62 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
     }
 }
 
+/* Fast-path flash + SRAM principale : ce sont les MÊMES tampons que le
+ * cœur META (factorisation), et ces lectures n'ont pas d'effet de bord —
+ * sinon chaque accès pokitto traversait pk_reg_peek et le grand switch
+ * LPC, et le cœur tombait à 62-80 % du temps réel (l'audio META fait
+ * 295 %).  Les autres régions (MMIO, banques 2 Ko) gardent la voie lente :
+ * leurs lectures ont des effets (FIFO, ADC...). */
+static uint32_t pk_rd16le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+}
+static int pk_in_ram(uint32_t a, uint32_t n) {
+    uint32_t o = a - 0x10000000u;
+    return a >= 0x10000000u && o <= SRAM_SIZE - n;
+}
 static uint32_t pk_read_word(uint32_t a) {
-    uint32_t v = pk_reg_read(a & ~3u);
-    return v;
+    a &= ~3u;
+    if (a + 4 <= FLASH_SIZE) return pk_rd32le(flash + a);
+    if (pk_in_ram(a, 4)) return pk_rd32le(sram + (a - 0x10000000u));
+    return pk_reg_read(a);
 }
 static uint16_t pk_read_half(uint32_t a) {
+    a &= ~1u;
+    if (a + 2 <= FLASH_SIZE) return (uint16_t)pk_rd16le(flash + a);
+    if (pk_in_ram(a, 2)) return (uint16_t)pk_rd16le(sram + (a - 0x10000000u));
     uint32_t v = pk_reg_read(a & ~3u);
     return (uint16_t)(v >> ((a & 2) << 3));
 }
 static uint8_t pk_read_byte(uint32_t a) {
+    if (a < FLASH_SIZE) return flash[a];
+    if (pk_in_ram(a, 1)) return sram[a - 0x10000000u];
     uint32_t v = pk_reg_read(a & ~3u); /* mot aligné, puis lane d'octet */
     return (uint8_t)(v >> ((a & 3) << 3));
 }
-static void pk_write_word(uint32_t a, uint32_t v) { pk_reg_write(a & ~3u, v); }
+/* écritures : seule la SRAM principale est court-circuitée (store direct) ;
+ * la flash a un effet (HardFault, comme la référence) et les MMIO aussi. */
+static void pk_write_word(uint32_t a, uint32_t v) {
+    a &= ~3u;
+    if (pk_in_ram(a, 4)) {
+        uint8_t *p = sram + (a - 0x10000000u);
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+        return;
+    }
+    pk_reg_write(a, v);
+}
 static void pk_write_half(uint32_t a, uint16_t v) {
+    if ((a & 1u) == 0u && pk_in_ram(a, 2)) {
+        uint8_t *p = sram + (a - 0x10000000u);
+        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+        return;
+    }
     uint32_t al = a & ~3u;
     uint32_t old = pk_reg_peek(al);
     uint32_t lane = (uint32_t)(a & 2) << 3;
     pk_reg_write(al, (old & ~(0xFFFFu << lane)) | ((uint32_t)v << lane));
 }
 static void pk_write_byte(uint32_t a, uint8_t v) {
+    if (pk_in_ram(a, 1)) { sram[a - 0x10000000u] = v; return; }
     uint32_t al = a & ~3u;
     uint32_t old = pk_reg_peek(al);
     uint32_t sh = (uint32_t)(a & 3) << 3;
@@ -4373,7 +4409,7 @@ static void step(void) {
     }
     if (profOn) {
         if (profOn < 0) {
-            profOn = getenv("EMU_PROF") && emuTarget == TGT_META;
+            profOn = getenv("EMU_PROF") != NULL;
             if (profOn) { profFlash = calloc(FLASH_SIZE / 2, 4); profSram = calloc(SRAM_SIZE / 2, 4); }
         }
         if (profOn) prof_add(pc, cyc + flashWaits);
@@ -4534,6 +4570,12 @@ static uint8_t pad_button_mask(uint8_t b) {
             case SDL_CONTROLLER_BUTTON_Y: return BTN_HOME;      /* D */
             case SDL_CONTROLLER_BUTTON_START: return BTN_MENU;
             case SDL_CONTROLLER_BUTTON_BACK: return BTN_HOME;
+            /* croix directionnelle, comme sur META (les boutons du pad
+             * pokitto sont des GPIO, via pk_btn_gpio) */
+            case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return BTN_DOWN;
+            case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return BTN_LEFT;
+            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return BTN_RIGHT;
+            case SDL_CONTROLLER_BUTTON_DPAD_UP: return BTN_UP;
             default: return 0;
         }
     }
