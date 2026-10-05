@@ -112,7 +112,8 @@ l'ordre est celui de la lib (down,left,right,up,a,b,menu,home), à
 d'après le registre BAUD du SERCOM4 au moment de la lecture ;
 **EMU_BTN_ORDER=lapinou** force l'ordre 24 MHz si besoin.
 Touches Pokitto : **I/K/J/L** ou flèches = directions, **A**=A,
-**S/B**=B, **D/C**=C, **F**=D (éclairage).  **F5** redémarre le jeu
+**S/B**=B, **D/C**=C, **F**=D (éclairage) — ou comme sur META :
+**Entrée**=C, **Espace**=A, **Ctrl**=B.  **F5** redémarre le jeu
 (les deux cibles ; la carte SD et l'EEPROM Pokitto sont conservées).
 
 **Manette** (SDL_GameController ; bascule automatique sur joystick brut) :

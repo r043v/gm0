@@ -4263,6 +4263,10 @@ static uint8_t key_bit(SDL_Keycode sym) {
             case SDLK_s: case SDLK_b: return BTN_B;
             case SDLK_d: case SDLK_c: return BTN_MENU;         /* C */
             case SDLK_f: return BTN_HOME;                      /* D (éclairage) */
+            /* comme sur META : Espace=A, Ctrl=B, Entrée=C (menu) */
+            case SDLK_SPACE: return BTN_A;
+            case SDLK_LCTRL: case SDLK_RCTRL: return BTN_B;
+            case SDLK_RETURN: case SDLK_KP_ENTER: return BTN_MENU;
             default: return 0;
         }
     }
