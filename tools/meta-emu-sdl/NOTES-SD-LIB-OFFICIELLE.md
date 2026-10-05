@@ -140,6 +140,58 @@ Ce que la session a établi (utile pour la suite) :
   sujet (parité TS).
 - Lapinou configure TC4 en MFRQ presc=16, CC0=136 → 21904 Hz attendus.
 
+## AUDIO (2026-10-05 — famine de lapinou : cause racine mesurée et corrigée)
+
+La conclusion « famine inhérente » du 2026-10-04 était **fausse**.  Preuves
+et correction (tout est mesuré, scripts de mesure reproduisibles) :
+
+**1. Le mixeur n'est pas en déficit.**  Rendu hors-ligne de la chanson
+(`music.h` du source lapinou, `pmf_player` compilé sur hôte, mêmes
+dynamique de double tampon 2×1280) : **2,93 % de vrais zéros mixés**,
+14935 runs, trou max 1730 échantillons.  WAV de l'émulateur : **2,94 %**,
+~14880 runs, trou max 1730.  La signature « v=512 → 96 » que l'on prenait
+pour de la famine est le **silence du morceau lui-même** (les cases lues
+avant écriture et un échantillon mixé à 0 donnent la même valeur DAC).
+L'ISR sert chaque tir : FIRE == DACW sur toute la trace (873985 == 873985).
+
+**2. Le 48 MHz n'est pas la solution.**  Passer le domaine à 48 M ticks/s
+(horloge réelle du SAMD21) fait tomber l'hôte à **72 % du temps réel**
+(2400 frames = 56 s de mur au lieu de 40,2 ; le domaine TS tient 100 %).
+Le jeu produit alors son audio à 72 % du débit de consommation : famine
+pire qu'avant.  Domaine TS conservé (EMU_TICKS_HZ reste disponible,
+expérimental).
+
+**3. La vraie cause : dérive production/consommation + trim brutal.**
+Production = cadence TC4 du domaine TS = 20e6/913 = **21907 éch/s** ;
+consommation SDL fixe = **22049 éch/s** → déficit de 142 éch/s en
+continu : le prébuffer (600) est mangé en ~4 s, puis sous-débittest
+permanent — chaque case vide joue `audioHold/2` (crépitement) et le
+garde-fou AQ_LATENCY jetait d'un coup des centaines d'échantillons
+(clics).  C'est LA famine audible, indépendante de la charge hôte.
+
+**4. Correction (meta_emu.c) :**
+- la sortie SDL est (ré)ouverte à la **cadence TC4 réelle du jeu**,
+  dérivée de sa config CTRLA/CC0 (`tc4_period_ticks`, arrondi au plus
+  proche — lapinou : 913 ticks → 21907/s ; les chemins IRQ et DMA TC4
+  partagent la même formule, le DMA n'est plus fixé à 907) ;
+- consommation calée **250 ppm sous** la production
+  (`AUDIO_CONSUME_SLIP 0.9975`) : l'anneau se réépaissit seul (~56
+  éch/s) après toute perte hôte (stall, onglet wasm) — pitch +0,25 %,
+  inaudible ;
+- trim de latence **ramolli** : 2 échantillons par poussée au-delà du
+  plafond (même rééchantillonnage ±0,25 %), reprise franche seulement
+  au-delà de +8192 (stall catastrophe).
+
+Résultat lapinou : production 21907/s, consommation 21851/s, hôte 100 %
+du temps réel, contenu identique au rendu de référence.  Non-régressions
+: `ctest -R meta` 8/8 ; banc couleurs inchangé (lapinou 25, celeste 6,
+yatzy 4, reuben 11, theft-auto 5, cats-and-coins 4 — 900/2400/3600
+frames selon le banc du 2026-10-04).  picomon.zip (le zip de ce dossier)
+: 13 couleurs déterministes à 900 frames — le jeu ne configure pas TC4
+avant cet instant et mes changements ne touchent pas son chemin (bench
+antérieur « 16 » : refaire avec le zip d'origine du banc si besoin).
+wasm + meta-emu-standalone.html reconstruits.
+
 ## BANC DE TEST COMPLET (2026-10-04, natif headless, captures /tmp/bench_*)
 
 Méthode : `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu …

@@ -3,8 +3,9 @@
 Port C du fork TypeScript (`output/gbemu/`) : interpréteur ARMv6-M Thumb,
 périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
 (image brute ou dossier FAT16 construit à la volée) et frontal SDL2
-(fenêtre 160×128, clavier, audio 22 049 Hz).  Se compile aussi en
-**WebAssembly** (même cœur, navigateur).
+(fenêtre 160×128, clavier, audio ouvert à la cadence TC4 du jeu, calée
+250 ppm sous sa production — cf. NOTES, section AUDIO du 2026-10-05).
+Se compile aussi en **WebAssembly** (même cœur, navigateur).
 
 **Jeux maison sans lib standard** (ex. lapinou : buffer demi-écran envoyé
 en DMA blocs vers `SERCOM4->SPI.DATA`, pilote SD et audio PMF écrits à la

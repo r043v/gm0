@@ -3,9 +3,13 @@
  * (gamebuino-emulator + nos ajouts : exécution SRAM, carte SD, TC4/DAC).
  *
  * Fidèle à meta_audio.cpp / meta_main.cpp / meta_sd.cpp du firmware gbl :
- *  - TC4 en 0x42003000, interruption IRQ19 toutes les 907 instructions
- *    (369 tirs par frame, comme la carte attend) ;
- *  - DAC DATA en 0x42004808 -> sortie audio SDL (22 049 Hz) ;
+ *  - domaine de ticks TS 20 M/s par défaut (EMU_TICKS_HZ pour surcharger ;
+ *    aucun hôte ne tient 48 M ticks/s en temps mur, cf. NOTES) ;
+ *  - TC4 en 0x42003000, interruption IRQ19 à la cadence exacte de la
+ *    config du jeu (prescale × (CC0+1) cycles du GCLK 48 MHz, mise à
+ *    l'échelle du domaine) ;
+ *  - DAC DATA en 0x42004808 -> sortie SDL ouverte à la cadence TC4 du
+ *    jeu −250 ppm (AUDIO_CONSUME_SLIP), sinon dérive et famine ;
  *  - carte SD SPI en PA27, image brute (.img) ou dossier… non : image
  *    brute uniquement ici (le C n'a pas besoin de plus pour tester) ;
  *  - écran ST7735 160x128 rendu dans une fenêtre SDL2 x2 ;
@@ -165,9 +169,10 @@ static uint8_t  sd_writeBuf[515];
 
 /* audio SDL : anneau producteur (ISR) -> consommateur (callback) */
 #define AQ_SIZE 65536
-/* plafond de latence son/image : au-delà, on jette le plus ancien.  Sans
- * ça, chaque burst du rAF (onglet réveillé, stall) accumule un retard
- * définitif — l'anneau ne se corrige jamais tout seul (3 s = 65536). */
+/* plafond de latence son/image : au-delà, on rattrape doucement (2 éch.
+ * par poussée, cf. audio_push) ; une seule reprise franche au-delà de
+ * +8192 (stall catastrophe).  La consommation étant calée 250 ppm sous
+ * la production, l'anneau se réépaissit seul après toute perte hôte. */
 #define AQ_LATENCY 900
 static int16_t aq[AQ_SIZE];
 static volatile int aq_head, aq_tail; /* tail = écrit, head = lu */
@@ -192,13 +197,38 @@ static int armIrqEnable = 1;       /* PRIMASK inversé (CPSIE/CPSID, Pokitto) */
 
 static unsigned SCR_W = 160, SCR_H = 128;
 
-/* ticks émulés par seconde : hack TS (20 M ticks/s) pour la META ; pour la
- * Pokitto, horloge réelle de la référence (SYSPLLCTRL 0x23 -> 45 MHz) */
-static uint32_t frame_ticks(void) {
-    return emuTarget == TGT_POKITTO ? 753431u : 334860u;
+/* ticks émulés par seconde : pour la META, le domaine « TS » à 20 M (le
+ * pacing 59,7275 tr/s × 334857 ticks tient 100 % du temps réel sur hôte
+ * natif comme en wasm).  Le SAMD21 réel est à 48 MHz mais l'expérience
+ * (2026-10-05) montre qu'aucun hôte testé ne soutient 48 M ticks/s en
+ * temps mur (72 % ici) : le jeu rendrait un audio en sous-débittest
+ * permanent.  Le mixeur PMF de lapinu tient la cadence dès 20 M — le
+ * contenu produit est identique au rendu hors-ligne de référence.
+ * EMU_TICKS_HZ=<n> surcharge (expérimental : au-delà de ce que l'hôte
+ * soutient, le son ralentit d'autant).
+ * Pour la Pokitto, horloge réelle de la référence (SYSPLLCTRL 0x23 -> 45 MHz) */
+static double emuTicksPerSec = 20000000.0;
+static uint32_t emuTicksPerMs = 20000u; /* 1 ms émulée = 20000 ticks */
+static uint32_t emuTicksPerUs = 20u;
+
+static void init_clock(void) {
+    const char *e = getenv("EMU_TICKS_HZ");
+    if (!e || emuTarget != TGT_META) return;
+    double hz = atof(e);
+    if (hz < 1000000.0) return;
+    emuTicksPerSec = hz;
+    emuTicksPerMs = (uint32_t)(hz / 1000.0 + 0.5);
+    emuTicksPerUs = (uint32_t)(hz / 1000000.0 + 0.5);
 }
+
 static double ticks_per_sec(void) {
-    return emuTarget == TGT_POKITTO ? 45000000.0 : 20000000.0;
+    return emuTarget == TGT_POKITTO ? 45000000.0 : emuTicksPerSec;
+}
+static uint32_t frame_ticks(void) {
+    /* domaine TS historique : littéral d'origine conservé bit-exact (le
+     * bench par capture à frame fixe doit rester reproductible) */
+    if (emuTarget != TGT_POKITTO && emuTicksPerSec == 20000000.0) return 334860u;
+    return (uint32_t)(ticks_per_sec() / 59.7275 + 0.5);
 }
 
 /* prototypes du bloc Pokitto (défini après la section FAT/zip) */
@@ -272,7 +302,15 @@ static void audio_push(int16_t s) {
     aq_tail = next;
     int ahead = aq_tail - aq_head;
     if (ahead < 0) ahead += AQ_SIZE;
-    if (ahead > AQ_LATENCY) aq_head = (aq_head + ahead - AQ_LATENCY) % AQ_SIZE;
+    if (ahead > AQ_LATENCY + 8192) { /* stall catastrophe : reprise franche */
+        aq_head = (aq_head + ahead - AQ_LATENCY) % AQ_SIZE;
+    } else if (ahead > AQ_LATENCY) {
+        /* surplus ordinaire (production ≥ consommation) : rattrapage doux,
+         * 2 échantillons max par poussée — un saut sec de centaines
+         * d'échantillons s'entend comme un clic ; 2/poussée = le même
+         * rééchantillonnage ±0,25 % que AUDIO_CONSUME_SLIP, inaudible */
+        aq_head = (aq_head + 2) % AQ_SIZE;
+    }
 }
 
 /* à appeler chaque itération de boucle : ouvre le gate quand le
@@ -286,6 +324,32 @@ static void audio_resume_when_ready(void) {
     int ahead = aq_tail - aq_head;
     if (ahead < 0) ahead += AQ_SIZE;
     if (ahead >= 600) audioPending = 0;
+}
+
+/* fréquence DAC du jeu : cadence TC4 réelle dans le domaine actif
+ * (ticks_per_sec / période en ticks), légèrement sous-consommée pour
+ * laisser l'anneau se remplir après toute perte hôte (stall, onglet).
+ * La sortie SDL est (ré)ouverte à cette fréquence : consommer 22 049
+ * fixe contre une production à ~22 004/s dérivait de 45 éch/s en
+ * continu — l'anneau se vidait en ~14 s puis tenait en sous-débittest
+ * (holds + trims AQ_LATENCY) : LA famine audible de lapinou, alors que
+ * le contenu produit est complet (rendu hors-ligne identique). */
+static double emuDacRate = 22049.0;
+static void meta_audio_reopen(double freq); /* défini avec le bloc SDL */
+#define AUDIO_CONSUME_SLIP 0.9975 /* −250 ppm : récupération du ring, pitch +0,25 % (inaudible) */
+
+/* période TC4 en ticks émulés : prescale × (CC0+1) cycles du GCLK 48 MHz,
+ * ramenés au domaine de ticks (× emuTicksPerUs/48, arrondi au plus
+ * proche ; ×1 au domaine natif 48 MHz, ×5/12 dans le domaine TS 20 MHz) */
+static uint32_t tc4_period_ticks(void) {
+    static const uint16_t prescTab[8] = {1, 2, 4, 8, 16, 64, 256, 1024};
+    uint32_t cycles = (uint32_t)prescTab[(tc4CtrlA >> 8) & 7u] * (tc4Top + 1u);
+    uint32_t per = (uint32_t)(((uint64_t)cycles * emuTicksPerUs + 24u) / 48u);
+    return per < 2 ? 2 : per;
+}
+
+static double tc4_config_rate(void) {
+    return ticks_per_sec() / (double)tc4_period_ticks() * AUDIO_CONSUME_SLIP;
 }
 
 static void wav_put(int16_t s) {
@@ -307,7 +371,8 @@ static void wav_finish(void) {
     fwrite(w4, 1, 4, wavFile);
     fclose(wavFile);
     wavFile = NULL;
-    printf("WAV : %u échantillons (%.1f s)\n", wavSamples, (double)wavSamples / 22049.0);
+    printf("WAV : %u échantillons (%.1f s à %.0f Hz)\n", wavSamples,
+           (double)wavSamples / emuDacRate, emuDacRate);
 }
 
 static void dac_write(uint16_t v) {
@@ -2837,8 +2902,8 @@ static uint32_t periph_read(uint32_t a, int *handled) {
         if (sysTickCountFlag) { v |= 1u << 16; sysTickCountFlag = 0; }
         return v;
     }
-    if (a == 0xe000e014u) { *handled = 1; return 19999u; }      /* RVR : 20000 ticks/ms */
-    if (a == 0xe000e018u) { *handled = 1; return 19999u - (sysTickTrigger % 20000u); } /* CVR */
+    if (a == 0xe000e014u) { *handled = 1; return emuTicksPerMs - 1u; }      /* RVR : 1 tick/ms du domaine émulé */
+    if (a == 0xe000e018u) { *handled = 1; return (emuTicksPerMs - 1u) - (sysTickTrigger % emuTicksPerMs); } /* CVR */
     if (a == 0xe000e01cu) { *handled = 1; return 0; }           /* CALIB */
     if (a == 0x41004018u) { *handled = 1; return 0; }           /* NVM STATUS */
     if (a == 0x41004820u) { /* INTPEND : premier canal avec un drapeau levé
@@ -3007,8 +3072,8 @@ static void writeWord(uint32_t a, uint32_t v) {
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     if (a == 0x42001828u) { sercom4_write((uint8_t)v); return; } /* SERCOM4 DATA */
     if (a == 0x42004808u) { if (emuSiteModel <= 0) dac_write((uint16_t)v); return; }    /* DAC DATA */
-    if (a == 0x42003000u) { if (emuSiteModel > 0) return; if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
-    if (a == 0x42003018u) { tc4Top = v; return; }                /* TC4 CC0 */
+    if (a == 0x42003000u) { if (emuSiteModel > 0) return; if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
+    if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }                /* TC4 CC0 */
     if (a == 0x4200300cu) { tc4IntEnMask &= (uint8_t)~v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENCLR */
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; } /* TC4 INTENSET : OVF=0x01 (jeux maison), MC0=0x10 (lib standard) */
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; } /* TC4 INTFLAG (acquittement) */
@@ -3063,7 +3128,7 @@ static void writeWord(uint32_t a, uint32_t v) {
                  * sort le canal de sa suspension après bloc) */
                 if (dmaOn[dmac_chid] && (dmaDst[dmac_chid] == 0x42001828u || dmaTrig[dmac_chid] == DMAC_TRIG_SERCOM4_TX)) {
                     uint32_t b = (spiBaud & 0xFFu) + 1;
-                    spiBeatTicks = (b * 20u + 1u) / 3u;
+                    spiBeatTicks = (b * emuTicksPerUs + 1u) / 3u;
                     if (spiBeatTicks < 1) spiBeatTicks = 1;
                     spiBeatAcc = 0;
                     spiDmaCh = (int)dmac_chid;
@@ -3163,7 +3228,7 @@ static void writeWord(uint32_t a, uint32_t v) {
                 dma_load(dmac_chid, dmac_desc);
                 if (dmaOn[dmac_chid]) {
                     uint32_t b = (spiBaud & 0xFFu) + 1;
-                    spiBeatTicks = (b * 20u + 1u) / 3u; /* 8 bits @ f/2(1+b), 20000 ticks/ms */
+                    spiBeatTicks = (b * emuTicksPerUs + 1u) / 3u; /* 8 bits @ f/2(1+b), 24 Mo/s à BAUD=0 */
                     if (spiBeatTicks < 1) spiBeatTicks = 1;
                     spiBeatAcc = 0;
                     spiDmaCh = (int)dmac_chid;
@@ -3236,8 +3301,8 @@ static void writeHalf(uint32_t a, uint16_t v) {
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff; return; }
     if (a == 0x42004808u) { if (dbg() && dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
     if (emuSiteModel > 0) return; /* modèle du site */
-    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; return; }
-    if (a == 0x42003018u) { tc4Top = v; return; }
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
+    if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; }
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; }
     if (a == 0x40000c02u) { if (dbg() && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v); dbgTc4Cfg++; } return; }
@@ -3337,9 +3402,12 @@ static void incrementPc(void) {
 
     if (emuTarget == TGT_POKITTO) return; /* timers LPC dans pk_machine_step */
     if (tc4Enabled && tc4Top > 0 && !tc4Armed && dma_tc4_active()) {
-        /* TC4 sans interruption, lu par DMA : cadence fixe, 1 ms = 20000
-         * ticks (SysTick émulé), donc 907 ticks par échantillon à 22 kHz */
-        if (++tc4Counter >= 907u) {
+        /* TC4 sans interruption, lu par DMA : même cadence que le chemin
+         * interruption, dérivée de la vraie config (MFRQ) — F = GCLK_TC4 /
+         * (prescale × (CC0+1)), GCLK audio = 48 MHz ; en ticks émulés ça
+         * revient à × emuTicksPerSec/48e6 (1.0 au domaine natif 48 MHz). */
+        uint32_t per = tc4_period_ticks();
+        if (++tc4Counter >= per) {
             tc4Counter = 0;
             tc4Fires++;
             for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
@@ -3348,13 +3416,10 @@ static void incrementPc(void) {
     } else if (tc4Enabled && tc4Armed && tc4Top > 0) {
         /* cadence dérivée de la vraie config (MFRQ) : F = GCLK_TC4 /
          * (prescale × (CC0+1)) ; GCLK audio = 48 MHz (lib standard et jeux
-         * maison), domaine de ticks de l'ému : 20000/ms → période =
-         * prescale × (CC0+1) × 20000/48 = ×5/12.  L'ancien gouverneur
-         * heuristique du TS comprimait la période quand le jeu sert chaque
-         * interruption immédiatement (son qui accélère à l'infini). */
-        static const uint16_t prescTab[8] = {1, 2, 4, 8, 16, 64, 256, 1024};
-        uint32_t cfg = (uint32_t)prescTab[(tc4CtrlA >> 8) & 7u] * (tc4Top + 1) * 5u / 12u;
-        tc4Period = cfg < 2 ? 2 : cfg;
+         * maison).  L'ancien gouverneur heuristique du TS comprimait la
+         * période quand le jeu sert chaque interruption immédiatement
+         * (son qui accélère à l'infini). */
+        tc4Period = tc4_period_ticks();
         if (++tc4Counter >= tc4Period) {
             tc4Counter = 0;
             tc4Fires++;
@@ -3496,7 +3561,7 @@ static void step(void) {
             if (dmacInterrupt) {
                 dmacInterrupt = 0;
                 irq_inject(dmacVector);
-            } else if (sysTickTrigger >= 20000) {
+            } else if (sysTickTrigger >= emuTicksPerMs) {
                 sysTickTrigger = 0;
                 sysTickEntries++;
                 irq_inject(sysTickVector);
@@ -3510,7 +3575,7 @@ static void step(void) {
                 dmacInterrupt = 0;
                 irq_inject(dmacVector);
             }
-            if (sysTickTrigger >= 20000) { /* 1 ms émulée (hack du TS) */
+            if (sysTickTrigger >= emuTicksPerMs) { /* 1 ms émulée (horloge réelle 48 MHz) */
                 sysTickTrigger = 0;
                 sysTickEntries++;
                 sysTickCountFlag = 1;
@@ -4283,6 +4348,7 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
         if ((w0 & 0xFFFF0000u) == 0x10000000u) emuTarget = TGT_POKITTO;
         else if ((w0 & 0xFFFF0000u) == 0x20000000u) emuTarget = TGT_META;
         pk_screen_reconfig();
+        init_clock();
     }
     free(fwData);
     fwData = malloc(len ? len : 1);
@@ -4434,6 +4500,31 @@ static void pk_audio_reopen(int freq) {
     SDL_PauseAudioDevice(dev, 0);
 }
 
+/* (ré)ouvre la sortie META au taux DAC réel du jeu (config TC4) : le
+ * callback consomme 1:1, la conversion vers le matériel reste gérée par
+ * SDL2.  Plage raisonnable seulement : hors plage, on garde le device. */
+static void meta_audio_reopen(double freq) {
+    static double openRate = 22049.0;
+    if (!audioOk || freq <= 0.0) return;
+    if (freq == openRate) return;
+    emuDacRate = freq;
+    if (freq < 8000.0 || freq > 96000.0) return; /* config farfelue : device inchangé */
+    SDL_AudioSpec want, got;
+    memset(&want, 0, sizeof(want));
+    want.freq = (int)(freq + 0.5);
+    want.format = AUDIO_S16SYS; want.channels = 1;
+    want.samples = 1024; want.callback = audio_cb;
+    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+    if (!dev) return;
+    if (audioDev) { SDL_PauseAudioDevice(audioDev, 1); SDL_CloseAudioDevice(audioDev); }
+    audioDev = dev;
+    openRate = freq;
+    audioHold = 0;
+    audioPending = 1; /* re-prébuffer avant de reparler */
+    SDL_PauseAudioDevice(dev, 0);
+    fprintf(stderr, "audio : %d Hz (cadence TC4 du jeu −250 ppm)\n", (int)(freq + 0.5));
+}
+
 static int noPad(void) {
     static int v = -1;
     if (v < 0) v = getenv("EMU_NO_PAD") ? 1 : 0;
@@ -4469,7 +4560,7 @@ static int sdl_init_all(void) {
 
     SDL_AudioSpec want, got;
     memset(&want, 0, sizeof(want));
-    want.freq = 22049; want.format = AUDIO_S16SYS; want.channels = 1;
+    want.freq = (int)(emuDacRate + 0.5); want.format = AUDIO_S16SYS; want.channels = 1;
     /* 512 fige l'émulateur sur emscripten (SPN audio) : ne pas descendre */
     want.samples = 1024; want.callback = audio_cb;
     audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
@@ -4664,6 +4755,7 @@ int main(int argc, char **argv) {
         }
     }
     int frames = argc > 3 ? atoi(argv[3]) : 700;
+    init_clock();
     for (int f = 0; f < frames; f++) run_emulated_frame();
     fprintf(stderr, "FINAL %u %08x\n", tickCount, state_hash());
     uint32_t h = 0x811c9dc5u;
@@ -4767,6 +4859,7 @@ int main(int argc, char **argv) {
     }
     if (fwLoaded) boot_vectors();
     fwNeedsBoot = 0;
+    init_clock();
 
     static int trace = -1;
     if (trace < 0) trace = getenv("EMU_TRACE") ? 1 : 0;
