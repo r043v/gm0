@@ -4799,7 +4799,12 @@ static void update_title_pct(void) {
 static void run_emulated_frame(void) {
     uint32_t target = emu_nextFrameTick;
     while (tickCount < target) step();
-    emu_nextFrameTick += frame_ticks();
+    /* re-base sur tickCount : l'ancien `+= frame_ticks()` laissait
+     * emu_nextFrameTick franchir 2^32 UNE frame avant tickCount — le
+     * comparateur non signé ne voyait plus rien à exécuter et
+     * l'émulateur restait ~12 825 frames sans aucune instruction
+     * (214 s figées à la 3,6e minute de jeu, interruptions mortes). */
+    emu_nextFrameTick = tickCount + frame_ticks();
 }
 
 #if defined(EMU_NODE_HEADLESS)
