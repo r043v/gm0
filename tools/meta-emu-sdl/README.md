@@ -257,7 +257,14 @@ manquaient, toutes côté émulateur :
 - **interruption DMAC level-triggered** : le handler ne service qu'un
   canal par entrée ; sur circuit le NVIC ré-entre tant qu'un drapeau
   pend — l'émulateur ré-arme maintenant dmacInterrupt à chaque
-  acquittement si d'autres canaux attendent ;
+  acquittement si d'autres canaux attendent, **filtré par CHINTENSET**
+  (un canal dont l'interruption TCMPL n'est pas activée ne tire pas la
+  ligne : le canal audio TC4 des firmwares gbrecomp, dont le flag TCMPL
+  n'est jamais acquitté par le DMAC Handler, ré-armait l'interruption
+  en boucle — tempête de réentrance, pile hors SRAM, « pc fou » vers
+  t=7,4 M dans tout jeu converti 0.5.0).  CHINTENSET/CLR sont capturés
+  sur toutes les largeurs d'accès (le mot indexé seul laissait les strb
+  de la lib à la bande) ;
 - **collision display-DMA / SD** : les beats DMA de l'écran
   horlogenaient la machine SD et vidaient sa file au milieu des
   échanges CPU — un beat n'horloge plus la carte que pour un dummy

@@ -399,7 +399,17 @@ d'incriminer les périphériques.
 - **Interruption DMAC level-triggered** : l'ISR ne service qu'un canal
   par entrée ; on ré-arme `dmacInterrupt` à chaque acquittement TCMPL
   (**TCMPL seulement — pas les SUSP**, désormais légitimes avec
-  BLOCKACT=0x3, sinon tempête).
+  BLOCKACT=0x3, sinon tempête).  **Filtre CHINTENSET obligatoire
+  (2026-10-05)** : la ligne NVIC ne ré-entre que pour un canal dont
+  l'interruption est levée ET activée ; le canal audio TC4 des
+  firmwares gbrecomp (jamais de CHINTENSET, flag TCMPL jamais acquitté
+  par le DMAC Handler du runtime) ré-armait en boucle → réentrance du
+  handler, la pile sortait de la SRAM, « pc fou » vers t=7,4 M sur
+  tous les jeux convertis 0.5.0 (Golf, Tetris…).  CHINTENSET/CLR sont
+  désormais capturés en mot, demi-mot ET octet (fenêtre CHID 0x...C/D
+  et canaux indexés 0x...4C-0x...4E) ; avant, seules les écritures
+  mot indexées comptaient et tous les `strb` de la lib comme du
+  runtime gbrecomp étaient jetés (`dmacIntEn` restait à 0).
 - **Collision display-DMA / SD** : les beats d'écran ne doivent
   horloger la machine SD que pour un dummy 0xFF pendant une transaction
   active, et pendant un CMD24 seuls les beats du **canal TX SD**

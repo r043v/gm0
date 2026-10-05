@@ -3085,9 +3085,51 @@ static void nvmctrl_write(uint32_t a, uint32_t v) {
 }
 #endif /* __EMSCRIPTEN__ */
 
+/* ré-armement level-triggered : le NVIC ré-entre tant qu'un AUTRE canal a
+ * une fin de transfert (TCMPL) à la fois levée (CHINTFLAG) et activée
+ * (CHINTENSET).  Un canal dont l'interruption TCMPL n'est pas activée ne
+ * tire pas la ligne du tout (le canal audio des firmwares gbrecomp : sa
+ * fin de bloc est servie par le TC4, jamais par le DMAC Handler — sans ce
+ * filtre, son flag TCMPL jamais acquitté ré-armait l'interruption en
+ * boucle : tempête de réentrance du handler, la pile sortait de la SRAM
+ * et le jeu déraillait en pc fou). */
+static void dmac_rearm_from(uint32_t done_ch) {
+    for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
+        if (k != done_ch && (dmacIntFlag[k] & 0x02u) && (dmacIntEn[k] & 0x02u)) { dmacInterrupt = 1; return; }
+}
+
+/* registres 8 bits de canal indexé (Channel[n].CHINTENCLR/SET/FLAG),
+ * partagés par les écritures octet et mot (le mot à 0x...C porte CLR en
+ * octet bas et SET en octet haut) */
+static void dmac_indexed_intwrite(uint32_t ch, uint32_t off, uint32_t v, int width_bytes) {
+    if (ch >= DMAC_CHANNELS) return;
+    if (off == 0xc) { dmacIntEn[ch] &= (uint8_t)~v; return; }            /* CHINTENCLR */
+    if (off == 0xd) { dmacIntEn[ch] |= (uint8_t)v; return; }             /* CHINTENSET */
+    if (off == 0xe) {                                                    /* CHINTFLAG : acquitter */
+        dmacIntFlag[ch] &= (uint8_t)~v;
+        dmac_rearm_from(ch);
+    }
+    (void)width_bytes;
+}
+
+/* fenêtre CHID : les octets 0x...C/0x...D portent CHINTENCLR/SET du canal
+ * sélectionné (le mot 0x...C les porte tous les deux) */
+static void dmac_window_intwrite(uint32_t a, uint32_t v, int width_bytes) {
+    uint32_t ch = dmac_chid & 0xfu;
+    if (ch >= DMAC_CHANNELS) return;
+    if (width_bytes == 4 && a == 0x4100484cu) {
+        dmacIntEn[ch] &= (uint8_t)~v;
+        dmacIntEn[ch] |= (uint8_t)(v >> 8);
+        return;
+    }
+    if (a == 0x4100484cu) { dmacIntEn[ch] &= (uint8_t)~v; return; }      /* CHINTENCLR */
+    if (a == 0x4100484du) { dmacIntEn[ch] |= (uint8_t)v; return; }       /* CHINTENSET */
+}
+
 static void writeWord(uint32_t a, uint32_t v) {
     if (emuTarget == TGT_POKITTO) { pk_write_word(a, v); return; }
     if (a == 0x41004840u) { static int n; if (n < 6) fprintf(stderr, "[WW-40] t=%u v=%x site=%d\n", tickCount, v, emuSiteModel); n++; }
+    dmac_window_intwrite(a, v, 4); /* 0x4100484C : CHINTENCLR|SET (fenêtre, mot) */
     if (a == millisWatchAddr) millisWrites++;
     if (watchAddr && a == watchAddr && usbWatch < 4000)
         fprintf(stderr, "[watch %x] tick=%u pc=%x val=%08x\n", a, tickCount, regs[15] - 2, v);
@@ -3134,12 +3176,8 @@ static void writeWord(uint32_t a, uint32_t v) {
                 return;
             }
             if (off == 4) { dmaTrig[ch] = (uint8_t)((v >> 8) & 0x3fu); return; } /* CHCTRLB.TRIGSRC */
-            if (off == 0xc) { dmacIntEn[ch] = (uint8_t)~v; return; }  /* CHINTENCLR */
-            if (off == 0xd) { dmacIntEn[ch] = (uint8_t)v; return; }   /* CHINTENSET */
-            if (off == 0xe) {
-                dmacIntFlag[ch] = 0; /* CHINTFLAG (acquitter) */
-                for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-                    if (k != ch && (dmacIntFlag[k] & 0x02u)) { dmacInterrupt = 1; break; }
+            if (off == 0xc || off == 0xd || off == 0xe) {
+                dmac_indexed_intwrite(ch, off, v, 4);
                 return;
             }
         }
@@ -3177,9 +3215,9 @@ static void writeWord(uint32_t a, uint32_t v) {
         dmacIntFlag[dmac_chid] &= (uint8_t)~v;
         /* l'interruption DMAC est level-triggered sur le hardware : tant
          * qu'un autre canal attend une fin de transfert (TCMPL), le NVIC
-         * ré-entre — les SUSP périmés ne doivent pas ré-armer */
-        for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-            if (k != dmac_chid && (dmacIntFlag[k] & 0x02u)) { dmacInterrupt = 1; break; }
+         * ré-entre — les SUSP périmés ne doivent pas ré-armer ; voir
+         * dmac_rearm_from pour le filtre CHINTENSET */
+        dmac_rearm_from(dmac_chid);
         return;
     }
     if (a == 0x41004840u && dma_is_tc4(dmac_chid)) { /* canal audio (TC4) */
@@ -3334,6 +3372,11 @@ static void writeHalf(uint32_t a, uint16_t v) {
         sram[a] = v & 0xff; sram[a+1] = (v >> 8) & 0xff; return; }
     if (a == 0x42004808u) { if (dbg() && dbgDac < 3) { fprintf(stderr, "[dbg] DAC half <- %x\n", v); dbgDac++; } dac_write(v); return; }
     if (emuSiteModel > 0) return; /* modèle du site */
+    if (a >= 0x41004850u && a < 0x41004900u) { /* canaux indexés (demi-mot) */
+        dmac_indexed_intwrite((a - 0x41004840u) >> 4, (a - 0x41004840u) & 0xfu, v, 2);
+        return;
+    }
+    dmac_window_intwrite(a, v, 2); /* 0x4100484C/D : CHINTENCLR/SET (fenêtre) */
     if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
     if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; }
@@ -3365,8 +3408,25 @@ static void writeByte(uint32_t a, uint8_t v) {
     if (a == 0x4200180cu || a == 0x4200180au) { spiBaud = v; return; } /* SERCOM4 BAUD (SPI : 0x0C ; 0x0A = compat TS) */
     if (a == 0x4100484eu) { /* DMAC CHINTFLAG acquittement (fenêtre, octet) */
         dmacIntFlag[dmac_chid & 0xfu] &= (uint8_t)~v;
-        for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-            if (k != (dmac_chid & 0xfu) && (dmacIntFlag[k] & 0x02u)) { dmacInterrupt = 1; break; }
+        dmac_rearm_from(dmac_chid & 0xfu);
+        return;
+    }
+    dmac_window_intwrite(a, v, 1); /* 0x4100484C/D : CHINTENCLR/SET (fenêtre) */
+    if (a >= 0x41004850u && a < 0x41004900u) { /* canaux indexés (octet) :
+        * CHCTRLA 8 bits et les registres d'interruption — la lib officielle
+        * écrit CHINTENSET/CHINTFLAG en strb, le mot seul ne suffit pas */
+        uint32_t ch = (a - 0x41004840u) >> 4, off = (a - 0x41004840u) & 0xfu;
+        if (ch < DMAC_CHANNELS && off == 0) { /* CHCTRLA */
+            if ((v & 0x03u) == 0x02u) {
+                uint32_t desc = dmac_baseAddr ? dmac_baseAddr + ch * 0x10 : 0;
+                if (desc) dma_load(ch, desc);
+            } else dmaOn[ch] = 0; /* SWRST / disable */
+            return;
+        }
+        if (ch < DMAC_CHANNELS && off >= 0xc && off <= 0xe) {
+            dmac_indexed_intwrite(ch, off, v, 1);
+            return;
+        }
         return;
     }
     if (a == 0x4100483fu) { dmac_chid = v; if (getenv("EMU_DESC_DEBUG")) fprintf(stderr, "[chid] t=%u chid=%u\n", tickCount, v); return; }
