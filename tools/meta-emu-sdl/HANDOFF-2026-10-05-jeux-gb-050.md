@@ -231,3 +231,84 @@ détaillés ici)
 Les validations de la section 6 ont été faites avec l'ensemble des trois
 changements présents.
 
+
+## 10. Suite (même jour) — graphismes GB corrompus, point 8.1 traité
+
+Symptôme : jeux GB 0.5.0 qui tournent mais écran faux (Tetris : « ©1989
+Nintendo » en double, restes de l'écran légal ; lignes de tiles dupliquées).
+`EMU_WIN_DEBUG=1` : après ~3 trames de boot, plus aucun RASET pendant des
+dizaines de millions de ticks — les bandes n'étaient presque jamais envoyées.
+
+Cause : les armements de fin de bloc (laissés inconditionnels en §5) levaient
+l'IRQ DMAC pour le canal audio TC4 (canal 1, aucun CHINTENSET).  Le
+`DMAC_Handler` du runtime (`meta_lcd.cpp`) ne sert que le canal écran et
+appelle `lcdq_on_complete()` sans vérifier : chaque fin de bloc audio passait
+pour une fin de bande écran → `lcdq_done`/`lcdq_active` désynchronisés, bandes
+perdues, et le saut de lignes inchangées (META_LINE_SKIP) gardait des lignes
+périmées à l'écran.
+
+Correctif (`meta_emu.c`) : `dmac_raise(ch, bits)` — le flag se pose toujours,
+la ligne NVIC ne monte que si `dmacIntEn[ch] & bits` (TCMPL 0x02, SUSP 0x04).
+Appliqué dans `dma_load` (SUSP), `dma_beat`, `dma_sercom4_rx_beat`, le chemin
+instantané (qui pose maintenant aussi TCMPL dans `dmacIntFlag`) ; l'armement en
+double de la fin de bloc `spiDmaCh` est retiré (déjà levé par `dma_beat`).
+Le chemin « modèle du site » (`emuSiteModel > 0`) n'est pas touché.
+
+Validation (1 500-1 800 trames, 0 pc fou) : Tetris, Super Mario Land, Golf
+(bin et zip), Alleyway, Balloon Kid, Dr. Mario, Gargoyle's Quest, Pac-Man,
+Tennis — écrans corrects ; Picomon, Celeste, Yatzy, Cats & Coins, lapinou,
+tetris.bin 0.4.x inchangés ; audio Golf `--wav` OK (±21 961).  Le standalone
+wasm n'est toujours pas régénéré.
+
+## 11. Son, freeze SMOOTH, fidélité (même jour, suite)
+
+Règle donnée par l'utilisateur : **vrai matériel en priorité**, ne plus
+reproduire les écarts de l'émulateur TS.  Détail des mécanismes dans le
+README (« Fidélité matérielle »).  Corrigé :
+
+- son haché des firmwares 0.5.0 : SWRST ne remettait pas le canal DMAC à
+  zéro, le SUSP d'un seul sous-débit restait collé → `channel_running()`
+  faux à chaque frame, 60 relances/s ;
+- trous côté hôte : file plafonnée à 900 sous un callback SDL de 1024
+  (~15 % du son en relâches) → file calée sur le buffer obtenu +
+  régulation dynamique ±0,5 % ;
+- Picomon (claquements/saturation après la fin d'une musique) : CMD18/CMD12
+  absents → `file.read()` échouait après le rembobinage, le canal WAV
+  rejouait son tampon de 2047 octets ; DAC ×96 écrêtait → ×64 ;
+- freeze du mode SMOOTH (~13 s) : IRQ injectées sous CPSID → DMAC_Handler
+  au milieu de `lcdq_submit_locked`, complétion perdue, `claim_strip`
+  bloqué.  NVIC fidèle (PRIMASK, priorités, pas d'auto-préemption) ;
+- MULS faux (double JS du TS) : les signatures de lignes ×0x9E3779B1 du
+  runtime perdaient leurs bits bas ;
+- temps : cycles M0+ à 48 MHz + cache NVM au lieu de « 1 instruction =
+  1 tick à 20 M » (lapinou perdait ~1 % de ses échantillons TC4).
+
+Constats laissés au runtime (pas des bugs de l'ému) :
+- Mario Land en démo/jeu : ~2 % des frames dépassent le budget
+  (jusqu'à >21 ms) et la file DMA audio du runtime (LATENCY 256 éch. =
+  11,6 ms, RING 768) se vide → quelques relances par seconde.  Piste :
+  LATENCY/RING plus grands dans `meta_audio.cpp`.
+- Gargoyle's Quest (firmware 0.4.x du 02/10, SPI écran 12 MHz) : trame
+  pleine 27 ms > frame → famine audio fidèle au matériel ; reconvertir.
+- builds streaming : TBLEND retombe en TILE (modes de fusion retirés,
+  ~3 Ko de RAM libre).
+- ST7735 : COLMOD 03h (12 bpp RGB444) = 25 % d'octets SPI en moins par
+  trame (13,7 → 10,2 ms à 24 MHz) ; l'ému le gère, le runtime non.
+
+Outils ajoutés : `EMU_NOPACE`, `EMU_AUDIO_STATS`, `EMU_INPUT`,
+`EMU_SPI_INSTANT`.  wasm + standalone régénérés.
+
+## 12. Cœur réécrit, nettoyage, runtime (même jour, suite)
+
+- Cœur ARMv6-M neuf (dispatch `switch (op >> 8)`, cycles intégrés, accès
+  SRAM/flash directs) : 1,5-1,9x plus rapide (natif 260-420 %, wasm
+  160-220 %) avec le timing fidèle 48 MHz ; corrige les écarts TS restants
+  (voir README).  Piège rencontré : `pk_interrupt` empilait PC+2 — avec le
+  retour d'exception unifié, chaque IRQ Pokitto sautait une instruction
+  (Alleyway Pokitto en écran rouge) ; corrigé.
+- Retirés : modèle « site » (EMU_SITE), domaine TS (EMU_TS_TIMING,
+  EMU_TICKS_HZ), MUL TS (EMU_TS_MUL, regD), STATE_HASH/ihash/TRACE_ALL,
+  montres mémoire, `emu.c.txt`.  Le harnais Node garde `state_hash` final.
+- Runtime : `META_TBLEND` (TBLEND aussi en build streaming : 672 o, table
+  de 16 couleurs) ; `META_LCD_12BPP` (RGB444, `meta_lcd_pack.h`, défaut 0) :
+  sur Mario Land, relances audio 82 -> 36 mais +3,6 % de CPU moyen.
