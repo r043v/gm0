@@ -253,8 +253,9 @@ static inline void nvm_access(uint32_t a) {
 }
 
 
+static double pk_core_hz(void); /* fréquence du cœur telle que configurée */
 static double ticks_per_sec(void) {
-    return emuTarget == TGT_POKITTO ? 45000000.0 : emuTicksPerSec;
+    return emuTarget == TGT_POKITTO ? pk_core_hz() : emuTicksPerSec;
 }
 static uint32_t frame_ticks(void) {
     return (uint32_t)(ticks_per_sec() / 59.7275 + 0.5);
@@ -1388,6 +1389,7 @@ static int pk_eepromDirty;
 /* --- SYSCON (0x40048000) : stockage générique + PINTSEL pour les boutons */
 static uint32_t pk_syscon[256];
 #define PK_SYSCON_SYSPLLCTRL   2u
+#define PK_SYSCON_MAINCLKSEL   28u
 #define PK_SYSCON_SYSAHBCLKCTRL 32u
 #define PK_SYSCON_PINTSEL(n)   (94u + (n))
 static uint32_t sys_VTOR, sys_AIRCR;
@@ -1755,6 +1757,7 @@ static float pk_audioHoldF;
 static uint8_t pk_prevData = 0xFF;
 static uint32_t pk_prevTicks;
 
+
 enum { PK_HLE_DETECT, PK_HLE_DISABLED, PK_HLE_ENABLED };
 static int pk_hleState = PK_HLE_DETECT;
 static uint32_t pk_hleIrqAddress;
@@ -1787,9 +1790,8 @@ static void pk_audio_check_hle(uint32_t rate) {
     pk_hlePlayhead = (uint32_t *)pk_audio_address(vplay);
     if (!pk_hleBuffer || !pk_hlePlayhead) return;
     pk_hleState = PK_HLE_ENABLED;
-    pk_audio_reopen((pk_syscon[PK_SYSCON_SYSPLLCTRL] == 0x25 ? 72000000 : 45000000) / (int)rate);
-    fprintf(stderr, "audio HLE actif (%d Hz)\n",
-            (pk_syscon[PK_SYSCON_SYSPLLCTRL] == 0x25 ? 72000000 : 45000000) / (int)rate);
+    pk_audio_reopen((int)(pk_core_hz() / rate));
+    fprintf(stderr, "audio HLE actif (%d Hz)\n", (int)(pk_core_hz() / rate));
 }
 
 /* valeur écrite sur le R2R : POUT1[31:28] | POUT2[23:20] */
@@ -1798,7 +1800,7 @@ static void pk_audio_gpio_write(void);
 static void pk_audio_write(uint8_t data) {
     if (pk_hleState == PK_HLE_ENABLED) return;
     pk_prevData = data;
-    float clock = pk_syscon[PK_SYSCON_SYSPLLCTRL] == 0x25 ? 72000000.f : 45000000.f;
+    float clock = (float)pk_core_hz();
     float delta = (float)(uint32_t)(tickCount - pk_prevTicks) / clock;
     pk_prevTicks = tickCount;
     pk_aqDelta[pk_aqEnd] = delta;
@@ -1809,6 +1811,16 @@ static void pk_audio_write(uint8_t data) {
 }
 
 static int pk_audio_ready(void) { return pk_aqSize >= 600; }
+
+/* Fréquence du cœur telle que le firmware l'a configurée : IRC 12 MHz tant
+ * que MAINCLKSEL ne pointe pas la sortie PLL, sinon 12 MHz x M (SYSPLLCTRL).
+ * L'ancien modèle cadençait à 45 MHz en dur : les firmwares 72 MHz (et tout
+ * ce qui n'est pas 0x25) tournaient à la mauvaise vitesse — le son GB
+ * étiré de 60 %, le jeu au ralenti. */
+static double pk_core_hz(void) {
+    if ((pk_syscon[PK_SYSCON_MAINCLKSEL] & 3u) != 3u) return 12e6;
+    return 12e6 * (double)((pk_syscon[PK_SYSCON_SYSPLLCTRL] & 0x1Fu) + 1u);
+}
 
 /* --- GPIO (0xA0000000) */
 static uint32_t pk_pin[3], pk_pout[3], pk_mask[3], pk_dir[3];
@@ -2037,13 +2049,46 @@ static uint32_t pk_ct_tick(struct pk_ct *ct, uint32_t num, uint32_t delta) {
     }
 
     if (ct->r[PK_CT_IR] && armIrqEnable) {
-        if (num == 0) pk_audio_check_hle(ct->r[7]); /* MR1 */
         pk_interrupt(34 + num);
     }
     return tti;
 }
 
+/* ticks restants avant le prochain événement timer (IRQ en attente,.SysTick
+ * CVR à court, prochain match CT armé) — sert à ne traiter les timers qu'à
+ * leurs échéances : par instruction, ils coûtaient 4 à 5 fois le reste. */
+static uint32_t pk_timers_next(void) {
+    uint32_t next = ~0u;
+    if ((pk_systickCSR & 1u) && pk_systickCVR + 1u < next) next = pk_systickCVR + 1u;
+    /* COUNTFLAG : urgence seulement si l'IRQ SysTick est activée (sinon le
+     * drapeau reste posé jusqu'à une lecture, et le Runtime ne le lit pas) */
+    if ((pk_systickCSR & 3u) == 3u && (pk_systickCSR & (1u << 16))) next = 0;
+    for (uint32_t n = 0; n < 2; n++) {
+        struct pk_ct *ct = &pk_ct[n];
+        if (!(ct->r[PK_CT_TCR] & 1u)) continue;
+        uint32_t pr = ct->r[PK_CT_PR] + 1u;
+        if (ct->r[PK_CT_IR]) return 0; /* IRQ en attente : maintenant */
+        for (uint32_t m = 0; m < 4; m++) {
+            if (!((ct->r[5] >> (m * 3)) & 1u)) continue; /* match sans IRQ */
+            uint32_t mr = ct->r[6 + m], tc = ct->r[PK_CT_TC];
+            uint32_t t = tc < mr ? (mr - tc) * pr : 0;
+            if (t < next) next = t;
+        }
+    }
+    return next == ~0u ? 1u << 20 : next; /* rien d'actif : re-regarder plus tard */
+}
+
+static uint32_t pkTimerNext;         /* tick de la prochaine échéance */
+static int       pkTimerNextValid;
+
 static void pk_timers_update(void) {
+    /* COUNTFLAG posé pendant une section critique (IRQ masquées) : l'IRQ
+     * SysTick part dès le ré-enable — sinon le drapeau restait posé pour
+     * toujours (le handler ne lit pas CSR) et l'échéance restait à 0. */
+    if ((pk_systickCSR & 3u) == 3u && (pk_systickCSR & (1u << 16)) && armIrqEnable) {
+        pk_systickCSR &= ~(1u << 16);
+        pk_interrupt(15);
+    }
     uint32_t delta = tickCount - pk_lastTick;
     if (!delta) return;
     pk_lastTick = tickCount;
@@ -2058,8 +2103,12 @@ static void pk_machine_step(void) {
         sys_AIRCR = 0x05FA0000u;
         pk_reset_core();
     }
-    pk_timers_update();
-    pk_gpio_update();
+    if (!pkTimerNextValid || (int32_t)(tickCount - pkTimerNext) >= 0) {
+        pk_timers_update();
+        pk_gpio_update();
+        pkTimerNext = tickCount + pk_timers_next();
+        pkTimerNextValid = 1;
+    }
 }
 
 /* --- mémoire : bancs LPC (mêmes sémantiques que la référence :
@@ -2171,6 +2220,7 @@ static uint32_t pk_reg_peek(uint32_t a) {
     }
     if (a >= 0xE000E000u && a < 0xE0010000u) { /* PPB */
         uint32_t off = a - 0xE000E000u;
+        if (off <= 0x1Cu) pkTimerNextValid = 0; /* SysTick réécrit */
         switch (off) {
             case 0x010: return pk_systickCSR;
             case 0x014: return pk_systickRVR;
@@ -2196,6 +2246,7 @@ static uint32_t pk_reg_read(uint32_t a) {
         if ((al == 0x40014008u || al == 0x40018008u) ||
             (al == 0x40024008u && pk_rtcEnabled))
             pk_timers_update();
+            pkTimerNextValid = 0;
         if (al == 0x40014008u) return pk_ct[0].r[PK_CT_TC];
         if (al == 0x40018008u) return pk_ct[1].r[PK_CT_TC];
         if (al == 0x40024008u && pk_rtcEnabled)
@@ -2249,6 +2300,7 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
                 struct pk_ct *ct = ((a >> 14) & 0x1F) == 5 ? &pk_ct[0] : &pk_ct[1];
                 uint32_t off = a - (((a >> 14) & 0x1F) == 5 ? 0x40014000u : 0x40018000u);
                 uint32_t idx = off >> 2;
+                pkTimerNextValid = 0; /* l'échéance peut changer */
                 if (idx == 0) { ct->r[0] &= ~v; return; }        /* IR : acquitte */
                 if (idx == 1) {                                   /* TCR */
                     ct->r[1] = v;
@@ -2468,10 +2520,12 @@ static void pk_reset_core(void) {
     armIrqEnable = 1;
     tickCount = 0;
     pk_lastTick = 0;
+    pkTimerNextValid = 0;
 
     /* SYSCON / périphériques (valeurs de la référence) */
     memset(pk_syscon, 0, sizeof pk_syscon);
     pk_syscon[PK_SYSCON_SYSPLLCTRL] = 0x23;
+    pk_syscon[PK_SYSCON_MAINCLKSEL] = 3u; /* le loader rend la main sur le PLL */
     pk_syscon[17] = 1;  /* SYSPLLCLKUEN */
     pk_syscon[3] = 1;   /* SYSPLLSTAT */
     pk_syscon[29] = 1;  /* MAINCLKUEN */
@@ -5014,7 +5068,11 @@ static void update_title_pct(void) {
     Uint32 nowMs = SDL_GetTicks();
     if (nowMs - titleMs < 500) return;
     if (fwLoaded) {
-        double emuMs = (double)(tickCount - titleTick) / ticks_per_sec();
+        /* emuMs en MILLISECONDES : ticks_per_sec est en hertz (48 MHz META,
+         * 45 MHz Pokitto) depuis le passage au timing fidèle — la formule
+         * donnait des secondes contre des millisecondes côté horloge murale
+         * et le % tombait à 0 sur les deux cibles. */
+        double emuMs = (double)(tickCount - titleTick) * 1000.0 / ticks_per_sec();
         double wallMs = (double)(nowMs - titleMs);
         int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
         if (pct < 0) pct = 0;
