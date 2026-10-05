@@ -5031,24 +5031,25 @@ static void update_title_pct(void) {
     titleTick = tickCount;
 }
 
+/* boucle de frame batchée : petite fonction appelée 60 fois par seconde —
+ * V8 la promeut vite vers TurboFan, et step y est appelé DIRECTEMENT (pas
+ * d'indirection par instruction).  noinline sur step : s'il était inliné
+ * ici, la boucle resterait au compilateur de base (pas d'OSR en wasm).
+ *
+ * tickCount est un u32 qui wrappe (2^32 à 48 MHz ≈ 89,5 s de jeu) : la
+ * cible calculée par la frame précédente peut se retrouver EN DEÇA du tick
+ * courant juste après le passage — comparaison signée de la différence,
+ * comme sur le compteur (qui wrappe) du Cortex-M0+.  La forme
+ * « tick < cible » non signée gelait l'émulateur pour de bon (lapinou,
+ * frame ~7000, % du HUD wasm figé à 0). */
+__attribute__((noinline))
+static void step_batch(uint32_t target) {
+    while ((int32_t)(tickCount - target) < 0) step();
+}
+
 static void run_emulated_frame(void) {
     uint32_t target = emu_nextFrameTick;
-#ifdef __EMSCRIPTEN__
-    /* wasm : step appelé par pointeur pour qu'il ne soit pas inliné dans
-     * cette boucle — V8 n'a pas d'OSR pour le wasm et ne promeut (TurboFan)
-     * que les fonctions souvent APPELÉES : inliné ici (60 appels/s), le
-     * cœur restait au compilateur de base Liftoff (~30 % plus lent) */
-    static void (*volatile stepFn)(void) = step;
-    void (*fn)(void) = stepFn;
-    while ((int32_t)(tickCount - target) < 0) fn();
-#else
-    /* tickCount est un u32 qui wrappe (2^32 à 48 MHz ≈ 89,5 s) : la cible
-     * calculée par la frame précédente peut se retrouver EN DEÇA du tick
-     * courant après le passage — comparaison signée de la différence, comme
-     * sur le compteur (qui wrappe) du Cortex-M0+ ; la forme « tick < cible »
-     * non signée gelait l'émulateur pour de bon (lapinou, frame ~7000). */
-    while ((int32_t)(tickCount - target) < 0) step();
-#endif
+    step_batch(target);
     /* re-base sur tickCount : l'ancien `+= frame_ticks()` laissait
      * emu_nextFrameTick franchir 2^32 UNE frame avant tickCount — le
      * comparateur non signé ne voyait plus rien à exécuter et
