@@ -5368,6 +5368,13 @@ int main(int argc, char **argv) {
 
         if (fwLoaded) run_emulated_frame();
         frame++;
+        if (emuTarget == TGT_POKITTO && ENVFLAG("EMU_DMA_TRACE") && (frame % 300) == 0) {
+            uint32_t msc = pk_rd32le(sram + (0x10005c64u - 0x10000000u));
+            uint32_t gframe = pk_rd32le(sram + (0x10000508u - 0x10000000u));
+            fprintf(stderr, "[derive] f=%u tick=%u ms=%u (%.1f Hz) gbf=%u (%.2f fps)\n",
+                    frame, tickCount, msc, (double)msc * pk_core_hz() / (double)tickCount,
+                    gframe, (double)gframe * pk_core_hz() / (double)tickCount);
+        }
 
         if (emuTarget == TGT_POKITTO) pk_adc_frame();
         update_title_pct();
@@ -5420,6 +5427,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[audio] FIN irq_block=%lu irq34=%lu crosses=%lu latches=%lu (muets=%lu son=%lu) tick=%u qtail=%u qhead=%u\n",
                 pk_ctIrqCount, pk_irq34, pk_ctCross, pk_latchCount, pk_latchMid, pk_latchSound, tickCount,
                 pk_read_half(QADDR), pk_read_half(QADDR + 2));
+    if (ENVFLAG("EMU_DMA_TRACE") && emuTarget == TGT_POKITTO) {
+        uint32_t msc = pk_rd32le(sram + (0x10005c64u - 0x10000000u));
+        uint32_t gframe = pk_rd32le(sram + (0x10000508u - 0x10000000u));
+        fprintf(stderr, "[timing] ticks=%u (%.2f s emu @ %.0f MHz) ms_count=%u (%.1f Hz) gbl_frame=%u (%.2f fps GB)\n",
+                tickCount, tickCount / pk_core_hz(), pk_core_hz() / 1e6,
+                msc, (double)msc * pk_core_hz() / (double)tickCount,
+                gframe, (double)gframe * pk_core_hz() / (double)tickCount);
+    }
     if (shotPath[0]) {
         FILE *sf = fopen(shotPath, "wb");
         if (sf) {
