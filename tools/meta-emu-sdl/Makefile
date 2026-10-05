@@ -1,4 +1,4 @@
-CFLAGS ?= -O3 -flto -DEMU_IHASH
+CFLAGS ?= -O3 -flto
 meta_emu: meta_emu.c
 	gcc $(CFLAGS) $(shell pkg-config --cflags sdl2 zlib) -o $@ meta_emu.c -lm $(shell pkg-config --libs sdl2 zlib)
 # build navigateur : wasm/index.html + wasm/meta_emu.js + .wasm

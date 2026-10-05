@@ -166,7 +166,7 @@ liste offline est le chemin recommandé.
 Depuis la 0.4.0, les firmwares gbrecomp envoient le son au DAC par le
 DMAC (canal 1, déclencheur `TC4_DMAC_ID_OVF`, descripteurs chaînés),
 l'écran gardant le canal 0.  L'émulateur suit à part tout canal déclenché
-par TC4 : un beat par débordement TC4 (907 ticks, ~22 kHz), descripteur
+par TC4 : un beat par débordement TC4 (2 177 cycles à 48 MHz, ~22 kHz), descripteur
 suivant lu en fin de bloc, canal arrêté sur un descripteur invalide ;
 `CHCTRLA` relu donne l'état ENABLE.  Avant ce suivi, l'activation du
 canal audio détournait le descripteur courant de l'écran : écran figé
@@ -304,46 +304,90 @@ puis jeu — voir NOTES, « Le bug BLX »).  Deux correctifs décisifs du
   attendaient leur tampon pour toujours.  Modélisé en miroir de TC4,
   sortie SDL calée sur sa cadence (44,1 kHz −250 ppm pour Picomon).
 
-Le boot est **paritairement validé contre le fork TypeScript** : mêmes
-hachages d'état (registres + SRAM) tick par tick jusqu'à ~6,9 M ticks,
-même splash Gamebuino au même tick (proportions de couleurs identiques),
-Millis avancant exactement d'1 ms par entrée SysTick, audio TC4/DAC actif
-(369 échantillons/frame), carte SD lue par le loader.
+Historique : le port est parti d'une parité tick à tick avec le fork
+TypeScript (mêmes hachages d'état jusqu'à ~6,9 M ticks).  Cette parité a
+été abandonnée le 2026-10-05 au profit du vrai matériel : le TS reproduisait
+des écarts (MUL en double JS, retenue des décalages sur le compteur, ROR
+ignoré, flags des ADD sur registres hauts, interruptions injectées sous
+CPSID, 1 instruction = 1 tick à 20 M/s…) qui cassaient des jeux réels.
 
-Corrections par rapport au précédent WIP (les quatre causes racines du
-blocage « f1 / Millis gelé ») :
-- **masque push/pop** : `0xfe00` laissait tous les POP (0xbcxx-0xbdxx)
-  hors du décodeur (traités en no-op → effondrement de pile, chutes dans
-  le code suivant, faux « f1 retourne non-zéro »).  Le TS utilise 0xf600 ;
-- **retenue des additions** : calculée sur la somme tronquée 32 bits
-  (C=0 pour toute comparaison d'égalité) au lieu de la somme 64 bits ;
-- **MUL non masqué** : le TS laisse le produit en double JS (arrondi
-  au-delà de 2^53) — répliqué via des ombres flottantes des registres
-  (`regD`) et `fmod` exact ;
-- **BL** : LR doit pointer après la paire (l'ancien code laissait
-  LR = PC + off1<<12, corrompant tout retour `bx lr`) ; la paire coûte
-  3 ticks comme les deux demi-mots du TS.
+## Fidélité matérielle (2026-10-05)
 
-Écart résiduel connu : le compteur interne TC4 peut dériver de quelques
-ticks vers 6,9 M ticks (état interne de l'émulateur, invisible côté
-SRAM) ; sans effet observé sur l'écran ni l'audio.
+Principe : **le vrai SAMD21 d'abord**, plus de reproduction des écarts de
+l'émulateur TS d'origine (sauf options explicites ci-dessous).
+
+- **Temps en cycles Cortex-M0+ à 48 MHz** : 1 tick = 1 cycle, chaque
+  instruction coûte ses cycles réels (modèle de `m0_estimate.py` : ALU 1,
+  load/store 2, B/BX 2, BL 3, conditionnel pris 2, PUSH/POP/LDM/STM 1+N,
+  POP {pc} 3+N, MRS/MSR 4) + les états d'attente des défauts du **cache
+  NVM** (8 lignes de 64 bits, RWS=1).  L'ancien domaine TS (1 instruction =
+  1 tick à 20 M/s, CPU ~1,5x trop lent face aux timers) a été retiré.
+- **NVIC** : PRIMASK respecté (CPSID/CPSIE/MSR), priorités IPR/SHPR3,
+  ISER/ICER/ISPR/ICPR, ICSR (PENDSTSET, VECTACTIVE), pas de préemption à
+  priorité égale (plus de réentrance d'un handler sur lui-même),
+  EXC_RETURN imbriqué, trame alignée 8 octets, xPSR réel ; MRS/MSR réels
+  (IPSR, PRIMASK, MSP).  Causes corrigées : le freeze du mode SMOOTH
+  (DMAC_Handler injecté dans la section critique de la file LCD).
+- **Cœur ARMv6-M réécrit** (dispatch par table de saut, coûts en cycles
+  intégrés, accès SRAM/flash directs) : MULS 32 bits exacts, décalages
+  par registre et ROR réels, ADD/MOV/CMP sur registres hauts (sans flags,
+  `add pc`, `mov pc`), REVSH, LDMIA sans écriture de base si Rn est
+  chargé, BL complet (S:I1:I2), MRS/MSR réels.  1,5 à 1,9x plus rapide
+  que le décodeur hérité.
+- **DMAC** : IRQ levée seulement si CHINTENSET l'active ; SWRST remet le
+  canal à zéro (flags, enable, FERR, TRIGSRC) ; CHSTATUS.FERR ; fin de
+  chaîne DESCADDR=0 sans SUSP.  Causes corrigées : écran GB aux lignes
+  dupliquées, son haché des firmwares 0.5.0 (relance du canal audio à
+  chaque frame).
+- **SPI (SERCOM4)** : durée d'octet exacte (16 x (BAUD+1) cycles) pour le
+  DMA comme pour le CPU ; INTFLAG DRE/TXC/RXC selon le temps émulé ; tampon
+  de réception à 2 niveaux (les octets laissés par l'écran DMA y restent,
+  vidé par SWRST, ENABLE=0 ou RXEN=0 — l'Arduino SPI.config() en fait un à
+  chaque changement de vitesse).  Les attentes RXC des firmwares coûtent
+  donc leur vrai temps.  `EMU_SPI_INSTANT=1` rend le DMA écran quasi
+  instantané (débogage, non fidèle).
+- **Carte SD** : CMD18 (lecture multi-blocs) + CMD12 — sans eux le WAV de
+  Picomon rejouait en boucle un tampon figé (claquements sans fin).
+- **ST7735** : COLMOD 12 bpp (RGB444, 2 pixels / 3 octets), 16 et 18 bpp.
+- **Audio hôte** : file dimensionnée sur le buffer SDL obtenu et
+  régulation dynamique du débit (±0,5 %, interpolation) — plus de trous
+  quand le callback SDL vide 1024 échantillons d'un coup ; DAC 10 bits
+  mis à l'échelle sans écrêtage.
+- **Noms longs FAT** : caractères 12-13 au bon endroit, cluster LFN à 0.
+- **Carte FAT** : BPB étendu (signature 0x29, type « FAT16   » à l'offset
+  54) — la PetitFatFs de PokittoLib n'accepte un volume qu'avec cette
+  chaîne ; en superfloppy (Pokitto), plus d'entrée MBR écrite dans le
+  secteur de boot.
+- **Zips Pokitto** : un `.pop` (conteneur du loader) dans le zip est pris
+  comme firmware (un `.bin` reste prioritaire), le reste du zip forme la
+  carte — ex. `GalaxyFighters_POPandMusic.zip` (musique `music/*.raw`
+  streamée depuis la carte).  Touches Pokitto : A, B, C = Entrée/U.
+
+Vitesse (Ryzen 7 6850H, 48 MHz émulés) : natif 1,7 à 2,3x le temps réel,
+cœur wasm (V8) ~1,25 à 1,5x.  Le wasm appelle `step` par pointeur : V8 ne
+promeut sous TurboFan que les fonctions souvent appelées (pas d'OSR).
 
 ## Débogage (variables d'environnement)
+
+- `EMU_NOPACE=1` : pas de cadencement temps réel (mesure de vitesse brute).
+- `EMU_PROF=<fichier>` : profil en cycles par adresse (flash et SRAM) écrit
+  en fin de run ; `./prof_report.py <fichier> <firmware.elf> [N]` agrège par
+  fonction.  Estimation fidèle au modèle de l'émulateur, pas une mesure.
+- `EMU_AUDIO_STATS=1` : bilan audio par seconde émulée (échantillons DAC,
+  famine du canal DMA, relances du canal, sous-débits et file côté hôte).
+- `EMU_INPUT="frame:touches:durée,..."` : script d'appuis (touches parmi
+  U D L R A B M H), ex. `300:H:45,380:D:3,400:A:3` (menu d'options).
 
 - `FAT_DUMP=/tmp/x.img` : écrit l'image FAT générée depuis un répertoire
   (vérifiable avec mtools).
 - `EMU_TRACE=1` : échantillonne le PC tous les 0x40000 ticks.
-- `TRACE_ALL=1` (+ `TRACE_FROM=<tick>`) : trace instruction par
-  instruction (pas, tick, pc, inst, sp, r0-r12, lr), même format que le
-  harnais TS `/tmp/ts_steptrace.js` — diff 1:1 avec la référence.
 - `TRACE_TAIL=<n>` (+ `TRACE_TAIL_OUT=<fichier>`) : garde les n
   dernières instructions en tampon circulaire et les déverse au
   **premier PC fou** (le tick du crash variant selon les runs, c'est le
-  moyen fiable d'attraper la fenêtre avant le déraillement).
-- `WILD_RESET=1` : sur PC hors flash, reprend sur le vecteur de reset au
-  lieu d'exécuter les mauvaises herbes (comportement TS = exécuter).
-  Les PC fous sont journalisés avec `pc/prev/lr/sp/r0-r3` (trois
-  occurrences max, comportement TS sinon inchangé).
+  moyen fiable d'attraper la fenêtre avant le déraillement).  Un PC hors
+  flash/SRAM est journalisé (`pc/prev/lr/sp/r0-r3`) puis la machine
+  reprend sur le vecteur de reset.
+- `EMU_SPI_INSTANT=1` : DMA SPI de l'écran quasi instantané (non fidèle).
 - `EMU_DMA_DEBUG=1` : chaque transfert DMA instantané (canal, src, dst,
   taille, beats, position LCD, hachure du contenu) — pour auditer le
   chemin d'affichage DMA d'un jeu maison.
@@ -364,18 +408,5 @@ SRAM) ; sans effet observé sur l'écran ni l'audio.
   lib/TS, voir « Touches META »).
 - `EMU_LCD_DEBUG=1` : trace les écritures MADCTL (ordre des composantes
   déclaré au panneau et verrou d'inversion).
-- `STATE_HASH=1` (+ `HASH_INTERVAL=<ticks>`) : hachage FNV-1a des
-  registres + SRAM toutes les N ticks, avec dump des registres —
-  comparable à `/tmp/ts_hash.js`.
-- `SRAM_DUMP_AT=<tick>` (+ `SRAM_DUMP=<fichier>`) : dump de la SRAM à un
-  tick donné (vs `/tmp/ts_sramdump.js` côté TS).
-- `WATCH_ADDR=<hex>` : journalise les écritures mot vers cette adresse.
-- `MILLIS_ADDR=<hex>` (défaut 0x20002c48) : adresse de la variable Millis
-  affichée par frame ; `MILLIS_WATCH=<hex>` : compteur d'écritures.
-- `ADC_FIXED=1` : ADC RESULT constant (comparaison de trajectoires avec
-  le TS piloté au même ADC).
+- `ADC_FIXED=1` : ADC RESULT constant (trajectoires reproductibles).
 
-Le port est fidèle à la sémantique du TS (mêmes quirks : décodage
-paresseux remplacé par un switch, même motif d'injection d'interruptions
-avec chaînage `else if`, même hack SysTick à 20 000 ticks, gouverneur
-TC4, lectures périphériques par largeur d'accès).

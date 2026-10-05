@@ -457,7 +457,7 @@ utilise un bundle plus récent pour le flux « PLAY », soit ces jeux y
 restent au boot — mais NOTRE modèle précis affiche déjà plus
 (SD INIT OK) que le v12.
 
-## Mode « site » expérimental (EMU_SITE=1)
+## Mode « site » expérimental (EMU_SITE=1) — retiré le 2026-10-05
 
 `emuSiteModel` (runtime, défaut 0) réplique le modèle v12 : flash
 jettée, DMA instantané par fenêtre CHID (garde 200 blocs), pas de
