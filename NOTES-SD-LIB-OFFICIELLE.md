@@ -28,7 +28,7 @@ Lapinou (homebrew sans lib) fonctionne depuis longtemps.
   bas).  picomon.bin + dossier : titre animé « PICO MONSTERS »
   également ; `EMU_PRESS_A` (la validation du titre) bascule sur un
   **écran noir qui streame en continu** — analyse en fin de fichier.
-- **Huit causes racines corrigées dans meta_emu.c** (protocole réel,
+- **Huit causes racines corrigées dans gm0.c** (protocole réel,
   datasheet SAM-D21 à l'appui) :
   0. **INTPEND mal encodé** : bit4 doit être TCMPL, bit5 SUSP, bit6 TERR
      — l'ancien code mettait TCMPL en bit6, l'ISR du guest y lisait
@@ -169,7 +169,7 @@ permanent — chaque case vide joue `audioHold/2` (crépitement) et le
 garde-fou AQ_LATENCY jetait d'un coup des centaines d'échantillons
 (clics).  C'est LA famine audible, indépendante de la charge hôte.
 
-**4. Correction (meta_emu.c) :**
+**4. Correction (gm0.c) :**
 - la sortie SDL est (ré)ouverte à la **cadence TC4 réelle du jeu**,
   dérivée de sa config CTRLA/CC0 (`tc4_period_ticks`, arrondi au plus
   proche — lapinou : 913 ticks → 21907/s ; les chemins IRQ et DMA TC4
@@ -194,7 +194,7 @@ wasm + meta-emu-standalone.html reconstruits.
 
 ## BANC DE TEST COMPLET (2026-10-04, natif headless, captures /tmp/bench_*)
 
-Méthode : `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu …
+Méthode : `SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy gm0 …
 --frames N --shot /tmp/bench_X.ppm` ; le score = couleurs distinctes +
 pixels non noirs de la capture.
 
@@ -288,7 +288,7 @@ A → sauvegarde puis ÉCRAN DE JEU (« ×RINGRING× »), DAC à 44100/s.
   `fat_write_lfn_entries`.
 - **Lapinou (25 couleurs), GB loader Zelda (4 couleurs), `ctest -R meta`
   8/8** : non-régression OK.  ATTENTION invocation zedtest : firmware
-  PUIS dossier — `./meta_emu wasm/zedtest/firmware.bin wasm/zedtest`
+  PUIS dossier — `gm0 wasm/zedtest/firmware.bin wasm/zedtest`
   (un seul arg dossier = carte sans firmware, écran noir).
 - wasm et meta-emu-standalone.html reconstruits avec le fix (make wasm +
   make single).
@@ -488,7 +488,7 @@ GARDER mais ne pas activer par défaut ; le modèle précis est meilleur.
    bénin mais visible (saut de 35 px) ; à rapprocher d'un re-init
    périodique du driver.  Vérifier à long terme sur d'autres jeux lib.
 
-## Outils de débogage (dans meta_emu.c, natif)
+## Outils de débogage (dans gm0.c, natif)
 
 - `SD_DEBUG=1` : toutes les commandes SD.  `SD_DEBUG=2` : échange octet
   par octet (`[sdx]`) + contenu des secteurs écrits (`[wr-done]`).
@@ -524,18 +524,18 @@ GARDER mais ne pas activer par défaut ; le modèle précis est meilleur.
 
     cd tools/meta-emu-sdl
     make && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-      ./meta_emu /tmp/celeste/Celeste/Celeste.bin /tmp/celeste/Celeste \
+      gm0 /tmp/celeste/Celeste/Celeste.bin /tmp/celeste/Celeste \
       --frames 2400 --shot /tmp/ce.ppm
     # attendu : écran titre Celeste (montagne, A+B, crédits) ;
     # avec EMU_PRESS_A=1200 : niveau 1 en jeu (Madeline à l'écran)
     make && SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
-      ./meta_emu wasm/games/reuben-quest-lost-between-times.bin wasm/games \
+      gm0 wasm/games/reuben-quest-lost-between-times.bin wasm/games \
       --frames 3600 --shot /tmp/r.ppm
     # attendu : scène de ville jouable (le save se crée sans SAVE ERROR)
-    SD_DEBUG=1 ./meta_emu wasm/games/yatzy.bin wasm/games --frames 900
+    SD_DEBUG=1 gm0 wasm/games/yatzy.bin wasm/games --frames 900
     # attendu : mount + « SD INIT... OK! » affiché (menu toujours absent,
     # open item « premier flush »)
 
 Non-régression : lapinou 25 couleurs, GB loader Zelda 4 couleurs
-(`./meta_emu wasm/zedtest/firmware.bin wasm/zedtest`, firmware PUIS
+(`gm0 wasm/zedtest/firmware.bin wasm/zedtest`, firmware PUIS
 dossier), `ctest -R meta` 8/8.

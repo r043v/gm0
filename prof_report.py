@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agrège un profil EMU_PROF de meta_emu par fonction (symboles de l'ELF).
+"""Agrège un profil EMU_PROF de gm0 par fonction (symboles de l'ELF).
 
 usage : prof_report.py profil.txt firmware.elf [N]
 Les cycles sont ceux du modèle de l'émulateur (Cortex-M0+ 48 MHz + cache

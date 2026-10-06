@@ -1,5 +1,5 @@
 /*
- * meta_emu.c — émulateur Gamebuino META (SAMD21 / Cortex-M0+) et Pokitto en
+ * gm0.c — émulateur Gamebuino META (SAMD21 / Cortex-M0+) et Pokitto en
  * C/SDL2 + WebAssembly.  Né d'un port du fork TypeScript gamebuino-emulator ;
  * depuis 2026-10-05, le vrai matériel prime (README « Fidélité matérielle ») :
  *  - Cortex-M0+ à 48 MHz compté en cycles (cache NVM compris), NVIC fidèle ;
@@ -11,7 +11,7 @@
  *  - boutons sur PB03 : flèches, J=A, K=B, U=MENU, I=HOME, Entrée=Start
  *    (HOME tenu 3 s = reset du jeu, comme sur la console).
  *
- * Usage : meta_emu <firmware.bin> [carte.img] [--wav out.wav]
+ * Usage : gm0 <firmware.bin> [carte.img] [--wav out.wav]
  *
  * La cible est aussi détectée automatiquement : un binaire dont le mot 0
  * (SP initial) pointe dans la SRAM LPC (0x1000xxxx) démarre en mode
@@ -4160,7 +4160,7 @@ static void step_debug(uint32_t pc, uint32_t op) {
 
 /* EMU_PROF=<fichier> : cycles cumulés par instruction (flash et SRAM, META),
  * écrits en fin de run (« adresse cycles » en hexa/décimal) ; agrégation
- * par fonction : tools/meta-emu-sdl/prof_report.py <fichier> <firmware.elf> */
+ * par fonction : prof_report.py <fichier> <firmware.elf> */
 static uint32_t *profFlash, *profSram;
 static int profOn = -1;
 static void prof_add(uint32_t pc, uint32_t cyc) {
@@ -5328,7 +5328,7 @@ int main(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc < 2)
-        fprintf(stderr, "meta_emu : lancé sans firmware — déposez un .bin "
+        fprintf(stderr, "gm0 : lancé sans firmware — déposez un .bin "
                         "dans la fenêtre (carte SD = son répertoire).\n");
     memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
     if (getenv("EMU_TARGET")) {

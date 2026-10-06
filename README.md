@@ -1,6 +1,7 @@
-# meta-emu-sdl — émulateur Gamebuino META **et Pokitto** en C/SDL2 + WebAssembly
+# gm0 — émulateur Gamebuino META **et Pokitto** (C/SDL2 + WebAssembly)
 
-Port C du fork TypeScript (`output/gbemu/`) : interpréteur ARMv6-M Thumb,
+Émulateur hôte du projet : port C d'un émulateur TypeScript préexistant —
+interpréteur ARMv6-M Thumb,
 périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
 (image brute ou dossier FAT16 construit à la volée) et frontal SDL2
 (fenêtre 160×128, clavier, audio ouvert à la cadence TC4 du jeu, calée
@@ -57,18 +58,22 @@ métadonnées sont ignorés, le programme est flashé).
 
 ## Compilation
 
-    make        # natif (SDL2 via pkg-config) — -O3 -flto par défaut
+Natif, via CMake (SDL2 + zlib requises ; Linux, macOS, Windows MinGW) :
+
+    cmake -G Ninja -B build .
+    ninja -C build      # -> build/gm0
 
 À vitesse native l'émulateur tourne à ~8 ms/frame pour un budget temps
 réel de 16,7 ms (59,7 fps) ; la marge vise le wasm (~3-4x plus lent).
 Profil gprof : ~84 % du temps dans le cœur CPU (step + incrementPc),
 le reste dans le chemin DMA/SPI — le dispatch n'est pas refactorisé
 sans garantie de parité TS.
-    make wasm   # navigateur (nécessite emsdk : source ~/emsdk/emsdk_env.sh)
+
+Navigateur (emsdk requis, `emcc` dans le PATH) : `make wasm`.
 
 ## Usage (natif)
 
-    ./meta_emu [firmware.bin] [carte] [--frames N] [--shot out.ppm] [--wav out.wav]
+    gm0 [firmware.bin] [carte] [--frames N] [--shot out.ppm] [--wav out.wav]
 
 - Lancé **sans argument**, la fenêtre s'ouvre vide : **déposez** un
   **.bin** (le firmware ; la carte SD devient son répertoire), une
@@ -92,14 +97,14 @@ sans garantie de parité TS.
   (l'ancien modèle cadençait le pokitto à 45 MHz : un jeu 72 MHz y allait
   à 160 %), ou `EMU_NOPACE=1` dans l'environnement.
 
-    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu \
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy gm0 \
       out/<Jeu>/.pio/build/meta/firmware.bin output/sd-card \
       --frames 300 --shot /tmp/shot.ppm
 
 Exemple Pokitto (détection automatique ; la carte est un argument
 explicite — image .img ou dossier —, jamais le répertoire du .bin) :
 
-    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy ./meta_emu \
+    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy gm0 \
       jeu.bin carte --frames 300 --shot /tmp/shot.ppm
     # .pop accepté tel quel ; --out-img out.img exporte la carte modifiée ;
     # -w/-W ignorent les écritures flash fautives (comme la référence)
@@ -142,7 +147,7 @@ gauche = directions.  Joystick sans mapping : boutons 0=A, 1=B, 2=MENU,
 
 **Version mono fichier distribuable** :
 
-    make single      # produit wasm/meta-emu-standalone.html (~1,1 Mo)
+    make single      # produit wasm/gm0-standalone.html (~1,1 Mo)
 
 Un unique `.html` avec le wasm embarqué en base64 (`-sSINGLE_FILE=1`) :
 à ouvrir directement (file:// compris), à envoyer tel quel — mêmes
