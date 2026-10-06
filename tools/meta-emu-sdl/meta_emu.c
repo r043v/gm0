@@ -4735,6 +4735,7 @@ static void scale_apply(void) {
 static uint32_t emu_nextFrameTick = 334860u; /* pas initial (frame_ticks suit la cible) */
 static Uint32 titleMs;
 static uint32_t titleTick;
+static double rawEmuMs, rawWallMs; /* temps émulé produit / temps mural passé à émuler */
 static char titleBuf[1200]; /* dernier titre construit (HUD wasm) */
 static char hudTitle[1240]; /* titre de la fenêtre native : jeu + % */
 static int titlePct;      /* dernier % (HUD wasm) */
@@ -5218,13 +5219,24 @@ static void update_title_pct(void) {
         double emuMs = (double)(tickCount - titleTick) * 1000.0 / ticks_per_sec();
         double wallMs = (double)(nowMs - titleMs);
         int pct = wallMs > 0.0 ? (int)(emuMs / wallMs * 100.0 + 0.5) : 0;
+        /* Les vraies perfs, sans la limite temps réel : temps émulé produit
+         * par temps mural réellement passé dans l'émulation (accumulé par
+         * les boucles natives/wasm autour de run_emulated_frame).  Affiché
+         * à côté quand il diffère du % limité. */
+        int raw = rawWallMs > 0.0 ? (int)(rawEmuMs / rawWallMs * 100.0 + 0.5) : 0;
+        rawEmuMs = rawWallMs = 0;
         if (pct < 0) pct = 0;
         /* PAS d'écrêtage à 100 : un dépassement (EMU_NOPACE, vieux binaire
-         * face à des firmwares récents) doit se VOIR dans le titre. */
+         * face aux firmwares récents) doit se VOIR dans le titre. */
         if (pct > 999) pct = 999;
         titlePct = pct;
         snprintf(titleBuf, sizeof(titleBuf), "%.900s", fwName);
-        snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %%", fwName, pct);
+        if (raw > pct + 5 && raw > 100) {
+            if (raw > 9999) raw = 9999;
+            snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %% (brut %d %%)", fwName, pct, raw);
+        } else {
+            snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %%", fwName, pct);
+        }
     } else {
         snprintf(titleBuf, sizeof(titleBuf), "déposez un firmware .bin");
         snprintf(hudTitle, sizeof(hudTitle), "%s", titleBuf);
@@ -5455,7 +5467,14 @@ int main(int argc, char **argv) {
         }
 #endif
 
-        if (fwLoaded) run_emulated_frame();
+        if (fwLoaded) {
+            Uint64 emuT0 = SDL_GetPerformanceCounter();
+            run_emulated_frame();
+            /* perf brute (titre « brut N % ») : le temps émulé produit par
+             * le temps mural réellement passé à émuler, hors attente */
+            rawEmuMs += (double)frame_ticks() * 1000.0 / ticks_per_sec();
+            rawWallMs += (double)(SDL_GetPerformanceCounter() - emuT0) * 1000.0 / perfFreq;
+        }
         frame++;
         if (emuTarget == TGT_POKITTO && ENVFLAG("EMU_DMA_TRACE") && (frame % 300) == 0) {
             uint32_t msc = pk_rd32le(sram + (0x10005c64u - 0x10000000u));
@@ -5738,7 +5757,11 @@ static void wasm_loop(void) {
     int due = (int)((now - wasmLastFrame) / frameMs);
     if (due > 4) { due = 1; wasmLastFrame = now; }
     if (fwLoaded && booted && !wasmPaused) {
+        double emuT0 = emscripten_get_now();
         for (int i = 0; i < due; i++) run_emulated_frame();
+        /* perf brute (titre « brut N % »), comme la boucle native */
+        rawEmuMs += (double)due * frame_ticks() * 1000.0 / ticks_per_sec();
+        rawWallMs += emscripten_get_now() - emuT0;
         wasmFrame += (Uint32)due;
     }
     if (emuTarget == TGT_POKITTO) pk_adc_frame();
