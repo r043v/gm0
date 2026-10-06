@@ -1795,16 +1795,23 @@ static void pk_audio_check_hle(uint32_t rate) {
     uint32_t timerIRQ = pk_read_word(sys_VTOR + (34 << 2));
     if (pk_hleState != PK_HLE_DETECT) {
         if (pk_hleIrqAddress == timerIRQ) return;
+        /* le handler a changé (loader -> jeu) : le device U8 du HLE ne doit
+         * pas jouer le jeu — retour au R2R le temps de la re-détection */
+        if (pk_hleState == PK_HLE_ENABLED) pk_r2r_reopen();
     }
     pk_hleState = PK_HLE_DISABLED;
     pk_hleIrqAddress = timerIRQ;
-    uint32_t sum = 0;
-    for (int i = 0; i < 10; i++) sum += pk_read_word(timerIRQ + ((uint32_t)i << 2));
-    if (sum != 0x32a90803u) return;
+    /* le loader stock garde buffer + playhead à +0x70/+0x6c du handler :
+     * détection structurelle (adresses résolubles) — le magic 0x32a90803
+     * ne matche qu'un build exact du loader et rate les autres .pop */
     uint32_t vbuffer = pk_read_word(timerIRQ + 0x70 - 1);
     uint32_t vplay = pk_read_word(timerIRQ + 0x6c - 1);
     pk_hleBuffer = pk_audio_address(vbuffer);
     pk_hlePlayhead = (uint32_t *)pk_audio_address(vplay);
+    if (ENVFLAG("EMU_PK_DEBUG"))
+        fprintf(stderr, "[pkhle] handler=%x vbuffer=%x vplay=%x -> %d\n",
+                timerIRQ, vbuffer, vplay,
+                (pk_hleBuffer && pk_hlePlayhead) ? 1 : 0);
     if (!pk_hleBuffer || !pk_hlePlayhead) return;
     pk_hleState = PK_HLE_ENABLED;
     pk_audio_reopen((int)(pk_core_hz() / rate));
@@ -1850,13 +1857,10 @@ static int pk_audio_ready(void) { return pk_aqSize >= 600; }
  * étiré de 60 %, le jeu au ralenti. */
 static double pk_core_hz(void) {
     if ((pk_syscon[PK_SYSCON_MAINCLKSEL] & 3u) != 3u) return 12e6;
-    /* LPC11U6x : CPU 50 MHz max, Pokitto cadencé à 48 MHz (datasheet NXP
-     * §8.25.4 : le PLL passe par un CCO 156-320 MHz + post-diviseur — le
-     * guest peut programmer une config hors spec (overclock) : le modèle
-     * suit le SoC réel et plafonne à 48 MHz). */
-    double h = 12e6 * (double)((pk_syscon[PK_SYSCON_SYSPLLCTRL] & 0x1Fu) + 1u);
-    if (h > 48e6) h = 48e6;
-    return h;
+    /* la fréquence est celle que le guest programme lui-même (12 MHz IRC
+     * x MSEL+1 quand MAINCLKSEL pointe le PLL) — le vrai SoC encaisse les
+     * configs au-delà du spec sheet (50 MHz), donc le modèle aussi. */
+    return 12e6 * (double)((pk_syscon[PK_SYSCON_SYSPLLCTRL] & 0x1Fu) + 1u);
 }
 
 /* --- GPIO (0xA0000000) */
@@ -2087,7 +2091,14 @@ static uint32_t pk_ct_tick(struct pk_ct *ct, uint32_t num, uint32_t delta) {
     }
 
     if (ct->r[PK_CT_IR] && armIrqEnable) {
-        if (num == 0) pk_irq34++;
+        if (num == 0) {
+            pk_irq34++;
+            /* détection HLE du handler stock (loader) : auto-limitée (le
+             * même vecteur ne re-détecte pas), le taux CT32B0 courant sert
+             * au taux de lecture du buffer HLE */
+            uint32_t mr0 = ct->r[6];
+            if (mr0 > 0) pk_audio_check_hle((uint32_t)(pk_core_hz() / ((uint64_t)(mr0 + 1) * pr)));
+        }
         pk_interrupt(34 + num);
     }
     return tti;
@@ -4575,7 +4586,16 @@ static void pk_audio_cb(Uint8 *stream, int len) {
         /* à sec (pause, menu, stall) : la dernière valeur se tient, comme
          * le DAC matériel — l'ancien « saute au présent » rejouait 600
          * latches déjà consommés à chaque reprise */
-        s = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
+        int raw = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
+        /* couplage AC de l'ampli Pokitto, comme sur la META (d936f63) :
+         * le loader tient un repos DC arbitraire (63) — sans blocage, ce
+         * rail mange la moitié de la dynamique et claque à chaque
+         * transition (le « son baisé » au loader) */
+        static float pk_dcX, pk_dcY; static int pk_dcInit;
+        if (!pk_dcInit) { pk_dcX = (float)raw; pk_dcInit = 1; }
+        pk_dcY = 0.995f * pk_dcY + (float)raw - pk_dcX;
+        pk_dcX = (float)raw;
+        s = (int16_t)(pk_dcY > 32767.f ? 32767.f : (pk_dcY < -32768.f ? -32768.f : pk_dcY));
         out[i] = s;
         if (wavFile) wav_put(s);
     }
