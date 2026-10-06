@@ -1814,9 +1814,6 @@ static uint32_t pk_aqStart, pk_aqEnd, pk_aqSize;
 static float pk_audioHoldF;
 static uint8_t pk_prevData = 0xFF;
 static uint32_t pk_prevTicks;
-/* cadence mesurée des latches R2R (moyenne glissante) -> emuDacRate */
-static float pk_rateEma;
-static int pk_rateInit;
 static unsigned long pk_latchCount, pk_ctIrqCount, pk_ctCross, pk_irq34, pk_latchMid, pk_latchSound;
 static FILE *latchDump;
 static int latchDumpTried; /* EMU_LATCH_DUMP lu une seule fois (getenv par
@@ -1895,20 +1892,11 @@ static void pk_audio_write(uint8_t data) {
      * s'encoder comme un retard permanent de la file — le décalage audible
      * se cumulait de la durée de chaque pause, session après session */
     if (delta > 3.0f * PK_IFREQ) delta = 3.0f * PK_IFREQ;
-    /* cadence réelle des latches -> emuDacRate : GF tique à 8 kHz (CT32B0,
-     * MR1) et le consommateur hôte restait calé sur le défaut 22049 — il
-     * mangeait 2,75x trop vite, la file tombait à sec en permanence et le
-     * son du jeu (fanfares d'écran et musiques streamées de la SD
-     * comprises) sortait haché.  Moyenne glissante courte + hystérésis. */
-    if (delta > 0.0f) {
-        float r = 1.0f / delta;
-        if (!pk_rateInit) { pk_rateEma = r; pk_rateInit = 1; }
-        else pk_rateEma += 0.25f * (r - pk_rateEma);
-        /* l'EMA (alpha 0,25) est déjà lissée : affectation directe, la
-         * consommation suit la cadence réelle du jeu sans dérive */
-        if (pk_rateEma > 3000.0f && pk_rateEma < 48000.0f)
-            emuDacRate = pk_rateEma;
-    }
+    /* la consommation normalise chaque entrée à d/(PK_IFREQ x emuDacRate)
+     * secondes murales : avec emuDacRate = 22050 (PK_IFREQ), chaque latch
+     * joue SA vraie durée émulée, quelle que soit la cadence du jeu
+     * (8 kHz chez GF comme 22 kHz ailleurs) — ne PAS dériver emuDacRate :
+     * le suivre réduisait les ziques à 2,75x leur vitesse. */
     pk_aqDelta[pk_aqEnd] = delta;
     pk_aqData[pk_aqEnd] = data;
     pk_aqEnd = (pk_aqEnd + 1) & PK_AQ_MASK;
@@ -1949,14 +1937,23 @@ static void pk_pout_write(uint32_t p, uint32_t v) {
             pk_lcd_reset();
         pk_pin[1] = (pk_pin[1] & ~pk_dir[1]) | (v & pk_dir[1]);
         pk_pout[1] = v;
+        /* latch R2R au niveau : GF écrit l'audio par POUT2 direct (mots),
+         * chemin que les déclencheurs SET/CLR/0xA0000057 ne voyaient pas —
+         * sa musique ne sortait jamais.  pk_audio_gpio_write dédoublonne. */
+        pk_audio_gpio_write();
         return;
     }
     pk_pout[2] = v;
     pk_pin[2] = (pk_pin[2] & ~pk_dir[2]) | (v & pk_dir[2]);
+    pk_audio_gpio_write();
 }
 
 static void pk_audio_gpio_write(void) {
-    pk_audio_write((uint8_t)((pk_pout[1] >> 28) | ((pk_pout[2] >> 16) & 0xF0)));
+    uint8_t v = (uint8_t)((pk_pout[1] >> 28) | ((pk_pout[2] >> 16) & 0xF0));
+    /* latch sensible au niveau : la même valeur relue ne rejoue rien
+     * (sinon les doubles déclencheurs pollueraient la cadence mesurée) */
+    if (v == pk_prevData && pk_latchCount) return;
+    pk_audio_write(v);
 }
 
 static void pk_gpio_input(uint32_t pinId, uint32_t bit, uint32_t val) {
@@ -2732,8 +2729,6 @@ static void pk_reset_core(void) {
     pk_aqStart = pk_aqEnd = pk_aqSize = 0;
     pk_prevData = 0xFF;
     pk_prevTicks = 0;
-    pk_rateEma = 0;
-    pk_rateInit = 0; /* la cadence apprise sur le jeu précédent ne fuit pas */
     aq_head = aq_tail = 0;
     audioHold = 0;
 
