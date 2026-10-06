@@ -1757,6 +1757,7 @@ static float pk_audioHoldF;
 static uint8_t pk_prevData = 0xFF;
 static uint32_t pk_prevTicks;
 static unsigned long pk_latchCount, pk_ctIrqCount, pk_ctCross, pk_irq34, pk_latchMid, pk_latchSound;
+static FILE *latchDump;
 #define QADDR 0x20000000u /* .bss_ram1 : pokitto_audio_q (tail, head, ring) */
 
 
@@ -1803,6 +1804,8 @@ static void pk_audio_write(uint8_t data) {
     if (pk_hleState == PK_HLE_ENABLED) return;
     pk_prevData = data;
     pk_latchCount++;
+    if (!latchDump && getenv("EMU_LATCH_DUMP")) latchDump = fopen(getenv("EMU_LATCH_DUMP"), "w");
+    if (latchDump) fprintf(latchDump, "%u %u\n", tickCount, data);
     if (pk_latchCount > 44000) { /* après le boot : ce qui est réellement joué */
         if (data == 128) pk_latchMid++;
         else { pk_latchSound++;
@@ -4473,7 +4476,7 @@ static void pk_audio_cb(Uint8 *stream, int len) {
              * le retour du son donnait des plages étirées.  On saute au
              * présent : ~600 latches d'avance, comme la reprise franche META. */
             pk_aqStart = (pk_aqEnd + PK_AQ_SIZE - 600) & PK_AQ_MASK;
-            pk_aqSize = (PK_AQ_SIZE - 600) & PK_AQ_MASK;
+            pk_aqSize = 600; /* les 600 latches qui séparent start de end */
             for (; i < len; i++) stream[i] = (uint8_t)pk_audioHoldF;
             return;
         }
