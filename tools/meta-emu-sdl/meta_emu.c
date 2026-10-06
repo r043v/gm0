@@ -4492,7 +4492,10 @@ static void pk_audio_cb(Uint8 *stream, int len) {
              * présent : ~600 latches d'avance, comme la reprise franche META. */
             pk_aqStart = (pk_aqEnd + PK_AQ_SIZE - 600) & PK_AQ_MASK;
             pk_aqSize = 600; /* les 600 latches qui séparent start de end */
-            for (; i < n; i++) out[i] = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
+            for (; i < n; i++) {
+                out[i] = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
+                if (wavFile) wav_put((int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8));
+            }
             return;
         }
         while (pk_aqSize) {
