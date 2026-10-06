@@ -1280,12 +1280,15 @@ static uint8_t *zip_entry_data(const ZipEnt *e) {
  * la racine ou dans un sous-dossier, il devient le firmware (le loader
  * listera tous les jeux de la carte, comme sur la vraie console) */
 static int zip_load_card(const uint8_t *data, size_t len) {
-    ZipEnt ents[256];
+    /* statiques : 256 ZipEnt (~270 Ko) débordaient la pile wasm (64 Ko) et
+     * corrompaient l'état en silence — lapinou passait par chance de
+     * layout, les autres zips restaient à 0 %. */
+    static ZipEnt ents[256];
     int n = zip_parse(data, len, ents, 256);
     if (n == 0) return 0;
     /* décompresse TOUT d'abord : les pointeurs cdata pointent dans `data`,
      * que reset_machine va libérer (sd_unload) */
-    uint8_t *datas[256];
+    static uint8_t *datas[256];
     int fwb = -1, fpop = -1;
     for (int i = 0; i < n; i++) {
         datas[i] = zip_entry_data(&ents[i]);
