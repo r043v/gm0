@@ -1849,7 +1849,13 @@ static int pk_audio_ready(void) { return pk_aqSize >= 600; }
  * étiré de 60 %, le jeu au ralenti. */
 static double pk_core_hz(void) {
     if ((pk_syscon[PK_SYSCON_MAINCLKSEL] & 3u) != 3u) return 12e6;
-    return 12e6 * (double)((pk_syscon[PK_SYSCON_SYSPLLCTRL] & 0x1Fu) + 1u);
+    /* LPC11U6x : CPU 50 MHz max, Pokitto cadencé à 48 MHz (datasheet NXP
+     * §8.25.4 : le PLL passe par un CCO 156-320 MHz + post-diviseur — le
+     * guest peut programmer une config hors spec (overclock) : le modèle
+     * suit le SoC réel et plafonne à 48 MHz). */
+    double h = 12e6 * (double)((pk_syscon[PK_SYSCON_SYSPLLCTRL] & 0x1Fu) + 1u);
+    if (h > 48e6) h = 48e6;
+    return h;
 }
 
 /* --- GPIO (0xA0000000) */

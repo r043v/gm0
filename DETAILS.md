@@ -80,7 +80,9 @@ transfert immédiat hérité du TS (firmwares 0.1.0 : sortie identique).
   deux bogues préexistants corrigés au passage (débordement de la table
   FAT sur les gros répertoires ; surlecture `FAT_SPC` vs `fatSpc`).
 - `Pandemic` (PokittoLib récent, fourni en `.bin` et `.pop`) : écran
-  titre complet rendu (nom, auteur, menu) — boot, init horloges 72 MHz,
+  titre complet rendu (nom, auteur, menu) — boot, init horloges (le guest
+  programme un PLL hors spec : le modèle plafonne le SoC à 48 MHz, max
+  LPC11U6x 50 — datasheet NXP §8.25.4),
   timers, constructeurs C++, IAP et API ROM (division) opérationnels.
   L'émulateur de référence C++ ne bootait pas ce fichier dans le même
   environnement.
