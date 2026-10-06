@@ -1814,6 +1814,9 @@ static uint32_t pk_aqStart, pk_aqEnd, pk_aqSize;
 static float pk_audioHoldF;
 static uint8_t pk_prevData = 0xFF;
 static uint32_t pk_prevTicks;
+/* cadence mesurée des latches R2R (moyenne glissante) -> emuDacRate */
+static float pk_rateEma;
+static int pk_rateInit;
 static unsigned long pk_latchCount, pk_ctIrqCount, pk_ctCross, pk_irq34, pk_latchMid, pk_latchSound;
 static FILE *latchDump;
 static int latchDumpTried; /* EMU_LATCH_DUMP lu une seule fois (getenv par
@@ -1892,6 +1895,20 @@ static void pk_audio_write(uint8_t data) {
      * s'encoder comme un retard permanent de la file — le décalage audible
      * se cumulait de la durée de chaque pause, session après session */
     if (delta > 3.0f * PK_IFREQ) delta = 3.0f * PK_IFREQ;
+    /* cadence réelle des latches -> emuDacRate : GF tique à 8 kHz (CT32B0,
+     * MR1) et le consommateur hôte restait calé sur le défaut 22049 — il
+     * mangeait 2,75x trop vite, la file tombait à sec en permanence et le
+     * son du jeu (fanfares d'écran et musiques streamées de la SD
+     * comprises) sortait haché.  Moyenne glissante courte + hystérésis. */
+    if (delta > 0.0f) {
+        float r = 1.0f / delta;
+        if (!pk_rateInit) { pk_rateEma = r; pk_rateInit = 1; }
+        else pk_rateEma += 0.25f * (r - pk_rateEma);
+        /* l'EMA (alpha 0,25) est déjà lissée : affectation directe, la
+         * consommation suit la cadence réelle du jeu sans dérive */
+        if (pk_rateEma > 3000.0f && pk_rateEma < 48000.0f)
+            emuDacRate = pk_rateEma;
+    }
     pk_aqDelta[pk_aqEnd] = delta;
     pk_aqData[pk_aqEnd] = data;
     pk_aqEnd = (pk_aqEnd + 1) & PK_AQ_MASK;
@@ -2715,6 +2732,8 @@ static void pk_reset_core(void) {
     pk_aqStart = pk_aqEnd = pk_aqSize = 0;
     pk_prevData = 0xFF;
     pk_prevTicks = 0;
+    pk_rateEma = 0;
+    pk_rateInit = 0; /* la cadence apprise sur le jeu précédent ne fuit pas */
     aq_head = aq_tail = 0;
     audioHold = 0;
 
@@ -5370,15 +5389,17 @@ static void update_diagnostics(Uint32 frame) {
     double sec = (double)(tickCount - diagLastT) / ticks_per_sec();
     if (emuTarget == TGT_POKITTO) {
         /* mêmes sondes que la META : production R2R (latches) ou HLE,
-         * consommation hôte (callbacks), remplissage de la file Pokitto */
-        uint32_t cbs = audCbCalls - diagLastC;
+         * consommation hôte (callbacks), remplissage de la file Pokitto.
+         * Les compteurs hôte sont pk_cbCalls/pk_cbSamples — audCb* ne
+         * bouge que sur la voie META et donnait cb=0, trompeur. */
+        uint32_t cbs = pk_cbCalls - diagLastC;
         fprintf(stderr, "[audio] f=%u latches=%lu (%.0f/s, muets=%lu son=%lu) hle=%s | hote: cb=%u éch/cb=%u sous-débit=%u file=%u\n",
                 frame, pk_latchCount - diagLastL, (double)(pk_latchCount - diagLastL) / sec,
                 pk_latchMid, pk_latchSound,
                 pk_hleState == PK_HLE_ENABLED ? "on" : "off",
-                cbs, cbs ? (audCbSamples - diagLastN) / cbs : 0, audUnder - diagLastU, pk_aqSize);
-        diagLastL = pk_latchCount; diagLastC = audCbCalls;
-        diagLastN = audCbSamples; diagLastU = audUnder;
+                cbs, cbs ? (pk_cbSamples - diagLastN) / cbs : 0, audUnder - diagLastU, pk_aqSize);
+        diagLastL = pk_latchCount; diagLastC = pk_cbCalls;
+        diagLastN = pk_cbSamples; diagLastU = audUnder;
     } else {
         int ahead = aq_tail - aq_head; if (ahead < 0) ahead += AQ_SIZE;
         fprintf(stderr, "[audio] f=%u dac/s=%.0f famine=%.1f%% relances=%u frames-hote=%u | hote: cb=%u éch/cb=%u sous-débit=%u file=%d\n",
