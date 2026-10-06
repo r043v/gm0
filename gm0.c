@@ -4736,6 +4736,7 @@ static uint32_t emu_nextFrameTick = 334860u; /* pas initial (frame_ticks suit la
 static Uint32 titleMs;
 static uint32_t titleTick;
 static double rawEmuMs, rawWallMs; /* temps émulé produit / temps mural passé à émuler */
+static double rawEmuMsTotal, rawWallMsTotal; /* cumuls sur tout le run (ligne [bench] de sortie) */
 static char titleBuf[1200]; /* dernier titre construit (HUD wasm) */
 static char hudTitle[1240]; /* titre de la fenêtre native : jeu + % */
 static int titlePct;      /* dernier % (HUD wasm) */
@@ -5472,8 +5473,10 @@ int main(int argc, char **argv) {
             run_emulated_frame();
             /* perf brute (titre « brut N % ») : le temps émulé produit par
              * le temps mural réellement passé à émuler, hors attente */
-            rawEmuMs += (double)frame_ticks() * 1000.0 / ticks_per_sec();
-            rawWallMs += (double)(SDL_GetPerformanceCounter() - emuT0) * 1000.0 / perfFreq;
+            double benchEmuMs = (double)frame_ticks() * 1000.0 / ticks_per_sec();
+            double benchWallMs = (double)(SDL_GetPerformanceCounter() - emuT0) * 1000.0 / perfFreq;
+            rawEmuMs += benchEmuMs; rawWallMs += benchWallMs;
+            rawEmuMsTotal += benchEmuMs; rawWallMsTotal += benchWallMs;
         }
         frame++;
         if (emuTarget == TGT_POKITTO && ENVFLAG("EMU_DMA_TRACE") && (frame % 300) == 0) {
@@ -5579,6 +5582,11 @@ int main(int argc, char **argv) {
         FILE *g = fopen(fd, "wb");
         if (g) { fwrite(sd_card_data(), 1, sd_card_size(), g); fclose(g); }
       } }
+    if (rawWallMsTotal > 0.0) /* vitesse brute du run, hors attente de pacing */
+        fprintf(stderr, "[bench] frames=%u wall=%.2fs emu=%.2fs brut=%.0f%% (%.0f MHz effectifs)\n",
+                frame, rawWallMsTotal / 1000.0, rawEmuMsTotal / 1000.0,
+                rawEmuMsTotal / rawWallMsTotal * 100.0,
+                (double)ticks_per_sec() / 1e6 * rawEmuMsTotal / rawWallMsTotal);
     if (audioDev) SDL_CloseAudioDevice(audioDev);
     SDL_DestroyRenderer(emuRen); SDL_DestroyTexture(tex); SDL_DestroyWindow(emuWin);
     SDL_Quit();
@@ -5750,11 +5758,13 @@ static void wasm_loop(void) {
         titleMs = (Uint32)emscripten_get_now();
     }
     /* une frame émulée par rAF (59,94 Hz ≈ 59,73) ; en retard de plus de
-     * 4 frames (onglet caché, stall) : pas de rattrapage */
+     * 4 frames (onglet caché, stall) : pas de rattrapage.  due est ARRONDI
+     * (pas tronqué) : un rAF à 60,0 Hz exact donne 16,68 ms < frameMs, la
+     * troncature restait à due=0 pour toujours (machine à l'arrêt). */
     double now = emscripten_get_now();
     const double frameMs = 16.743;
     if (wasmLastFrame == 0) wasmLastFrame = now;
-    int due = (int)((now - wasmLastFrame) / frameMs);
+    int due = (int)((now - wasmLastFrame) / frameMs + 0.5);
     if (due > 4) { due = 1; wasmLastFrame = now; }
     if (fwLoaded && booted && !wasmPaused) {
         double emuT0 = emscripten_get_now();

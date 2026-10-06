@@ -437,7 +437,6 @@ function renderDirectGames() {
     b.textContent = g.n.split(' ')[0];
     b.title = 'Charger ' + g.n + ' (offline)';
     b.addEventListener('click', async () => {
-      if (fwLoaded && !confirm('Charger ' + g.n + ' (le jeu courant est remplacé) ?')) return;
       setStatus('chargement de ' + g.f + ' …');
       try {
         await loadDirect(await offlineBytes(g.f), g.f);
@@ -481,8 +480,9 @@ function offlineBytes(f) {
 
 </script>
 <script>
-/* le canvas doit être fourni au module AVANT son chargement ; console et
- * sorties C remontent dans le bandeau de statut */
+/* le canvas doit être fourni au module AVANT son chargement ; les sorties C
+ * vont à la console du navigateur, le bandeau ne montre que les vraies
+ * erreurs (abort, exception) */
 const __log = [];
 function __show(s) {
   __log.push(s); if (__log.length > 4) __log.shift();
@@ -490,7 +490,7 @@ function __show(s) {
 }
 var Module = {
   canvas: document.getElementById('canvas'),
-  printErr: (s) => __show('· ' + s),
+  printErr: (s) => console.log(s),
   onAbort: (s) => __show('ABORT : ' + s),
 };
 window.addEventListener('error', e => { __show('ERREUR : ' + e.message);

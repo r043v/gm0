@@ -44,13 +44,69 @@ LPC11U6x), ou forcée par `--target`.
   traces DMA/SPI/LCD/SD, script d'appuis (`EMU_INPUT`), dumps FAT/flash/
   framebuffer — liste complète dans DETAILS.md.
 
-## Performances attendues
+## Performances mesurées
 
-(Ryzen 7 6850H, machine émulée à 48 MHz) : **1,7 à 2,3x le temps réel**
-en natif, cœur wasm (V8) **~1,25 à 1,5x** — le budget temps réel de
-16,7 ms est tenu en ~8 ms/frame.  Le cœur CPU (dispatch par table de
-saut, coûts en cycles Cortex-M0+ réels + états d'attente du cache NVM)
-tourne 1,5 à 1,9x plus vite que le décodeur hérité du port TypeScript.
+Vitesse brute mesurée (Ryzen 7 PRO 6850H ; **% = vitesse de la machine
+émulée rapport au temps réel de la console** — 100 % = temps réel exact) :
+
+- **Natif** : `EMU_NOPACE=1`, 30 000 frames par run avec script
+  d'entrées aléatoires (ligne `[bench]` de fin de run) — les 20 jeux du
+  tableau, un par un, système à vide ;
+- **Wasm** : % brut du titre sous Chromium/V8, même poste (échantillon de
+  4 jeux représentatifs, 20-30 s par jeu) ; le pacing tient le temps réel
+  (~100 %) avec cette marge de cadence.
+
+| Jeu | META · C | META · wasm | Pokitto · C |
+|---|---|---|---|
+| Super Mario Land | 406 % | ~260 % | 273 % |
+| Super Mario Land X | 486 % | — | 291 % |
+| Tetris | 516 % | — | 294 % |
+| Dr. Mario | 457 % | — | 281 % |
+| Mario & Yoshi | 530 % | — | 292 % |
+| Alleyway | 435 % | — | 276 % |
+| Tennis | 445 % | — | 285 % |
+| F-1 Race | 349 % | — | 259 % |
+| R-Type | 495 % | — | 286 % |
+| Contra | 522 % | — | 296 % |
+| Prince of Persia | 522 % | — | 285 % |
+| Bubble Bobble | 557 % | — | 302 % |
+| Donkey Kong Land | 469 % | — | 264 % |
+| Castlevania II Belmont's | 362 % | — | 262 % |
+| Double Dragon | 531 % | — | 289 % |
+| Ninja Gaiden Shadow | 407 % | — | 264 % |
+| Pinball Dreams | 518 % | — | 291 % |
+| Golf | 528 % | — | 294 % |
+| Arcade Classic 4 Defender | 540 % | — | 274 % |
+| Bubble Bobble Junior | 537 % | — | 291 % |
+| lapinou (pilotes maison) | 350 % | ~210 % | — |
+| Cats & Coins (lib officielle) | 456 % | ~250 % | — |
+
+En clair : en natif la META tourne **3,5 à 5,6x le temps réel** (médiane
+~500 %) et la Pokitto **2,6 à 3,0x** (médiane ~290 %) — le budget temps
+réel de 16,7 ms est tenu en ~8 ms/frame.  En wasm le temps réel est tenu
+sans effort (~100 %) avec une marge brute de ~2 à 2,9x.  Le cœur CPU
+(dispatch par table de saut, coûts en cycles Cortex-M0+ réels + états
+d'attente du cache NVM) tourne 1,5 à 1,9x plus vite que le décodeur
+hérité du port TypeScript.
+
+## Support par plateforme
+
+| Fonction | Natif (C/SDL2) | WebAssembly |
+|---|---|---|
+| Écran | fenêtre redimensionnable, échelle entière/ajustée/étirée (**F10**), plein écran (**F11**) | canvas, pixels nets, mise à l'échelle navigateur |
+| Son | sortie SDL2 calée sur le timer du jeu (régulation ±0,5 %) | WebAudio, démarrage au premier geste |
+| Manette | SDL_GameController, branchement à chaud, mappings libellés | Gamepad API (via le port SDL d'Emscripten), mêmes mappages |
+| Clavier META | flèches/ZQSD/WASD, **Entrée**=MENU, **Espace**=A, **Ctrl**=B, **\***=HOME (ou J/K/U/I) | identique |
+| Clavier Pokitto | IJKL/flèches, **A/S/B/D/F** — ou Entrée=C, Espace=A, Ctrl=B | identique |
+| Pause / reset | **F5** = reset (pas de pause au clavier) | boutons ⏸ (pause) et ⏹ (reset) du dock |
+| Chargement d'un jeu | argument CLI ou glisser-déposer : `.bin`, `.img`, `.zip`, dossier | glisser-déposer ou 📄/📁 : `.bin`, `.pop`, `.zip`, dossier |
+| Carte SD | dossier → FAT16 à la volée (taille dynamique), image `.img`, `.zip` = carte complète ; streaming `.GB` | `.zip` = carte complète ; streaming `.GB` (FAT16 en mémoire) |
+| Sauvegardes | `.SAV`/`.STA` réécrits dans les fichiers ; EEPROM Pokitto `<jeu>.eeprom` persistée | en mémoire — perdues à la fermeture de l'onglet |
+| Écritures flash (auto-patch des loaders) | modélisées | ignorées |
+| % de vitesse | barre de titre (± % brut hors pacing) | titre de l'onglet + coin de la page |
+| Jeux en un clic | — | dock de droite (`wasm/games.js`) ; standalone mono-fichier ouvrable en `file://` |
+| Headless / capture | `--frames`, `--shot`, `--wav`, ligne `[bench]` de fin de run | — |
+| Débogage | variables d'environnement `EMU_*`, `SD_DEBUG`… (DETAILS.md) | console du navigateur |
 
 ## Compilation
 
