@@ -159,3 +159,20 @@ aucun code repris :
 
 Écosystème : [gamebuino.com](https://gamebuino.com) côté META ;
 [PokittoLib](https://github.com/pokitto/PokittoLib) côté Pokitto.
+
+## Licence
+
+gm0 est sous licence **[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.fr)**
+(© 2026 r043v) : attribution, pas d'utilisation commerciale, partage
+dans les mêmes conditions.
+
+La logique extraite de deux émulateurs **MIT** reste sous MIT — leurs
+avis de droit sont conservés dans [LICENSE](LICENSE) :
+[aoneill01/gamebuino-emulator](https://github.com/aoneill01/gamebuino-emulator)
+(Andy O'Neill, 2017) et
+[felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu)
+(Felipe Manga, 2017).  Le reste n'engendre aucune obligation :
+implémenter un comportement documenté dans les datasheets (Microchip,
+NXP, Sitronix, ARM) ne crée pas de dérivé de ces documents, et ni le
+source de lapinou ni les binaires META ni la lib officielle n'ont fourni
+la moindre ligne de code (analyse seule).
