@@ -1788,6 +1788,7 @@ static uint8_t *pk_audio_address(uint32_t v) {
     return NULL;
 }
 
+static void pk_r2r_reopen(void); /* défini dans la section SDL */
 static void pk_audio_reopen(int freq); /* défini dans la section SDL */
 
 static void pk_audio_check_hle(uint32_t rate) {
@@ -2712,7 +2713,10 @@ static void pk_eeprom_save(void) {
 static void pk_debug_dump(void) {
     if (!getenv("EMU_PK_DEBUG")) return;
     for (int i = 0; i < 64; i++)
-        if (pk_irqCount[i]) fprintf(stderr, "IRQ %d : %ld tirs\n", i, pk_irqCount[i]);
+        if (pk_irqCount[i]) fprintf(stderr, TR("IRQ %d : %ld tirs\n", "IRQ %d: %ld shots\n"), i, pk_irqCount[i]);
+    fprintf(stderr, TR("HLE audio : %s\n", "HLE audio: %s\n"),
+            pk_hleState == PK_HLE_ENABLED ? TR("actif (firmware stock)", "active (stock firmware)")
+                                          : TR("inactif (R2R)", "inactive (R2R)"));
     for (int n = 0; n < 2; n++)
         fprintf(stderr, "CT32B%d : TCR=%x TC=%u PR=%u MCR=%x MR=[%u %u %u %u] IR=%x armIrq=%d\n",
                 n, pk_ct[n].r[1], pk_ct[n].r[2], pk_ct[n].r[3], pk_ct[n].r[5],
@@ -5027,6 +5031,20 @@ static void pk_audio_reopen(int freq) {
     if (!dev) return;
     if (audioDev) { SDL_PauseAudioDevice(audioDev, 1); SDL_CloseAudioDevice(audioDev); }
     audioDev = dev;
+    SDL_PauseAudioDevice(dev, 0);
+}
+
+static void pk_r2r_reopen(void) {
+    if (!audioOk) return;
+    SDL_AudioSpec want, got;
+    memset(&want, 0, sizeof(want));
+    want.freq = (int)(emuDacRate + 0.5); want.format = AUDIO_S16SYS; want.channels = 1;
+    want.samples = 512; want.callback = audio_cb;
+    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
+    if (!dev) return;
+    if (audioDev) { SDL_PauseAudioDevice(audioDev, 1); SDL_CloseAudioDevice(audioDev); }
+    audioDev = dev;
+    aq_configure(got.samples, (double)got.freq, emuDacRate);
     SDL_PauseAudioDevice(dev, 0);
 }
 
