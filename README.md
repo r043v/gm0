@@ -8,6 +8,37 @@ périphériques (ports, SERCOM4/5, DMAC, SysTick, TC4+DAC), carte SD SPI
 250 ppm sous sa production — cf. NOTES, section AUDIO du 2026-10-05).
 Se compile aussi en **WebAssembly** (même cœur, navigateur).
 
+## Génèse et crédits
+
+Ce projet est **100 % vibe-coded** : aucune ligne de C tapée à la main.
+L'émulateur entier (≈ 5 800 lignes de C, 66 commits) a été écrit par des
+agents de code IA en une semaine — du 30 septembre au 6 octobre 2026 ;
+le nombre de tokens, lui, n'est pas journalisé.  Signature dans l'historique
+git : 15 commits co-signés **ZCode**, et un co-signé **Claude Opus 5.5**
+(le canal audio DMA déclenché par TC4).
+
+Trois sources de vérité ont nourri le code :
+
+- **l'émulateur TypeScript d'Andy O'Neill** (MIT) — le premier port C en
+  reproduisait la parité tick à tick :
+  [aoneill01/gamebuino-emulator](https://github.com/aoneill01/gamebuino-emulator) ;
+- **PokittoEmu de Felipe Manga** — le cœur LPC11U6x/Cortex-M0 en est un
+  port C fidèle :
+  [felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu) ;
+- **les datasheets officielles**, pour tout le reste (cœur ARMv6-M réel,
+  DMAC/SERCOM/TC/NVIC, carte SD SPI, panneau) :
+  - SAM D21/DA1 — Microchip, DS40001882 :
+    <https://www.microchip.com/en-us/product/ATSAMD21G18> ;
+  - LPC11U6x — NXP (datasheet + user manual UM10732) :
+    <https://www.nxp.com/docs/en/data-sheet/LPC11U6X.pdf> ;
+  - ST7735 — Sitronix (PDF sous NDA, copies publiques courantes) ;
+  - ARMv6-M Architecture Reference Manual :
+    <https://developer.arm.com/documentation/ddi0419/latest>.
+
+Écosystème : [gamebuino.com](https://gamebuino.com) et
+[Gamebuino-META](https://github.com/Gamebuino/Gamebuino-META) côté META ;
+[PokittoLib](https://github.com/pokitto/PokittoLib) côté Pokitto.
+
 **Jeux maison sans lib standard** (ex. lapinou : buffer demi-écran envoyé
 en DMA blocs vers `SERCOM4->SPI.DATA`, pilote SD et audio PMF écrits à la
 main) : pris en charge depuis la révision « compat lapinou » —
