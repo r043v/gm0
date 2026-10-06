@@ -1,5 +1,5 @@
 # build natif (CMake)
-build/
+build*/
 gm0
 gm0.exe
 

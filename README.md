@@ -1,18 +1,15 @@
-# gm0 — Gamebuino META **and Pokitto** emulator (C/SDL2 + WebAssembly)
+# gm0 — Gamebuino META (SAMD21) **and Pokitto** (LPC11U6x) emulator, Cortex-M0+/M0 (C/SDL2 + WebAssembly)
 
 > **Version française** : [README.fr.md](README.fr.md)
 
-One emulator for both consoles: a silicon-faithful ARMv6-M Thumb
-interpreter, real peripherals (ports, SERCOM4/5, DMAC, SysTick,
-TC4/TC5+DAC, NVIC), an SPI SD card (raw image or FAT16 folder built on
-the fly), an SDL2 frontend and a WebAssembly build (same C core).  The
-target is auto-detected at load time (META SAMD21 / Pokitto LPC11U6x),
-or forced with `--target`.
-
-> The technical deep-dive (homebrew games, SD/official library,
-> hardware fidelity, debug environment variables) lives in
-> [DETAILS.md](DETAILS.md) and
-> [NOTES-SD-LIB-OFFICIELLE.md](NOTES-SD-LIB-OFFICIELLE.md) (French).
+One emulator for both consoles: a silicon-faithful **ARMv6-M Thumb
+interpreter** (a **Cortex-M0+** on the META, a **Cortex-M0** on the
+Pokitto — cycle-counted, with the real peripherals: ports, SERCOM4/5,
+DMAC, SysTick, TC4/TC5+DAC, NVIC; LPC-side SYSCON/CT32B/SCT/SSP on the
+Pokitto), an SPI SD card (raw image or FAT16 folder built on the fly),
+an SDL2 frontend and a WebAssembly build (same C core).  The target is
+auto-detected at load time (META SAMD21 / Pokitto LPC11U6x), or forced
+with `--target`.
 
 ## Project status
 
@@ -46,51 +43,15 @@ or forced with `--target`.
 | Speed % | window title (± raw % without pacing) | tab title + page corner |
 | One-click games | — | right dock (`wasm/games.js`); single-file standalone usable from `file://` |
 | Headless / capture | `--frames`, `--shot`, `--wav`, end-of-run `[bench]` line | — |
-| Debugging | environment variables `EMU_*`, `SD_DEBUG`… (DETAILS.md) | browser console |
+| Debugging | environment variables `EMU_*`, `SD_DEBUG`… | browser console |
 
-## Measured performance
+## Performance
 
-Raw speed (Ryzen 7 PRO 6850H; **% = emulated machine speed relative to
-the console's real time** — 100 % = exact real time):
-
-- **Native**: `EMU_NOPACE=1`, 30,000 frames per run with a random input
-  script (end-of-run `[bench]` line) — all 20 games below, one at a
-  time, idle system;
-- **Wasm**: raw % from the title bar under Chromium/V8, same machine
-  (4-game sample, 20-30 s per game); pacing holds real time (~100 %)
-  with this much headroom.
-
-| Game | META · C | META · wasm | Pokitto · C |
-|---|---|---|---|
-| Super Mario Land | 406 % | ~260 % | 273 % |
-| Super Mario Land X | 486 % | — | 291 % |
-| Tetris | 516 % | — | 294 % |
-| Dr. Mario | 457 % | — | 281 % |
-| Mario & Yoshi | 530 % | — | 292 % |
-| Alleyway | 435 % | — | 276 % |
-| Tennis | 445 % | — | 285 % |
-| F-1 Race | 349 % | — | 259 % |
-| R-Type | 495 % | — | 286 % |
-| Contra | 522 % | — | 296 % |
-| Prince of Persia | 522 % | — | 285 % |
-| Bubble Bobble | 557 % | — | 302 % |
-| Donkey Kong Land | 469 % | — | 264 % |
-| Castlevania II Belmont's | 362 % | — | 262 % |
-| Double Dragon | 531 % | — | 289 % |
-| Ninja Gaiden Shadow | 407 % | — | 264 % |
-| Pinball Dreams | 518 % | — | 291 % |
-| Golf | 528 % | — | 294 % |
-| Arcade Classic 4 Defender | 540 % | — | 274 % |
-| Bubble Bobble Junior | 537 % | — | 291 % |
-| lapinou (custom drivers) | 350 % | ~210 % | — |
-| Cats & Coins (official lib) | 456 % | ~250 % | — |
-
-Bottom line: natively the META runs at **3.5-5.6x real time** (median
-~500 %) and the Pokitto at **2.6-3.0x** (median ~290 %) — the 16.7 ms
-real-time budget is met in ~8 ms/frame.  In wasm, real time is held
-effortlessly (~100 %) with a raw headroom of ~2-2.9x.  The CPU core
-(jump-table dispatch, real Cortex-M0+ cycle costs + NVM cache wait
-states) runs 1.5-1.9x faster than the TypeScript-port decoder.
+Absolute numbers depend on the host (CPU, RAM, OS, load) — the durable
+fact is the median: both consoles run at **≈ 4× (META) and ≈ 3×
+(Pokitto) real time** natively on a mid-range laptop, and the wasm build
+holds real time in the browser (≈ 55 % of native on META, ≈ 33 % on
+Pokitto).
 
 ## Features
 
@@ -98,7 +59,8 @@ states) runs 1.5-1.9x faster than the TypeScript-port decoder.
   `.pop` accepted as firmware on Pokitto) or a **folder** (card only)
   onto the window; dynamic-size FAT16 card, `.SAV` files written by the
   game are written back to disk;
-- resizable window (**F10**: scaling modes, **F11**: fullscreen), speed
+- resizable window (**F10**: scaling modes, **F11**: fullscreen),
+  **F8** = Game Boy filter (4-shade DMG palette + dot-matrix grid), speed
   **%** in the title (unbounded: >100 = running too fast), debt-free
   deadline pacing, **F5** = reset;
 - SDL_GameController gamepad (hot-plug) + keyboard (META and Pokitto);
@@ -107,9 +69,8 @@ states) runs 1.5-1.9x faster than the TypeScript-port decoder.
   bounded headless runs (`--frames`);
 - wasm: pause/stop/loading dock, offline game list (`wasm/games.js`),
   single-file standalone with games embedded in base64;
-- debugging: per-address cycle profile (`EMU_PROF` + `prof_report.py`),
-  DMA/SPI/LCD/SD traces, input scripting (`EMU_INPUT`), FAT/flash/
-  framebuffer dumps — full list in DETAILS.md.
+- debugging: per-address cycle profile (`EMU_PROF`), DMA/SPI/LCD/SD
+  traces, input scripting (`EMU_INPUT`), FAT/flash/framebuffer dumps.
 
 ## Building
 
@@ -121,9 +82,9 @@ Native, via CMake (SDL2 + zlib required; Linux, macOS, Windows MinGW):
 French interface: `cmake -B build-fr -DGM0_FR=ON && cmake --build build-fr`
 (the default interface is English).
 
-Browser (emsdk required, `emcc` on PATH): `make wasm`.
-Single-file distributable: `make single`
-(`wasm/gm0-standalone.html`, usable from file://).
+Browser (emsdk required, `emcc` on PATH): `make wasm` →
+`wasm/gm0-standalone.html`, a single self-contained file (wasm embedded
+in base64, usable straight from file://).
 
 ## Usage (native)
 
@@ -148,7 +109,10 @@ Headless (tests, captures):
 
 ## Browser usage
 
-    cd wasm && python3 -m http.server 8000    # http://localhost:8000/
+Open `wasm/gm0-standalone.html` (double-click — no server needed, it
+works from file://) or play directly at
+<https://r043v.github.io/gm0/> (GitHub Pages, emulator only — drag &
+drop your own games).
 
 ## Known limitations
 
@@ -210,7 +174,7 @@ debugging, no code copied:
 
 - the **lapinou source** on META (hand-written screen/SD/audio drivers,
   no standard library): it revealed the screen's real DMA/SPI protocol,
-  the TC4 clocking and the CS/pull-up quirks (DETAILS.md);
+  the TC4 clocking and the CS/pull-up quirks;
 - **META binaries** and the **official META library**
   ([Gamebuino/Gamebuino-META](https://github.com/Gamebuino/Gamebuino-META)):
   stepped through in the emulator for the SdFat stack, the library's

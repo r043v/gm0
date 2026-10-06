@@ -1,17 +1,15 @@
-# gm0 — émulateur Gamebuino META **et Pokitto** (C/SDL2 + WebAssembly)
+# gm0 — émulateur Gamebuino META (SAMD21) **et Pokitto** (LPC11U6x), Cortex-M0+/M0 (C/SDL2 + WebAssembly)
 
 > **English version** : [README.md](README.md)
 
-Émulateur des deux consoles en un seul binaire : interpréteur ARMv6-M
-Thumb fidèle au silicium, périphériques réels (ports, SERCOM4/5, DMAC,
-SysTick, TC4/TC5+DAC, NVIC), carte SD SPI (image brute ou dossier FAT16
-construit à la volée), frontal SDL2 et build WebAssembly (même cœur C).
-Cible détectée automatiquement au chargement (META SAMD21 / Pokitto
+Émulateur des deux consoles en un seul binaire : interpréteur **ARMv6-M
+Thumb** fidèle au silicium (**Cortex-M0+** sur la META, **Cortex-M0**
+sur la Pokitto — compté en cycles, avec les périphériques réels : ports,
+SERCOM4/5, DMAC, SysTick, TC4/TC5+DAC, NVIC ; côté LPC SYSCON/CT32B/
+SCT/SSP), carte SD SPI (image brute ou dossier FAT16 construit à la
+volée), frontal SDL2 et build WebAssembly (même cœur C).  Cible
+détectée automatiquement au chargement (META SAMD21 / Pokitto
 LPC11U6x), ou forcée par `--target`.
-
-> Le fond technique (jeux maison, SD/lib officielle, fidélité matérielle,
-> variables de débogage) : [DETAILS.md](DETAILS.md) et
-> [NOTES-SD-LIB-OFFICIELLE.md](NOTES-SD-LIB-OFFICIELLE.md).
 
 ## État du projet
 
@@ -34,7 +32,8 @@ LPC11U6x), ou forcée par `--target`.
   **dossier** (carte seule) dans la fenêtre ; carte FAT16 à taille
   dynamique, `.SAV` écrits par le jeu réécrits dans les fichiers ;
 - fenêtre redimensionnable (**F10** : modes d'échelle, **F11** : plein
-  écran), **% de vitesse** dans le titre (non borné : >100 = machine trop
+  écran), **F8** = filtre Game Boy (4 nuances DMG + trame point-matrice),
+  **% de vitesse** dans le titre (non borné : >100 = machine trop
   rapide), pacing à échéance sans rattrapage, **F5** = reset ;
 - manette SDL_GameController (hot-plug) + clavier (META et Pokitto) ;
 - export de la carte modifiée (`--out-img`), ignore des écritures flash
@@ -42,54 +41,17 @@ LPC11U6x), ou forcée par `--target`.
   (`--shot`), run headless borné (`--frames`) ;
 - wasm : dock pause/stop/chargement, liste offline de jeux
   (`wasm/games.js`), standalone embarquant les jeux en base64 ;
-- débogage : profil cycles par adresse (`EMU_PROF` + `prof_report.py`),
+- débogage : profil cycles par adresse (`EMU_PROF`),
   traces DMA/SPI/LCD/SD, script d'appuis (`EMU_INPUT`), dumps FAT/flash/
-  framebuffer — liste complète dans DETAILS.md.
+  framebuffer.
 
-## Performances mesurées
+## Performance
 
-Vitesse brute mesurée (Ryzen 7 PRO 6850H ; **% = vitesse de la machine
-émulée rapport au temps réel de la console** — 100 % = temps réel exact) :
-
-- **Natif** : `EMU_NOPACE=1`, 30 000 frames par run avec script
-  d'entrées aléatoires (ligne `[bench]` de fin de run) — les 20 jeux du
-  tableau, un par un, système à vide ;
-- **Wasm** : % brut du titre sous Chromium/V8, même poste (échantillon de
-  4 jeux représentatifs, 20-30 s par jeu) ; le pacing tient le temps réel
-  (~100 %) avec cette marge de cadence.
-
-| Jeu | META · C | META · wasm | Pokitto · C |
-|---|---|---|---|
-| Super Mario Land | 406 % | ~260 % | 273 % |
-| Super Mario Land X | 486 % | — | 291 % |
-| Tetris | 516 % | — | 294 % |
-| Dr. Mario | 457 % | — | 281 % |
-| Mario & Yoshi | 530 % | — | 292 % |
-| Alleyway | 435 % | — | 276 % |
-| Tennis | 445 % | — | 285 % |
-| F-1 Race | 349 % | — | 259 % |
-| R-Type | 495 % | — | 286 % |
-| Contra | 522 % | — | 296 % |
-| Prince of Persia | 522 % | — | 285 % |
-| Bubble Bobble | 557 % | — | 302 % |
-| Donkey Kong Land | 469 % | — | 264 % |
-| Castlevania II Belmont's | 362 % | — | 262 % |
-| Double Dragon | 531 % | — | 289 % |
-| Ninja Gaiden Shadow | 407 % | — | 264 % |
-| Pinball Dreams | 518 % | — | 291 % |
-| Golf | 528 % | — | 294 % |
-| Arcade Classic 4 Defender | 540 % | — | 274 % |
-| Bubble Bobble Junior | 537 % | — | 291 % |
-| lapinou (pilotes maison) | 350 % | ~210 % | — |
-| Cats & Coins (lib officielle) | 456 % | ~250 % | — |
-
-En clair : en natif la META tourne **3,5 à 5,6x le temps réel** (médiane
-~500 %) et la Pokitto **2,6 à 3,0x** (médiane ~290 %) — le budget temps
-réel de 16,7 ms est tenu en ~8 ms/frame.  En wasm le temps réel est tenu
-sans effort (~100 %) avec une marge brute de ~2 à 2,9x.  Le cœur CPU
-(dispatch par table de saut, coûts en cycles Cortex-M0+ réels + états
-d'attente du cache NVM) tourne 1,5 à 1,9x plus vite que le décodeur
-hérité du port TypeScript.
+Les chiffres absolus dépendent de l'hôte (CPU, RAM, OS, charge) — le
+fait durable est la **médiane** : les deux consoles tournent à
+**≈ 4× (META) et ≈ 3× (Pokitto) le temps réel** en natif sur un portable
+moyen, et le build wasm tient le temps réel dans le navigateur
+(≈ 55 % du natif sur META, ≈ 33 % sur Pokitto).
 
 ## Support par plateforme
 
@@ -108,7 +70,7 @@ hérité du port TypeScript.
 | % de vitesse | barre de titre (± % brut hors pacing) | titre de l'onglet + coin de la page |
 | Jeux en un clic | — | dock de droite (`wasm/games.js`) ; standalone mono-fichier ouvrable en `file://` |
 | Headless / capture | `--frames`, `--shot`, `--wav`, ligne `[bench]` de fin de run | — |
-| Débogage | variables d'environnement `EMU_*`, `SD_DEBUG`… (DETAILS.md) | console du navigateur |
+| Débogage | variables d'environnement `EMU_*`, `SD_DEBUG`… | console du navigateur |
 
 ## Compilation
 
@@ -117,9 +79,9 @@ Natif, via CMake (SDL2 + zlib requises ; Linux, macOS, Windows MinGW) :
     cmake -B build .
     cmake --build build      # -> build/gm0
 
-Navigateur (emsdk requis, `emcc` dans le PATH) : `make wasm`.
-Version mono fichier distribuable : `make single`
-(`wasm/gm0-standalone.html`, ouvrable en file://).
+Navigateur (emsdk requis, `emcc` dans le PATH) : `make wasm` →
+`wasm/gm0-standalone.html`, un seul fichier autonome (wasm embarqué en
+base64, ouvrable directement en file://).
 
 ## Usage (natif)
 
@@ -145,7 +107,10 @@ Headless (tests, captures) :
 
 ## Usage (navigateur)
 
-    cd wasm && python3 -m http.server 8000    # http://localhost:8000/
+Ouvrez `wasm/gm0-standalone.html` (double-clic — pas de serveur, ça
+marche en file://) ou jouez directement sur
+<https://r043v.github.io/gm0/> (GitHub Pages, émulateur seul — déposez
+vos propres jeux).
 
 ## Limitations connues
 
@@ -208,8 +173,7 @@ aucun code repris :
 
 - le **source de lapinou** sur META (pilotes écran/SD/audio écrits à la
   main, sans la lib standard) : c'est lui qui a révélé le vrai protocole
-  DMA/SPI de l'écran, le cadencement TC4 et les quirks CS/pull-ups
-  (DETAILS.md) ;
+  DMA/SPI de l'écran, le cadencement TC4 et les quirks CS/pull-ups ;
 - des **binaires META** et la **lib META officielle**
   ([Gamebuino/Gamebuino-META](https://github.com/Gamebuino/Gamebuino-META))
   : exécutés pas à pas dans l'émulateur pour la pile SD (SdFat), les
