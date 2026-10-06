@@ -1,7 +1,7 @@
 # Build navigateur uniquement : wasm/index.html + wasm/gm0.js + .wasm
 # (nécessite emsdk : source ~/emsdk/emsdk_env.sh, ou emcc déjà dans le PATH).
 # Le build natif (Linux/macOS/Windows) passe par CMake :
-#   cmake -G Ninja -B build . && ninja -C build   # -> build/gm0
+#   cmake -B build . && cmake --build build   # -> build/gm0
 EMCC ?= emcc
 EMFLAGS := -O3 -flto -sUSE_SDL=2 -sUSE_ZLIB=1 -sALLOW_MEMORY_GROWTH=1 -sENVIRONMENT=web \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,stringToUTF8,UTF8ToString -sEXIT_RUNTIME=0 \

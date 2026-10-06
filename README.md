@@ -60,8 +60,8 @@ métadonnées sont ignorés, le programme est flashé).
 
 Natif, via CMake (SDL2 + zlib requises ; Linux, macOS, Windows MinGW) :
 
-    cmake -G Ninja -B build .
-    ninja -C build      # -> build/gm0
+    cmake -B build .
+    cmake --build build      # -> build/gm0
 
 À vitesse native l'émulateur tourne à ~8 ms/frame pour un budget temps
 réel de 16,7 ms (59,7 fps) ; la marge vise le wasm (~3-4x plus lent).
