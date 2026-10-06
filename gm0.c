@@ -1316,15 +1316,17 @@ static uint8_t *zip_entry_data(const ZipEnt *e) {
  * la racine ou dans un sous-dossier, il devient le firmware (le loader
  * listera tous les jeux de la carte, comme sur la vraie console) */
 static int zip_load_card(const uint8_t *data, size_t len) {
-    /* statiques : 256 ZipEnt (~270 Ko) débordaient la pile wasm (64 Ko) et
-     * corrompaient l'état en silence — lapinou passait par chance de
+    /* tas (pas pile) : 256 ZipEnt (~270 Ko) débordaient la pile wasm (64 Ko)
+     * et corrompaient l'état en silence — lapinou passait par chance de
      * layout, les autres zips restaient à 0 %. */
-    static ZipEnt ents[256];
+    static ZipEnt *ents = 0;
+    if (!ents) ents = malloc(sizeof(ZipEnt) * 256);
     int n = zip_parse(data, len, ents, 256);
     if (n == 0) return 0;
     /* décompresse TOUT d'abord : les pointeurs cdata pointent dans `data`,
      * que reset_machine va libérer (sd_unload) */
-    static uint8_t *datas[256];
+    static uint8_t **datas = 0;
+    if (!datas) datas = malloc(sizeof(uint8_t *) * 256);
     int fwb = -1, fpop = -1;
     for (int i = 0; i < n; i++) {
         datas[i] = zip_entry_data(&ents[i]);
@@ -4238,8 +4240,8 @@ static void step_debug(uint32_t pc, uint32_t op) {
 #define BRANCH(t) do { regs[15] = ((t) & ~1u) + 2u; cyc = 2; } while (0)
 
 /* EMU_PROF=<fichier> : cycles cumulés par instruction (flash et SRAM, les
- * deux cibles), écrits en fin de run (« adresse cycles » en hexa/décimal) ;
- * agrégation par fonction : prof_report.py <fichier> <firmware.elf> */
+ * deux cibles), écrits en fin de run (« adresse cycles » en hexa/décimal),
+ * un fichier « adresse cycles » agrégeable à la main ou par script. */
 static uint32_t *profFlash, *profSram;
 static int profOn = -1;
 static void prof_add(uint32_t pc, uint32_t cyc) {
@@ -4523,7 +4525,7 @@ static void step(void) {
 /* --------------------------------------------------------- SDL + main */
 
 static SDL_Texture *tex;
-static uint32_t px32[MAX_SCREEN_W * MAX_SCREEN_H];
+static uint32_t px32[3 * MAX_SCREEN_W * 3 * MAX_SCREEN_H];
 
 /* Mise à l'échelle de la fenêtre : 0 = échelle entière (pixels carrés,
  * défaut), 1 = adaptée (au plus grand multiple non entier qui garde le
@@ -4531,17 +4533,54 @@ static uint32_t px32[MAX_SCREEN_W * MAX_SCREEN_H];
  * cycle les modes, F11 bascule le plein écran. */
 static int dispScale, dispFull;
 
+/* F8 : filtre Game Boy DMG — la luminance de chaque pixel est quantifiée
+ * sur les 4 nuances de la dalle réflexe, puis chaque pixel émulé devient
+ * une cellule 3x3 à bord sombre (la maille point-matrice de la photo).
+ * La texture est alors 3x plus grande ; la taille logique de rendu ne
+ * change pas, le tracé et les modes d'échelle restent identiques. */
+static int dispFilter;
+static const uint32_t dmgShade[4] = { /* ARGB, de la plus sombre à la plus claire */
+    0xff0f380fu, 0xff306230u, 0xff8bac0fu, 0xff9bbc0fu };
+#define DMG_SHADE(c, num) (0xff000000u | \
+    ((((c) >> 16) & 0xff) * (num) / 100) << 16 | \
+    ((((c) >> 8) & 0xff) * (num) / 100) << 8 | \
+    (((c) & 0xff) * (num) / 100))
+
 static void scale_apply(void);
 
 static void blit(SDL_Renderer *ren) {
     const uint16_t *src = emuTarget == TGT_POKITTO ? pk_lcd : pix;
-    for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
-        uint16_t p = src[i];
-        uint8_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
-        /* même expansion que st7735.ts : décalages, pas de mise à l'échelle */
-        px32[i] = 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
+    if (!dispFilter) {
+        for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
+            uint16_t p = src[i];
+            uint8_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+            /* même expansion que st7735.ts : décalages, pas de mise à l'échelle */
+            px32[i] = 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
+        }
+        SDL_UpdateTexture(tex, NULL, px32, SCR_W * sizeof(uint32_t));
+    } else {
+        /* quantifie la luminance sur les 4 nuances DMG, puis trame 3x3 :
+         * centre de cellule à pleine teinte, bords assombris (la maille
+         * point-matrice de la dalle) */
+        for (unsigned ty = 0; ty < 3 * SCR_H; ty++) {
+            uint32_t *out = px32 + ty * 3 * SCR_W;
+            const uint16_t *line = src + (ty / 3) * SCR_W;
+            unsigned j = ty % 3;
+            for (unsigned x = 0; x < SCR_W; x++) {
+                uint16_t p = line[x];
+                uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+                /* luminance 8 bits depuis du 5/6/5 : sommes pré-multipliées */
+                uint32_t lum = (r * 616 + g * 604 + b * 224) >> 8; /* 0..250 */
+                uint32_t c = dmgShade[lum >= 176 ? 3 : lum >= 120 ? 2 : lum >= 64 ? 1 : 0];
+                uint32_t e = DMG_SHADE(c, 52), m = DMG_SHADE(c, 74);
+                out[0] = j == 1 ? m : e;
+                out[1] = j == 1 ? c : m;
+                out[2] = j == 1 ? m : e;
+                out += 3;
+            }
+        }
+        SDL_UpdateTexture(tex, NULL, px32, SCR_W * 3 * sizeof(uint32_t));
     }
-    SDL_UpdateTexture(tex, NULL, px32, SCR_W * sizeof(uint32_t));
     SDL_RenderClear(ren);
     if (dispScale) {
         int ow, oh;
@@ -4815,8 +4854,9 @@ static void scale_apply(void) {
      * recrée (le contenu est de toute façon réécrit à chaque frame). */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, dispScale ? "linear" : "nearest");
     if (tex) SDL_DestroyTexture(tex);
+    unsigned tw = dispFilter ? 3 * SCR_W : SCR_W, th = dispFilter ? 3 * SCR_H : SCR_H;
     tex = SDL_CreateTexture(emuRen, SDL_PIXELFORMAT_ARGB8888,
-                            SDL_TEXTUREACCESS_STREAMING, (int)SCR_W, (int)SCR_H);
+                            SDL_TEXTUREACCESS_STREAMING, (int)tw, (int)th);
     if (dispScale) {
         SDL_RenderSetLogicalSize(emuRen, 0, 0);
         SDL_RenderSetIntegerScale(emuRen, SDL_FALSE);
@@ -5113,7 +5153,10 @@ static void pk_audio_reopen(int freq) {
  * revient quand le HLE se retire, audio_start la rétablit au boot d'un jeu
  * si une partie Pokitto HLE l'avait remplacée. */
 static void audio_open_standard(void) {
-    if (!audioOk) return;
+    /* PAS de garde audioOk : au premier appel (sdl_init_all) le device
+     * n'existe pas encore — une garde ici le faisait renvoyer immédiatement
+     * et l'émulateur démarrait sans aucun son.  L'échec d'ouverture laisse
+     * simplement audioOk à 0 (audio_start retentera au boot d'un jeu). */
     SDL_AudioSpec want, got;
     memset(&want, 0, sizeof(want));
     want.freq = 48000; want.format = AUDIO_S16SYS; want.channels = 1;
@@ -5122,6 +5165,7 @@ static void audio_open_standard(void) {
     if (!dev) return;
     if (audioDev) { SDL_PauseAudioDevice(audioDev, 1); SDL_CloseAudioDevice(audioDev); }
     audioDev = dev;
+    audioOk = 1;
     devRate = got.freq ? got.freq : 48000;
     devCbSamples = got.samples;
     aq_configure(got.samples, (double)devRate, emuDacRate);
@@ -5233,6 +5277,12 @@ static int poll_events(void) {
 #endif
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F5) {
             if (fwLoaded) { fw_restart(); printf(TR("redémarrage\n", "restart\n")); }
+        }
+        else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F8) {
+            dispFilter = !dispFilter;
+            scale_apply();
+            printf(TR("filtre : %s (F8)\n", "filter: %s (F8)\n"),
+                   dispFilter ? "Game Boy DMG" : TR("aucun", "none"));
         }
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F10) {
             dispScale = (dispScale + 1) % 3;

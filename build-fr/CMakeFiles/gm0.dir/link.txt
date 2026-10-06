@@ -1,1 +1,0 @@
-/usr/sbin/cc -O3 -flto -Wl,--dependency-file=CMakeFiles/gm0.dir/link.d CMakeFiles/gm0.dir/gm0.c.o -o bin/gm0  /usr/lib/libSDL2-2.0.so.0.3200.72 /usr/lib/libSDL2main.a /usr/lib/libz.so -lm
