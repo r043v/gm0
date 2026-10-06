@@ -78,27 +78,31 @@
 <body>
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
 <div id="overlay">
-  <h1>Gamebuino META / Pokitto — émulateur (wasm)</h1>
-  <div>… ou déposez-les directement ici.</div>
-  <small>La cible (META ou Pokitto) est détectée automatiquement — .bin,
+  <h1><span data-fr="Gamebuino META / Pokitto — émulateur (wasm)">Gamebuino META / Pokitto — emulator (wasm)</span></h1>
+  <div data-fr="… ou déposez-les directement ici.">… or drop them straight here.</div>
+  <small data-fr="La cible (META ou Pokitto) est détectée automatiquement — .bin,
          .pop (loader Pokitto), .zip ou dossier acceptés. Un .zip = carte SD
          complète (son premier .bin lance le jeu — bouton « 🎮 Jeux » pour
          changer). META : flèches/ZQSD, Entrée=MENU, Espace=A, Ctrl=B,
-         *=HOME. Pokitto : IJKL/flèches, A=« a », B=« s », C=« d » — ou manette.</small>
+         *=HOME. Pokitto : IJKL/flèches, A=« a », B=« s », C=« d » — ou manette.">The target (META or Pokitto) is auto-detected — .bin,
+         .pop (Pokitto loader), .zip or folder accepted. A .zip = full SD
+         card (its first .bin boots the game — the « 🎮 Games » button
+         switches). META: arrows/ZQSD/WASD, Enter=MENU, Space=A, Ctrl=B,
+         *=HOME. Pokitto: IJKL/arrows, A=“a”, B=“s”, C=“d” — or gamepad.</small>
 </div>
 <div id="pct"></div>
 <div id="dock">
-  <button id="pickFiles" title="Un fichier : .zip (carte SD) ou .bin (jeu)" aria-label="Ouvrir un fichier">📄</button>
-  <button id="pickFolder" title="Un répertoire de jeu (bin + rom + sauvegarde)" aria-label="Ouvrir un dossier">📁</button>
+  <button id="pickFiles" title="One file: .zip (SD card) or .bin (game)" data-fr-title="Un fichier : .zip (carte SD) ou .bin (jeu)" aria-label="Open a file">📄</button>
+  <button id="pickFolder" title="A game folder (bin + rom + save)" data-fr-title="Un répertoire de jeu (bin + rom + sauvegarde)" aria-label="Open a folder">📁</button>
   <div class="sep"></div>
-  <button id="pauseBtn" title="Pause / reprise" disabled>⏸</button>
-  <button id="stopBtn" title="Revenir au premier écran du jeu" disabled>⏹</button>
+  <button id="pauseBtn" title="Pause / resume" data-fr-title="Pause / reprise" disabled>⏸</button>
+  <button id="stopBtn" title="Restart the current game" data-fr-title="Revenir au premier écran du jeu" disabled>⏹</button>
   <div class="sep"></div>
   <span class="lab">jeux</span>
   <div id="directGames" style="display:contents"></div>
 </div>
-<div id="gamesBtn">🎮 Jeux</div>
-<div id="lightbox"><span id="closeLb">✕</span><h2>Jeux sur la carte</h2><div class="grid" id="gameGrid"></div></div>
+<div id="gamesBtn" data-fr="🎮 Jeux">🎮 Games</div>
+<div id="lightbox"><span id="closeLb">✕</span><h2 data-fr="Jeux sur la carte">Games on the card</h2><div class="grid" id="gameGrid"></div></div>
 <div id="status"><span id="gamename"></span><span id="msg"></span></div>
 <input id="folder" type="file" webkitdirectory multiple hidden>
 <input id="files" type="file" multiple hidden>
@@ -110,9 +114,13 @@ const statusEl = document.getElementById('msg');
 const folderInput = document.getElementById('folder');
 const filesInput = document.getElementById('files');
 
+const FR = (navigator.language || '').toLowerCase().startsWith('fr');
+const T = (fr, en) => FR ? fr : en;
+if (FR) document.querySelectorAll('[data-fr]').forEach(e => { e.textContent = e.dataset.fr; });
+if (FR) document.querySelectorAll('[data-fr-title]').forEach(e => { e.title = e.dataset.frTitle; });
 function setStatus(msg) { statusEl.textContent = msg; }
-window.addEventListener('error', e => setStatus('ERREUR : ' + e.message));
-window.addEventListener('unhandledrejection', e => setStatus('ERREUR (promise) : ' + e.reason));
+window.addEventListener('error', e => setStatus(T('ERREUR : ', 'ERROR: ') + e.message));
+window.addEventListener('unhandledrejection', e => setStatus(T('ERREUR (promise) : ', 'ERROR (promise): ') + e.reason));
 
 /* ---- pont vers le C ---- */
 /* exports Module.emu_xxx (sans underscore, style 3.1.x) ou _emu_xxx */
@@ -121,7 +129,7 @@ function cfunc(name) {
 }
 function cFirmware(bytes, name) {
   const f = cfunc('emu_firmware');
-  if (!f) { setStatus('export emu_firmware manquant'); return false; }
+  if (!f) { setStatus(T('export emu_firmware manquant', 'missing emu_firmware export')); return false; }
   const ptr = Module._malloc(bytes.length);
   Module.HEAPU8.set(bytes, ptr);
   const namePtr = Module._malloc(256);
@@ -153,7 +161,7 @@ function cCardImage(bytes) {
 function cCardFinish() { const f = cfunc('emu_card_finish'); if (f) f(); }
 function cZip(bytes) {
   const f = cfunc('emu_zip_load');
-  if (!f) { setStatus('export emu_zip_load manquant'); return 0; }
+  if (!f) { setStatus(T('export emu_zip_load manquant', 'missing emu_zip_load export')); return 0; }
   const ptr = Module._malloc(bytes.length);
   Module.HEAPU8.set(bytes, ptr);
   const r = f(ptr, bytes.length);
@@ -164,7 +172,7 @@ function cZip(bytes) {
 /* charge un ensemble de fichiers {path, file} : le .bin unique devient le
  * firmware, le reste la carte SD (comme le fork TS) */
 async function loadSet(items) {
-  if (!items.length) { setStatus('aucun fichier reçu'); return; }
+  if (!items.length) { setStatus(T('aucun fichier reçu', 'no files received')); return; }
   // le module wasm doit être prêt (les drops peuvent arriver pendant le chargement)
   await new Promise(res => {
     if (Module.calledRun || Module._malloc) res();
@@ -180,35 +188,35 @@ async function loadSet(items) {
   // un .zip = carte SD complète (son premier .bin devient le firmware)
   const zips = items.filter(it => /\.zip$/i.test(it.path));
   if (zips.length) {
-    setStatus('lecture du zip…');
+    setStatus(T('lecture du zip…', 'reading zip…'));
     const r = cZip(new Uint8Array(await zips[0].file.arrayBuffer()));
     if (r === 2) {
       overlay.classList.add('hidden');
-      setStatus('zip chargé : firmware + carte');
+      setStatus(T('zip chargé : firmware + carte', 'zip loaded: firmware + card'));
       if (gamesCount() > 1) gamesBtn.style.display = 'block';
     } else if (r === 1) {
-      setStatus('carte du zip montée, mais aucun firmware .bin dedans — déposez un .bin');
-    } else setStatus('zip inexploitable');
+      setStatus(T('carte du zip montée, mais aucun firmware .bin dedans — déposez un .bin', 'zip card mounted but no .bin firmware inside — drop a .bin'));
+    } else setStatus(T('zip inexploitable', 'unusable zip'));
     return;
   }
   const firmwareBin = bins.length === 1 ? bins[0] : bins.find(b => !b.path.includes('/'));
 
   if (!firmwareBin && bins.length === 0) {
-    setStatus('firmware .bin manquant — carte ignorée');
+    setStatus(T('firmware .bin manquant — carte ignorée', 'missing .bin firmware — card ignored'));
     if (items.length === 1 && /\.img$/i.test(items[0].path)) {
       cCardImage(new Uint8Array(await items[0].file.arrayBuffer()));
-      setStatus('carte SD chargée (image) — déposez un firmware .bin');
+      setStatus(T('carte SD chargée (image) — déposez un firmware .bin', 'SD card loaded (image) — drop a .bin firmware'));
     }
     return;
   }
   if (bins.length > 1 && !firmwareBin) {
-    setStatus(`${bins.length} fichiers .bin : déposez un seul jeu (ou son dossier)`);
+    setStatus(T(`${bins.length} fichiers .bin : déposez un seul jeu (ou son dossier)`, `${bins.length} .bin files: drop a single game (or its folder)`));
     return;
   }
-  setStatus('lecture du firmware…');
+  setStatus(T('lecture du firmware…', 'reading firmware…'));
   const fwBytes = new Uint8Array(await firmwareBin.file.arrayBuffer());
   if (!cFirmware(fwBytes, firmwareBin.path.split('/').pop())) {
-    setStatus(`${firmwareBin.path.split('/').pop()} : firmware refusé (vide ou invalide)`);
+    setStatus(`${firmwareBin.path.split('/').pop()} : ` + T('firmware refusé (vide ou invalide)', 'firmware rejected (empty or invalid)'));
     return;
   }
   // la carte : tous les autres fichiers, chemin relatif
@@ -218,7 +226,7 @@ async function loadSet(items) {
   }
   cCardFinish(); /* construit la carte (même vide) puis démarre la machine */
   overlay.classList.add('hidden');
-  setStatus(`firmware : ${firmwareBin.path.split('/').pop()}` +
+  setStatus(`firmware: ${firmwareBin.path.split('/').pop()}` +
             (rest.length ? ` + ${rest.length} fichier(s) de carte` : ''));
 }
 
@@ -244,8 +252,8 @@ document.addEventListener('dragover', e => e.preventDefault());
 document.addEventListener('drop', async e => {
   e.preventDefault();
   const dt = e.dataTransfer;
-  if (!dt) { setStatus('drop sans dataTransfer'); return; }
-  setStatus(`drop : ${dt.items ? dt.items.length : '?'} item(s), ` +
+  if (!dt) { setStatus(T('drop sans dataTransfer', 'drop without dataTransfer')); return; }
+  setStatus(`drop: ${dt.items ? dt.items.length : '?'} item(s), ` +
             `${dt.files ? dt.files.length : '?'} fichier(s)…`);
   const out = [];
   const entries = [];
@@ -275,12 +283,12 @@ document.addEventListener('drop', async e => {
     for (const it of out) if (it.path.startsWith(prefix)) it.path = it.path.slice(prefix.length);
   }
   if (!out.length) {
-    setStatus(`drop : ${dt.items ? dt.items.length : '?'} item(s) mais aucun fichier ` +
+    setStatus(`drop: ${dt.items ? dt.items.length : '?'} item(s) ` + T('mais aucun fichier ', 'but no file ') +
               `lisible${fails.length ? ` (${fails.length} échec(s))` : ''} — ` +
               'passez par les boutons 📄/📁');
     return;
   }
-  setStatus(`${out.length} élément(s) reçu(s)…`);
+  setStatus(T(`${out.length} élément(s) reçu(s)…`, `${out.length} item(s) received…`));
   await loadSet(out);
 });
 
@@ -296,7 +304,7 @@ function gamesCount() {
 
 async function openLightbox() {
   const n = gamesCount();
-  if (!n) { setStatus('aucun jeu .bin sur la carte'); return; }
+  if (!n) { setStatus(T('aucun jeu .bin sur la carte', 'no .bin game on the card')); return; }
   gameGrid.innerHTML = '';
   const names = [];
   for (let i = 0; i < n; i++) {
@@ -317,14 +325,14 @@ async function openLightbox() {
     div.querySelector('.nm').textContent = folder;
     div.onclick = async () => {
       lightbox.classList.remove('open');
-      setStatus('chargement de ' + folder + '…');
+      setStatus(T('chargement de ', 'loading ') + folder + '…');
       const sel = cfunc('emu_select_game');
       const nb = Module._malloc(1024);
       Module.stringToUTF8(fullPath, nb, 1024);
       const ok = sel(nb);
       Module._free(nb);
-      if (ok) setStatus('jeu : ' + folder);
-      else setStatus('échec du changement de jeu');
+      if (ok) setStatus(T('jeu : ', 'game: ') + folder);
+      else setStatus(T('échec du changement de jeu', 'game switch failed'));
     };
     // l'icône si elle existe
     const gi = cfunc('emu_game_icon');
@@ -387,9 +395,9 @@ async function loadDirect(bytes, name) {
     if (r === 2) {
       overlay.classList.add('hidden');
       enableTransport();
-      setStatus(name + ' : zip chargé (firmware + carte)');
+      setStatus(name + T(' : zip chargé (firmware + carte)', ': zip loaded (firmware + card)'));
       if (gamesCount() > 1) gamesBtn.style.display = 'block';
-    } else setStatus(name + ' : zip inexploitable');
+    } else setStatus(name + T(' : zip inexploitable', ': unusable zip'));
     return;
   }
   if (cFirmware(u8, name)) {
@@ -407,8 +415,8 @@ async function loadDirect(bytes, name) {
     cCardFinish();
     overlay.classList.add('hidden');
     enableTransport();
-    setStatus('jeu : ' + name);
-  } else setStatus(name + ' : firmware refusé');
+    setStatus(T('jeu : ', 'game: ') + name);
+  } else setStatus(name + T(' : firmware refusé', ': firmware rejected'));
 }
 
 /* jeux offline : window.OFFLINE_GAMES (games.js) ; le standalone embarque
@@ -435,9 +443,9 @@ function renderDirectGames() {
     const b = document.createElement('button');
     /* icône seule : le texte complet reste dans l'infobulle */
     b.textContent = g.n.split(' ')[0];
-    b.title = 'Charger ' + g.n + ' (offline)';
+    b.title = T('Charger ', 'Load ') + g.n + T(' (offline)', '');
     b.addEventListener('click', async () => {
-      setStatus('chargement de ' + g.f + ' …');
+      setStatus(T('chargement de ', 'loading ') + g.f + ' …');
       try {
         await loadDirect(await offlineBytes(g.f), g.f);
       } catch (e) { setStatus(g.f + ' : ' + e.message); }
@@ -452,13 +460,13 @@ renderDirectGames();pauseBtn.addEventListener('click', () => {
   if (t) t();
   paused = q ? !!q() : !paused; /* l'état vient du C, pas du JS */
   pauseBtn.textContent = paused ? '▶' : '⏸';
-  setStatus(paused ? 'pause' : 'reprise');
+  setStatus(paused ? T('pause', 'paused') : T('reprise', 'resumed'));
 });
 stopBtn.addEventListener('click', () => {
   if (!fwLoaded) return;
   if (paused) pauseBtn.click(); /* dépausse puis redémarre */
   const f = cfunc('emu_restart');
-  if (f) { f(); setStatus('jeu redémarré'); }
+  if (f) { f(); setStatus(T('jeu redémarré', 'game restarted')); }
 });
 
 /* jeux offline : window.OFFLINE_GAMES (games.js) ; le standalone embarque

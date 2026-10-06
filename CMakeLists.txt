@@ -31,6 +31,12 @@ find_package(ZLIB REQUIRED)
 
 add_executable(gm0 gm0.c)
 
+# Interface en français (par défaut : anglais)
+option(GM0_FR "French interface (default: English)" OFF)
+if(GM0_FR)
+    target_compile_definitions(gm0 PRIVATE GM0_FR)
+endif()
+
 if(TARGET SDL2::SDL2)
     target_link_libraries(gm0 PRIVATE SDL2::SDL2)
 elseif(TARGET SDL2::SDL2-static)

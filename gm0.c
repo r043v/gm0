@@ -30,6 +30,14 @@
 #include <time.h>
 #include <math.h>
 #include <stdarg.h>
+
+/* Interface : anglais par défaut ; français avec -DGM0_FR (CMake -DGM0_FR=ON).
+ * Les traces de débogage étiquetées [xxx] restent en français. */
+#ifdef GM0_FR
+#define TR(fr, en) fr
+#else
+#define TR(fr, en) en
+#endif
 static const char *fwName; /* firmware courant (clé de sauvegarde wasm) */
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -412,7 +420,7 @@ static void wav_finish(void) {
     fwrite(w4, 1, 4, wavFile);
     fclose(wavFile);
     wavFile = NULL;
-    printf("WAV : %u échantillons (%.1f s à %.0f Hz)\n", wavSamples,
+    printf(TR("WAV : %u échantillons (%.1f s à %.0f Hz)\n", "WAV: %u samples (%.1f s at %.0f Hz)\n"), wavSamples,
            (double)wavSamples / emuDacRate, emuDacRate);
 }
 
@@ -721,7 +729,7 @@ static uint32_t fat_alloc(int clusters) {
     for (int i = 0; i < clusters; i++) {
         uint32_t c = first + (uint32_t)i;
         if (c + 1 >= cap) {
-            fprintf(stderr, "carte SD : pleine, contenu tronqué\n");
+            fprintf(stderr, TR("carte SD : pleine, contenu tronqué\n", "SD card: full, content truncated\n"));
             break;
         }
         uint16_t v = (i == clusters - 1) ? 0xffff : (uint16_t)(c + 1);
@@ -868,7 +876,7 @@ static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
             if (flba * FAT_SECTOR + fwant > fatImageSize) {
                 /* le fichier ne tient pas sur la carte : sauté (la garde
                  * de fat_alloc borne la table, celle-ci borne les données) */
-                fprintf(stderr, "carte SD : %s hors capacité, ignoré\n", ents[i].path);
+                fprintf(stderr, TR("carte SD : %s hors capacité, ignoré\n", "SD card: %s over capacity, ignored\n"), ents[i].path);
                 continue;
             }
             FILE *g = fopen(ents[i].path, "rb");
@@ -928,7 +936,7 @@ static void fat_bootstrap_for(size_t bytes, int ndirs) {
     fatImage = calloc(1, fatImageSize);
     fatTable = calloc((size_t)fatsz * FAT_SECTOR, 1);
     if (!fatImage || !fatTable) { /* carte hors ressources : pas de carte */
-        fprintf(stderr, "carte SD : image trop grande (%zu Mio) — abandon\n",
+        fprintf(stderr, TR("carte SD : image trop grande (%zu Mio) — abandon\n", "SD card: image too large (%zu MiB) — aborting\n"),
                 fatImageSize / (1024 * 1024));
         free(fatImage); fatImage = NULL; fatImageSize = 0;
         free(fatTable); fatTable = NULL;
@@ -1041,9 +1049,9 @@ static void fat_finish(const char *label) {
     if (getenv("FAT_DUMP")) {
         FILE *g = fopen(getenv("FAT_DUMP"), "wb");
         if (g) { fwrite(fatImage, 1, fatImageSize, g); fclose(g);
-                 printf("image FAT test : %s\n", getenv("FAT_DUMP")); }
+                 printf(TR("image FAT test : %s\n", "FAT image test: %s\n"), getenv("FAT_DUMP")); }
     }
-    printf("carte SD : %s (%d fichiers)\n", label, fatFileCount);
+    printf(TR("carte SD : %s (%d fichiers)\n", "SD card: %s (%d files)\n"), label, fatFileCount);
 }
 
 /* taille réelle du contenu (fichiers + marge par fichier) */
@@ -1312,10 +1320,10 @@ static int zip_load_card(const uint8_t *data, size_t len) {
         if (dc && fatImage) {
             FILE *df = fopen(dc, "wb");
             if (df) { fwrite(fatImage, 1, fatImageSize, df); fclose(df); }
-            fprintf(stderr, "carte dumped : %s (%zu o)\n", dc, fatImageSize);
+            fprintf(stderr, TR("carte dumped : %s (%zu o)\n", "card dumped: %s (%zu B)\n"), dc, fatImageSize);
         }
     }
-    printf("carte SD : zip (%d fichiers)", n);
+    printf(TR("carte SD : zip (%d fichiers)", "SD card: zip (%d files)"), n);
     if (fwLoaded) printf(" + firmware %s", fwName);
     printf("\n");
     return fwLoaded ? 2 : 1;
@@ -1794,7 +1802,7 @@ static void pk_audio_check_hle(uint32_t rate) {
     if (!pk_hleBuffer || !pk_hlePlayhead) return;
     pk_hleState = PK_HLE_ENABLED;
     pk_audio_reopen((int)(pk_core_hz() / rate));
-    fprintf(stderr, "audio HLE actif (%d Hz)\n", (int)(pk_core_hz() / rate));
+    fprintf(stderr, TR("audio HLE actif (%d Hz)\n", "HLE audio active (%d Hz)\n"), (int)(pk_core_hz() / rate));
 }
 
 /* valeur écrite sur le R2R : POUT1[31:28] | POUT2[23:20] */
@@ -1967,7 +1975,7 @@ static void pk_blx(uint32_t opcode) {
         switch (t) {
             case 0: {
                 uint32_t cmdId = pk_read_word(regs[0]);
-                if (cmdId > 62) fprintf(stderr, "IAP invalide : %u\n", cmdId);
+                if (cmdId > 62) fprintf(stderr, TR("IAP invalide : %u\n", "invalid IAP: %u\n"), cmdId);
                 else {
                     if (!pk_iap_cmd[cmdId]) pk_iap_stub(regs[0], regs[1], regs[2], regs[3]);
                     else pk_iap_cmd[cmdId](regs[0], regs[1], regs[2], regs[3]);
@@ -2666,7 +2674,7 @@ static void pk_eeprom_load(void) {
     size_t n = fread(pk_eeprom, 1, sizeof pk_eeprom, f);
     (void)n;
     fclose(f);
-    fprintf(stderr, "eeprom : %s\n", path);
+    fprintf(stderr, TR("eeprom : %s\n", "eeprom: %s\n"), path);
 #endif
 }
 
@@ -2680,7 +2688,7 @@ static void pk_eeprom_save(void) {
     fwrite(pk_eeprom, 1, sizeof pk_eeprom, f);
     fclose(f);
     pk_eepromDirty = 0;
-    printf("eeprom : %s\n", path);
+    printf(TR("eeprom : %s\n", "eeprom: %s\n"), path);
 #endif
 }
 
@@ -2708,7 +2716,7 @@ static void pk_card_export(void) {
     if (!f) return;
     fwrite(card, 1, sz, f);
     fclose(f);
-    printf("carte exportée : %s (%zu Kio)\n", outImgPath, sz / 1024);
+    printf(TR("carte exportée : %s (%zu Kio)\n", "card exported: %s (%zu KiB)\n"), outImgPath, sz / 1024);
 #endif
 }
 
@@ -4860,7 +4868,7 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
     if (emuTarget == TGT_POKITTO) {
         memset(flash, 0x00, FLASH_SIZE); /* la référence ne remplit pas */
         size_t n = plen < FLASH_SIZE ? plen : FLASH_SIZE;
-        if (n == 0) { fprintf(stderr, "firmware vide\n"); return; }
+        if (n == 0) { fprintf(stderr, TR("firmware vide\n", "empty firmware\n")); return; }
         memcpy(flash, payload, n);
         snprintf(fwPath, sizeof(fwPath), "%s", display);
         const char *b = strrchr(fwPath, '/');
@@ -4868,18 +4876,18 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
         fwLoaded = 1;
         pk_reset_core(); /* vecteurs lisibles ici */
         pk_eeprom_load();
-        printf("firmware Pokitto : %s (%zu Ko)\n", display, len / 1024);
+        printf(TR("firmware Pokitto : %s (%zu Ko)\n", "Pokitto firmware: %s (%zu KB)\n"), display, len / 1024);
         return;
     }
     memset(flash, 0xff, FLASH_SIZE); /* comme le TS : flash remplie de 0xff */
     size_t n = plen < (FLASH_SIZE - 0x4000) ? plen : (FLASH_SIZE - 0x4000);
-    if (n == 0) { fprintf(stderr, "firmware vide\n"); return; }
+    if (n == 0) { fprintf(stderr, TR("firmware vide\n", "empty firmware\n")); return; }
     memcpy(flash + 0x4000, payload, n);
     snprintf(fwPath, sizeof(fwPath), "%s", display);
     const char *b = strrchr(fwPath, '/');
     fwName = b ? b + 1 : fwPath;
     fwLoaded = 1;
-    printf("firmware : %s (%zu Ko)\n", display, len / 1024);
+    printf(TR("firmware : %s (%zu Ko)\n", "firmware: %s (%zu KB)\n"), display, len / 1024);
 }
 
 /* F5 : redémarre le firmware courant (la Pokitto garde sa carte et son
@@ -4895,11 +4903,11 @@ static void fw_restart(void) {
 
 static void load_firmware(const char *p, int rebindCard) {
     FILE *f = fopen(p, "rb");
-    if (!f) { fprintf(stderr, "firmware introuvable : %s\n", p); return; }
+    if (!f) { fprintf(stderr, TR("firmware introuvable : %s\n", "firmware not found: %s\n"), p); return; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
     uint8_t *data = malloc((size_t)sz);
     if (fread(data, 1, (size_t)sz, f) == 0) {
-        fprintf(stderr, "firmware vide\n"); free(data); fclose(f); return;
+        fprintf(stderr, TR("firmware vide\n", "empty firmware\n")); free(data); fclose(f); return;
     }
     fclose(f);
     load_firmware_data(data, (size_t)sz, p);
@@ -4927,7 +4935,7 @@ static void load_sd_from_path(const char *p) {
     struct stat st;
     if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) { sd_unload(); fat_build_from_dir(p); return; }
     FILE *g = fopen(p, "rb");
-    if (!g) { fprintf(stderr, "carte introuvable : %s\n", p); return; }
+    if (!g) { fprintf(stderr, TR("carte introuvable : %s\n", "card not found: %s\n"), p); return; }
     fseek(g, 0, SEEK_END); long sz = ftell(g); fseek(g, 0, SEEK_SET);
     sd_unload();
     sd_image = malloc((size_t)sz);
@@ -4942,13 +4950,13 @@ static void load_sd_from_path(const char *p) {
         return;
     }
     sd_size = (size_t)sz;
-    printf("carte SD : image %s (%ld Kio)\n", p, sz / 1024);
+    printf(TR("carte SD : image %s (%ld Kio)\n", "SD card: image %s (%ld KiB)\n"), p, sz / 1024);
 }
 
 static void boot_vectors(void) {
     if (emuTarget == TGT_POKITTO) {
         /* vecteurs déjà chargés par pk_reset_core */
-        fprintf(stderr, "Pokitto : SP=%08x PC=%08x\n", regs[13], regs[15]);
+        fprintf(stderr, "Pokitto: SP=%08x PC=%08x\n", regs[13], regs[15]);
         return;
     }
     vectorBase = 0x4000;
@@ -4967,7 +4975,7 @@ static void boot_vectors(void) {
 static void refresh_title(void) {
     char title[1200];
     if (fwLoaded) snprintf(title, sizeof(title), "%.900s", fwName);
-    else snprintf(title, sizeof(title), "déposez un firmware .bin");
+    else snprintf(title, sizeof(title), TR("déposez un firmware .bin", "drop a .bin firmware"));
     SDL_SetWindowTitle(emuWin, title);
 }
 
@@ -5023,7 +5031,7 @@ static void meta_audio_reopen(double freq) {
     audioHold = 0;
     audioPending = 1; /* re-prébuffer avant de reparler */
     SDL_PauseAudioDevice(dev, 0);
-    fprintf(stderr, "audio : %d Hz (cadence timer du jeu −250 ppm)\n", (int)(freq + 0.5));
+    fprintf(stderr, TR("audio : %d Hz (cadence timer du jeu −250 ppm)\n", "audio: %d Hz (game timer clock −250 ppm)\n"), (int)(freq + 0.5));
 }
 
 static int noPad(void) {
@@ -5040,7 +5048,7 @@ static int sdl_init_all(void) {
     }
     if (SDL_CreateWindowAndRenderer((int)(SCR_W * 2), (int)(SCR_H * 2),
                                     SDL_WINDOW_RESIZABLE, &emuWin, &emuRen) != 0) {
-        fprintf(stderr, "fenêtre: %s\n", SDL_GetError());
+        fprintf(stderr, TR("fenêtre: %s\n", "window: %s\n"), SDL_GetError());
         return 1;
     }
     /* échelle logique = écran console : redimensionnable, rendu entier
@@ -5052,8 +5060,8 @@ static int sdl_init_all(void) {
         if (SDL_IsGameController(i)) { pad = SDL_GameControllerOpen(i); if (pad) break; }
         else if (!joyFb) joyFb = SDL_JoystickOpen(i);
     }
-    if (pad) printf("manette : %s\n", SDL_GameControllerName(pad));
-    else if (joyFb) printf("joystick : %s\n", SDL_JoystickName(joyFb));
+    if (pad) printf(TR("manette : %s\n", "gamepad: %s\n"), SDL_GameControllerName(pad));
+    else if (joyFb) printf(TR("joystick : %s\n", "joystick: %s\n"), SDL_JoystickName(joyFb));
 
     refresh_title();
 
@@ -5067,7 +5075,7 @@ static int sdl_init_all(void) {
     if (audioOk) aq_configure(got.samples, got.freq);
     if (audioOk) SDL_PauseAudioDevice(audioDev, 0); /* tourne en silence ;
         le pré-buffer est géré par audioPending dans le callback */
-    if (!audioOk) fprintf(stderr, "audio indisponible : %s\n", SDL_GetError());
+    if (!audioOk) fprintf(stderr, TR("audio indisponible : %s\n", "audio unavailable: %s\n"), SDL_GetError());
     if (audioOk && fwLoaded) audio_start();
     return 0;
 }
@@ -5082,7 +5090,7 @@ static int poll_events(void) {
             char *fp = ev.drop.file;
             const char *ext = strrchr(fp, '.');
             struct stat st;
-            printf("déposé : %s\n", fp);
+            printf(TR("déposé : %s\n", "dropped: %s\n"), fp);
             if (stat(fp, &st) == 0 && S_ISDIR(st.st_mode)) {
                 load_sd_from_path(fp);
             } else if (ext && (strcasecmp(ext, ".img") == 0 || strcasecmp(ext, ".zip") == 0)) {
@@ -5110,14 +5118,14 @@ static int poll_events(void) {
         }
 #endif
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F5) {
-            if (fwLoaded) { fw_restart(); printf("redémarrage\n"); }
+            if (fwLoaded) { fw_restart(); printf(TR("redémarrage\n", "restart\n")); }
         }
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F10) {
             dispScale = (dispScale + 1) % 3;
             scale_apply();
-            printf("échelle : %s\n", dispScale == 0 ? "entière (F10/F11)"
-                                   : dispScale == 1 ? "adaptée (F10/F11)"
-                                                    : "étirée (F10/F11)");
+            printf(TR("échelle : %s\n", "scale: %s\n"), dispScale == 0 ? TR("entière (F10/F11)", "integer (F10/F11)")
+                                   : dispScale == 1 ? TR("adaptée (F10/F11)", "fitted (F10/F11)")
+                                                    : TR("étirée (F10/F11)", "stretched (F10/F11)"));
         }
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F11) {
             dispFull = !dispFull;
@@ -5134,7 +5142,7 @@ static int poll_events(void) {
         else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
             if (!pad && SDL_IsGameController(ev.cdevice.which)) {
                 pad = SDL_GameControllerOpen(ev.cdevice.which);
-                if (pad) printf("manette : %s\n", SDL_GameControllerName(pad));
+                if (pad) printf(TR("manette : %s\n", "gamepad: %s\n"), SDL_GameControllerName(pad));
             }
         }
         else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
@@ -5239,7 +5247,7 @@ static void update_title_pct(void) {
             snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %%", fwName, pct);
         }
     } else {
-        snprintf(titleBuf, sizeof(titleBuf), "déposez un firmware .bin");
+        snprintf(titleBuf, sizeof(titleBuf), TR("déposez un firmware .bin", "drop a .bin firmware"));
         snprintf(hudTitle, sizeof(hudTitle), "%s", titleBuf);
     }
     SDL_SetWindowTitle(emuWin, hudTitle);
@@ -5329,8 +5337,10 @@ int main(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     if (argc < 2)
-        fprintf(stderr, "gm0 : lancé sans firmware — déposez un .bin "
-                        "dans la fenêtre (carte SD = son répertoire).\n");
+        fprintf(stderr, TR("gm0 : lancé sans firmware — déposez un .bin "
+                        "dans la fenêtre (carte SD = son répertoire).\n",
+                        "gm0: started without a firmware — drop a .bin "
+                        "into the window (SD card = its directory).\n"));
     memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
     if (getenv("EMU_TARGET")) {
         if (strcasecmp(getenv("EMU_TARGET"), "pokitto") == 0) emuTarget = TGT_POKITTO;
@@ -5342,7 +5352,7 @@ int main(int argc, char **argv) {
             /* debug : --build-vcard out.img fichier1 fichier2 ... */
             for (int j = i + 2; j < argc; j++) {
                 FILE *g = fopen(argv[j], "rb");
-                if (!g) { fprintf(stderr, "vcard: %s illisible\n", argv[j]); continue; }
+                if (!g) { fprintf(stderr, TR("vcard: %s illisible\n", "vcard: %s unreadable\n"), argv[j]); continue; }
                 fseek(g, 0, SEEK_END); long sz = ftell(g); fseek(g, 0, SEEK_SET);
                 uint8_t *data = malloc((size_t)sz);
                 fread(data, 1, (size_t)sz, g); fclose(g);
@@ -5352,7 +5362,7 @@ int main(int argc, char **argv) {
             fat_build_from_vfiles();
             FILE *out = fopen(argv[i + 1], "wb");
             if (out) { fwrite(fatImage, 1, fatImageSize, out); fclose(out); }
-            printf("vcard écrite : %s\n", argv[i + 1]);
+            printf(TR("vcard écrite : %s\n", "vcard written: %s\n"), argv[i + 1]);
             return 0;
         }
         if (strcmp(argv[i], "--wav") == 0 && i + 1 < argc) {
@@ -5365,7 +5375,7 @@ int main(int argc, char **argv) {
             ++i;
             if (strcasecmp(argv[i], "pokitto") == 0) emuTarget = TGT_POKITTO;
             else if (strcasecmp(argv[i], "meta") == 0) emuTarget = TGT_META;
-            else { fprintf(stderr, "cible inconnue : %s (meta|pokitto)\n", argv[i]); return 1; }
+            else { fprintf(stderr, TR("cible inconnue : %s (meta|pokitto)\n", "unknown target: %s (meta|pokitto)\n"), argv[i]); return 1; }
             targetForced = 1;
         } else if (strcmp(argv[i], "--out-img") == 0 && i + 1 < argc) {
             snprintf(outImgPath, sizeof(outImgPath), "%s", argv[++i]);
@@ -5564,7 +5574,7 @@ int main(int argc, char **argv) {
                 fwrite(rgb, 1, 3, sf);
             }
             fclose(sf);
-            printf("capture : %s\n", shotPath);
+            printf(TR("capture : %s\n", "shot: %s\n"), shotPath);
         }
     }
     wav_finish();
@@ -5583,7 +5593,7 @@ int main(int argc, char **argv) {
         if (g) { fwrite(sd_card_data(), 1, sd_card_size(), g); fclose(g); }
       } }
     if (rawWallMsTotal > 0.0) /* vitesse brute du run, hors attente de pacing */
-        fprintf(stderr, "[bench] frames=%u wall=%.2fs emu=%.2fs brut=%.0f%% (%.0f MHz effectifs)\n",
+        fprintf(stderr, TR("[bench] frames=%u wall=%.2fs emu=%.2fs brut=%.0f%% (%.0f MHz effectifs)\n", "[bench] frames=%u wall=%.2fs emu=%.2fs raw=%.0f%% (%.0f MHz effective)\n"),
                 frame, rawWallMsTotal / 1000.0, rawEmuMsTotal / 1000.0,
                 rawEmuMsTotal / rawWallMsTotal * 100.0,
                 (double)ticks_per_sec() / 1e6 * rawEmuMsTotal / rawWallMsTotal);
@@ -5708,7 +5718,7 @@ void emu_card_image(uint8_t *data, int len) {
     sd_image = malloc(len ? (size_t)len : 1);
     memcpy(sd_image, data, (size_t)len);
     sd_size = (size_t)len;
-    printf("carte SD : image (%d Kio)\n", len / 1024);
+    printf(TR("carte SD : image (%d Kio)\n", "SD card: image (%d KiB)\n"), len / 1024);
 }
 
 EMSCRIPTEN_KEEPALIVE
