@@ -4466,10 +4466,25 @@ static void pk_hle_audio_cb(void *ud, Uint8 *stream, int len) {
 
 /* audio Pokitto non HLE : ring (delta, octet) -> u8 22050 Hz, rééchantillonné
  * exactement comme la référence ; chaque octet sorti alimente aussi le WAV */
+static unsigned long pk_cbCalls, pk_cbSamples;
+static Uint32 pk_cbFirstMs;
 static void pk_audio_cb(Uint8 *stream, int len) {
+    /* le device est S16SYS : len octets = len/2 échantillons.  L'ancien
+     * traitement U8 consommait deux fois trop de contenu par callback
+     * (son 2x trop rapide, mesuré 44160 « échantillons »/s) et écrivait
+     * des octets pleins échelle dans des int16 (distorsion générale). */
+    int16_t *out = (int16_t *)stream;
+    int n = len / 2;
+    if (pk_cbFirstMs == 0) pk_cbFirstMs = SDL_GetTicks();
+    pk_cbCalls++; pk_cbSamples += (uint32_t)n;
+    if (ENVFLAG("EMU_DMA_TRACE") && (pk_cbCalls % 100 == 1))
+        fprintf(stderr, "[cb] calls=%ul samples=%ul (%.1f/s mural) n=%d aqSize=%u\n",
+                pk_cbCalls, pk_cbSamples,
+                (double)pk_cbSamples * 1000.0 / (SDL_GetTicks() - pk_cbFirstMs + 1),
+                n, pk_aqSize);
     float err = 0;
-    for (int i = 0; i < len; i++) {
-        if (pk_aqSize < (uint32_t)len) {
+    for (int i = 0; i < n; i++) {
+        if (pk_aqSize < (uint32_t)n) {
             /* à sec : la production (temps émulé) va un peu moins vite que la
              * consommation (temps réel) dès que le pacing passe sous 100 % —
              * sans resynchro la file restait vide pour toujours (silence) et
@@ -4477,7 +4492,7 @@ static void pk_audio_cb(Uint8 *stream, int len) {
              * présent : ~600 latches d'avance, comme la reprise franche META. */
             pk_aqStart = (pk_aqEnd + PK_AQ_SIZE - 600) & PK_AQ_MASK;
             pk_aqSize = 600; /* les 600 latches qui séparent start de end */
-            for (; i < len; i++) stream[i] = (uint8_t)pk_audioHoldF;
+            for (; i < n; i++) out[i] = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
             return;
         }
         while (pk_aqSize) {
@@ -4488,7 +4503,7 @@ static void pk_audio_cb(Uint8 *stream, int len) {
             pk_aqStart = (pk_aqStart + 1) & PK_AQ_MASK;
             pk_aqSize--;
         }
-        stream[i] = (uint8_t)pk_audioHoldF;
+        out[i] = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
         if (wavFile) wav_put((int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8));
     }
 }
