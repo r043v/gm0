@@ -2374,7 +2374,12 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
                        if (i < 88) pk_iocon[i] = v;
                        return; }
             case 18: { uint32_t i = (a - 0x40048000u) >> 2;
-                       if (i < 256) pk_syscon[i] = v;
+                       if (i < 256) {
+                           if (ENVFLAG("EMU_PK_DEBUG") &&
+                               (i == PK_SYSCON_SYSPLLCTRL || i == PK_SYSCON_MAINCLKSEL || i == 1))
+                               fprintf(stderr, "[pkclk] t=%u SYSPLLCTRL/SEL[%u] <- %x\n", tickCount, i, v);
+                           pk_syscon[i] = v;
+                       }
                        return; }
             default: return;
         }
