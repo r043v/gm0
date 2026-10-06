@@ -5233,7 +5233,7 @@ static void update_title_pct(void) {
         snprintf(titleBuf, sizeof(titleBuf), "%.900s", fwName);
         if (raw > pct + 5 && raw > 100) {
             if (raw > 9999) raw = 9999;
-            snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %% (brut %d %%)", fwName, pct, raw);
+            snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %% - %d %%", fwName, pct, raw);
         } else {
             snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %%", fwName, pct);
         }
