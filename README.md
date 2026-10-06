@@ -111,41 +111,49 @@ Headless (tests, captures) :
 ## Génèse et crédits
 
 Ce projet est **100 % vibe-coded** : aucune ligne de C tapée à la main.
-L'émulateur entier (≈ 5 800 lignes de C, 66 commits) a été écrit par des
-agents de code IA en une semaine — du 30 septembre au 6 octobre 2026 ;
-le nombre de tokens, lui, n'est pas journalisé.  Signature dans l'historique
-git : 14 commits co-signés **ZCode**, et un co-signé **Claude Opus 5.5**
-(le canal audio DMA déclenché par TC4).
+L'émulateur entier (≈ 5 800 lignes de C, 66 commits) a été écrit par
+**GLM-5.3-Flash**, l'agent ZCode, en une semaine — du 30 septembre au
+6 octobre 2026.  Tous les commits du dépôt sont de lui, sauf un co-signé
+**Claude Opus 5.5** (le canal audio DMA déclenché par TC4, travaillé dans
+son propre outillage).  Les compteurs du sprint META complet (émulateur
+ici, convertisseur dans gb-recompiled), relevés dans la base de sessions :
 
-Trois sources de vérité ont nourri le code :
+- 14 sessions, 122 messages-prompt ;
+- 5 446 requêtes modèle, 5 488 appels d'outils ;
+- **1,84 milliard de tokens** traités (dont 1,82 Md relus du cache,
+  ~4,2 M générés), ~52 h de temps modèle cumulé.
+
+Deux sources dont la **logique a été extraite** :
 
 - **l'émulateur TypeScript d'Andy O'Neill** (MIT) — le premier port C en
   reproduisait la parité tick à tick :
   [aoneill01/gamebuino-emulator](https://github.com/aoneill01/gamebuino-emulator) ;
 - **PokittoEmu de Felipe Manga** — le cœur LPC11U6x/Cortex-M0 en est un
   port C fidèle :
-  [felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu) ;
-- **les datasheets officielles**, pour tout le reste (cœur ARMv6-M réel,
-  DMAC/SERCOM/TC/NVIC, carte SD SPI, panneau) :
-  - SAM D21/DA1 — Microchip, DS40001882 :
-    <https://www.microchip.com/en-us/product/ATSAMD21G18> ;
-  - LPC11U6x — NXP (datasheet + user manual UM10732) :
-    <https://www.nxp.com/docs/en/data-sheet/LPC11U6X.pdf> ;
-  - ST7735 — Sitronix (PDF sous NDA, copies publiques courantes) ;
-  - ARMv6-M Architecture Reference Manual :
-    <https://developer.arm.com/documentation/ddi0419/latest>.
+  [felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu).
 
-Deux références maison ont également servi — **en analyse logique
-uniquement, aucun code n'en est repris** :
+**Les datasheets officielles** pour tout le reste (cœur ARMv6-M réel,
+DMAC/SERCOM/TC/NVIC, carte SD SPI, panneau) :
 
-- **gm0-gb** (ex-« gm0 »), l'émulateur GB maison de l'auteur (Pokitto,
-  ESPboy, META) : consulté pour la logique d'ensemble, les séquences de
-  boot et les comportements attendus du matériel ;
+- SAM D21/DA1 — Microchip, DS40001882 :
+  <https://www.microchip.com/en-us/product/ATSAMD21G18> ;
+- LPC11U6x — NXP (datasheet + user manual UM10732) :
+  <https://www.nxp.com/docs/en/data-sheet/LPC11U6X.pdf> ;
+- ST7735 — Sitronix (PDF sous NDA, copies publiques courantes) ;
+- ARMv6-M Architecture Reference Manual :
+  <https://developer.arm.com/documentation/ddi0419/latest>.
+
+Et du **reverse de matériel réel** — analyse et débogage en profondeur,
+aucun code repris :
+
 - le **source de lapinou** sur META (pilotes écran/SD/audio écrits à la
   main, sans la lib standard) : c'est lui qui a révélé le vrai protocole
   DMA/SPI de l'écran, le cadencement TC4 et les quirks CS/pull-ups
-  décrits dans DETAILS.md.
+  (DETAILS.md) ;
+- des **binaires META** et la **lib META officielle**
+  ([Gamebuino/Gamebuino-META](https://github.com/Gamebuino/Gamebuino-META))
+  : exécutés pas à pas dans l'émulateur pour la pile SD (SdFat), les
+  descripteurs DMAC de la lib et l'audio TC5.
 
-Écosystème : [gamebuino.com](https://gamebuino.com) et
-[Gamebuino-META](https://github.com/Gamebuino/Gamebuino-META) côté META ;
+Écosystème : [gamebuino.com](https://gamebuino.com) côté META ;
 [PokittoLib](https://github.com/pokitto/PokittoLib) côté Pokitto.
