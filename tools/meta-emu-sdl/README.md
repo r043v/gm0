@@ -80,7 +80,9 @@ sans garantie de parité TS.
 - **La carte SD est par défaut le répertoire contenant le firmware** ;
   une carte passée explicitement en ligne de commande reste prioritaire,
   et tout drop de firmware rebascule la carte sur son répertoire.
-- La fenêtre est **redimensionnable** (échelle entière, pixels carrés) et
+- La fenêtre est **redimensionnable** (échelle entière, pixels carrés par
+  défaut ; **F10** cycle entière → adaptée [ratio conservé, interpolation
+  linéaire] → étirée ; **F11** bascule le **plein écran**) et
   la **barre de titre** affiche le **% de vitesse** (ticks émulés / temps
   réel, mis à jour toutes les 500 ms).  Le pacing est une échéance par
   frame sans dette : jamais plus vite que le temps réel, et un
@@ -117,7 +119,12 @@ d'après le registre BAUD du SERCOM4 au moment de la lecture ;
 Touches Pokitto : **I/K/J/L** ou flèches = directions, **A**=A,
 **S/B**=B, **D/C**=C, **F**=D (éclairage) — ou comme sur META :
 **Entrée**=C, **Espace**=A, **Ctrl**=B.  **F5** redémarre le jeu
-(les deux cibles ; la carte SD et l'EEPROM Pokitto sont conservées).
+(les deux cibles ; la carte SD et l'EEPROM Pokitto sont conservées),
+**F10** cycle les modes de mise à l'échelle de la fenêtre, **F11** le
+plein écran.  Le menu d'options du firmware (HOME/C tenu) coupe le son du
+jeu pendant qu'il est ouvert, et la file audio Pokitto de l'émulateur est
+régulée (~55 ms de latence) : plus de décalage son/image qui s'accumule
+d'une session de menu à l'autre.
 
 **Manette** (SDL_GameController ; bascule automatique sur joystick brut) :
 A=A, B=B, Start=MENU, Back/Guide=HOME, croix directionnelle et stick

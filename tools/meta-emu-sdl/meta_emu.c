@@ -1816,6 +1816,10 @@ static void pk_audio_write(uint8_t data) {
     float clock = (float)pk_core_hz();
     float delta = (float)(uint32_t)(tickCount - pk_prevTicks) / clock;
     pk_prevTicks = tickCount;
+    /* trou dans les latches (pause, menu, stall hôte) : il ne doit pas
+     * s'encoder comme un retard permanent de la file — le décalage audible
+     * se cumulait de la durée de chaque pause, session après session */
+    if (delta > 3.0f * PK_IFREQ) delta = 3.0f * PK_IFREQ;
     pk_aqDelta[pk_aqEnd] = delta;
     pk_aqData[pk_aqEnd] = data;
     pk_aqEnd = (pk_aqEnd + 1) & PK_AQ_MASK;
@@ -4438,6 +4442,14 @@ static void step(void) {
 static SDL_Texture *tex;
 static uint32_t px32[MAX_SCREEN_W * MAX_SCREEN_H];
 
+/* Mise à l'échelle de la fenêtre : 0 = échelle entière (pixels carrés,
+ * défaut), 1 = adaptée (au plus grand multiple non entier qui garde le
+ * ratio, interpolation linéaire), 2 = étirée (remplit la fenêtre).  F10
+ * cycle les modes, F11 bascule le plein écran. */
+static int dispScale, dispFull;
+
+static void scale_apply(void);
+
 static void blit(SDL_Renderer *ren) {
     const uint16_t *src = emuTarget == TGT_POKITTO ? pk_lcd : pix;
     for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
@@ -4448,7 +4460,22 @@ static void blit(SDL_Renderer *ren) {
     }
     SDL_UpdateTexture(tex, NULL, px32, SCR_W * sizeof(uint32_t));
     SDL_RenderClear(ren);
-    SDL_RenderCopy(ren, tex, NULL, NULL);
+    if (dispScale) {
+        int ow, oh;
+        SDL_GetRendererOutputSize(ren, &ow, &oh);
+        SDL_Rect dst = {0, 0, ow, oh};
+        if (dispScale == 1) { /* adaptée : ratio de l'écran console conservé */
+            double sw = (double)ow / SCR_W, sh = (double)oh / SCR_H;
+            double s = sw < sh ? sw : sh;
+            dst.w = (int)(SCR_W * s + 0.5);
+            dst.h = (int)(SCR_H * s + 0.5);
+            dst.x = (ow - dst.w) / 2;
+            dst.y = (oh - dst.h) / 2;
+        }
+        SDL_RenderCopy(ren, tex, NULL, &dst);
+    } else {
+        SDL_RenderCopy(ren, tex, NULL, NULL);
+    }
     SDL_RenderPresent(ren);
 }
 
@@ -4482,32 +4509,43 @@ static void pk_audio_cb(Uint8 *stream, int len) {
                 pk_cbCalls, pk_cbSamples,
                 (double)pk_cbSamples * 1000.0 / (SDL_GetTicks() - pk_cbFirstMs + 1),
                 n, pk_aqSize);
+    /* Régulation du remplissage, comme le chemin META : la cible est ~55 ms
+     * de latches ; au-delà, la consommation accélère d'autant (la latence
+     * retombe en une fraction de seconde — la file pokitto plafonnait à
+     * ~7000 latches, 0,32 s de retard constant, et montait sans retour
+     * sous les rafales de production) ; en deçà, elle ralentit d'au plus
+     * 0,4 % pour la faire remonter. */
+    float step = 1.0f;
+    {
+        float over = (float)pk_aqSize - 1200.0f;
+        if (over > 0.0f) {
+            step = 1.0f + over / 22050.0f;
+            if (step > 1.5f) step = 1.5f;
+        } else {
+            float under = -over / 22050.0f;
+            if (under > 0.004f) under = 0.004f;
+            step = 1.0f - under;
+        }
+    }
     float err = 0;
     for (int i = 0; i < n; i++) {
-        if (pk_aqSize < (uint32_t)n) {
-            /* à sec : la production (temps émulé) va un peu moins vite que la
-             * consommation (temps réel) dès que le pacing passe sous 100 % —
-             * sans resynchro la file restait vide pour toujours (silence) et
-             * le retour du son donnait des plages étirées.  On saute au
-             * présent : ~600 latches d'avance, comme la reprise franche META. */
-            pk_aqStart = (pk_aqEnd + PK_AQ_SIZE - 600) & PK_AQ_MASK;
-            pk_aqSize = 600; /* les 600 latches qui séparent start de end */
-            for (; i < n; i++) {
-                out[i] = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
-                if (wavFile) wav_put((int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8));
+        int16_t s;
+        if (pk_aqSize) {
+            while (pk_aqSize) {
+                float d = pk_aqDelta[pk_aqStart] + err - PK_IFREQ * step;
+                if (d > 0) { pk_aqDelta[pk_aqStart] = d; err = 0; break; }
+                pk_audioHoldF = pk_aqData[pk_aqStart];
+                err = -d;
+                pk_aqStart = (pk_aqStart + 1) & PK_AQ_MASK;
+                pk_aqSize--;
             }
-            return;
         }
-        while (pk_aqSize) {
-            float d = pk_aqDelta[pk_aqStart] + err - PK_IFREQ;
-            if (d > 0) { pk_aqDelta[pk_aqStart] = d; err = 0; break; }
-            pk_audioHoldF = pk_aqData[pk_aqStart];
-            err = -d;
-            pk_aqStart = (pk_aqStart + 1) & PK_AQ_MASK;
-            pk_aqSize--;
-        }
-        out[i] = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
-        if (wavFile) wav_put((int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8));
+        /* à sec (pause, menu, stall) : la dernière valeur se tient, comme
+         * le DAC matériel — l'ancien « saute au présent » rejouait 600
+         * latches déjà consommés à chaque reprise */
+        s = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
+        out[i] = s;
+        if (wavFile) wav_put(s);
     }
 }
 
@@ -4676,6 +4714,23 @@ static SDL_Renderer *emuRen;
 static SDL_GameController *pad;
 static SDL_Joystick *joyFb;
 static uint8_t padDirBits; /* directions tenues par stick/chapeau */
+
+static void scale_apply(void) {
+    if (!emuRen) return;
+    /* La qualité de filtre se lit à la création de la texture : on la
+     * recrée (le contenu est de toute façon réécrit à chaque frame). */
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, dispScale ? "linear" : "nearest");
+    if (tex) SDL_DestroyTexture(tex);
+    tex = SDL_CreateTexture(emuRen, SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STREAMING, (int)SCR_W, (int)SCR_H);
+    if (dispScale) {
+        SDL_RenderSetLogicalSize(emuRen, 0, 0);
+        SDL_RenderSetIntegerScale(emuRen, SDL_FALSE);
+    } else {
+        SDL_RenderSetLogicalSize(emuRen, SCR_W, SCR_H);
+        SDL_RenderSetIntegerScale(emuRen, SDL_TRUE);
+    }
+}
 
 static uint32_t emu_nextFrameTick = 334860u; /* pas initial (frame_ticks suit la cible) */
 static Uint32 titleMs;
@@ -4926,11 +4981,7 @@ static void pk_screen_reconfig(void) {
     SCR_H = emuTarget == TGT_POKITTO ? 176 : 128;
     if (!emuRen) return;
     SDL_SetWindowSize(emuWin, (int)(SCR_W * 2), (int)(SCR_H * 2));
-    SDL_RenderSetLogicalSize(emuRen, SCR_W, SCR_H);
-    SDL_RenderSetIntegerScale(emuRen, SDL_TRUE);
-    if (tex) { SDL_DestroyTexture(tex); tex = NULL; }
-    tex = SDL_CreateTexture(emuRen, SDL_PIXELFORMAT_ARGB8888,
-                            SDL_TEXTUREACCESS_STREAMING, (int)SCR_W, (int)SCR_H);
+    scale_apply();
 }
 
 /* audio HLE : réouvre le périphérique au taux réel du firmware (référence) */
@@ -4990,9 +5041,9 @@ static int sdl_init_all(void) {
         fprintf(stderr, "fenêtre: %s\n", SDL_GetError());
         return 1;
     }
-    /* échelle logique = écran console : redimensionnable, rendu entier */
-    SDL_RenderSetLogicalSize(emuRen, SCR_W, SCR_H);
-    SDL_RenderSetIntegerScale(emuRen, SDL_TRUE);
+    /* échelle logique = écran console : redimensionnable, rendu entier
+     * (F10 change de mode de mise à l'échelle, F11 le plein écran) */
+    scale_apply();
 
     /* manette déjà branchée : contrôleur sinon joystick brut */
     for (int i = 0; !noPad() && i < SDL_NumJoysticks(); i++) {
@@ -5003,8 +5054,6 @@ static int sdl_init_all(void) {
     else if (joyFb) printf("joystick : %s\n", SDL_JoystickName(joyFb));
 
     refresh_title();
-    tex = SDL_CreateTexture(emuRen, SDL_PIXELFORMAT_ARGB8888,
-                            SDL_TEXTUREACCESS_STREAMING, (int)SCR_W, (int)SCR_H);
 
     SDL_AudioSpec want, got;
     memset(&want, 0, sizeof(want));
@@ -5060,6 +5109,18 @@ static int poll_events(void) {
 #endif
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F5) {
             if (fwLoaded) { fw_restart(); printf("redémarrage\n"); }
+        }
+        else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F10) {
+            dispScale = (dispScale + 1) % 3;
+            scale_apply();
+            printf("échelle : %s\n", dispScale == 0 ? "entière (F10/F11)"
+                                   : dispScale == 1 ? "adaptée (F10/F11)"
+                                                    : "étirée (F10/F11)");
+        }
+        else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F11) {
+            dispFull = !dispFull;
+            if (SDL_SetWindowFullscreen(emuWin, dispFull ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0)
+                fprintf(stderr, "plein écran : %s\n", SDL_GetError());
         }
         else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
             uint8_t m = key_bit(ev.key.keysym.sym);
