@@ -209,10 +209,10 @@ static uint8_t  sd_writeBuf[515];
  * de 1024 garantissait un trou à chaque appel (~15 % du son en relâches). */
 static int aqLatency = 1500, aqPrebuf = 900;
 #define AQ_LATENCY aqLatency
-static void aq_configure(int cb, double rate) {
+static void aq_configure(int cb, double devHz, double guestHz) {
     if (cb <= 0) cb = 1024;
-    int burst = (int)(rate / 59.7275) + 1; /* échantillons produits par frame émulée */
-    aqLatency = cb + 2 * burst + (int)(rate * 0.012); /* callback + 2 rafales + 12 ms de gigue */
+    int burst = (int)(guestHz / 59.7275) + 1; /* échantillons produits par frame émulée */
+    aqLatency = cb + 2 * burst + (int)(devHz * 0.012); /* callback + 2 rafales + 12 ms de gigue */
     if (aqLatency > AQ_SIZE / 2) aqLatency = AQ_SIZE / 2;
     aqPrebuf = cb + burst;
 }
@@ -224,6 +224,8 @@ static volatile uint32_t audUnder, audCbSamples, audCbCalls; /* EMU_AUDIO_STATS 
 
 static SDL_AudioDeviceID audioDev;
 static int audioOk;
+static int devRate = 48000;      /* taux du périphérique hôte : fixe, ouvert une seule fois */
+static int devCbSamples = 1024;
 static FILE *wavFile;
 static uint32_t wavSamples;
 static char wavPathStr[512];
@@ -367,7 +369,7 @@ static void audio_resume_when_ready(void) {
  * (holds + trims AQ_LATENCY) : LA famine audible de lapinou, alors que
  * le contenu produit est complet (rendu hors-ligne identique). */
 static double emuDacRate = 22049.0;
-static void meta_audio_reopen(double freq); /* défini avec le bloc SDL */
+static void meta_audio_set_rate(double freq); /* défini avec le bloc SDL */
 
 /* période TC4/TC5 en ticks émulés : prescale × (CC0+1) cycles du GCLK
  * 48 MHz, ramenés au domaine de ticks (× emuTicksPerUs/48, arrondi au
@@ -3546,10 +3548,10 @@ static void writeWord(uint32_t a, uint32_t v) {
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     if (a == 0x42001828u) { sercom4_write((uint8_t)v); return; } /* SERCOM4 DATA */
     if (a == 0x42004808u) { dac_write((uint16_t)v); return; }    /* DAC DATA */
-    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
-    if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }                /* TC4 CC0 */
-    if (a == 0x42003400u) { tc5CtrlA = v; tc5Enabled = (v & 0x02) != 0; if (!tc5Enabled) tc5Counter = 0; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }  /* TC5 CTRLA */
-    if (a == 0x42003418u) { tc5Top = v; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }  /* TC5 CC0 */
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA word <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); } } return; }
+    if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); } } return; }                /* TC4 CC0 */
+    if (a == 0x42003400u) { tc5CtrlA = v; tc5Enabled = (v & 0x02) != 0; if (!tc5Enabled) tc5Counter = 0; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks(); if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); } } return; }  /* TC5 CTRLA */
+    if (a == 0x42003418u) { tc5Top = v; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks(); if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); } } return; }  /* TC5 CC0 */
     if (a == 0x4200340cu) { tc5IntEnMask &= (uint8_t)~v; tc5Armed = (tc5IntEnMask & 0x33) != 0; return; } /* TC5 INTENCLR */
     if (a == 0x4200340du) { tc5IntEnMask |= (uint8_t)v; tc5Armed = (tc5IntEnMask & 0x33) != 0; return; } /* TC5 INTENSET : MC0=0x10 (lib) */
     if (a == 0x4200340eu) { tc5IntFlagMask &= (uint8_t)~v; return; }             /* TC5 INTFLAG */
@@ -3761,12 +3763,12 @@ static void writeHalf(uint32_t a, uint16_t v) {
         return;
     }
     dmac_window_intwrite(a, v, 2); /* 0x4100484C/D : CHINTENCLR/SET (fenêtre) */
-    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
-    if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
+    if (a == 0x42003000u) { if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA half <- %x\n", v); dbgTc4Cfg++; } tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0; if (!tc4Enabled) tc4Counter = 0; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); } } return; }
+    if (a == 0x42003018u) { tc4Top = v; if (tc4Enabled && tc4Top > 0) { double r = tc4_config_rate(); if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); } } return; }
     if (a == 0x4200300du) { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; return; }
     if (a == 0x4200300eu) { tc4IntFlagMask &= (uint8_t)~v; return; }
-    if (a == 0x42003400u) { tc5CtrlA = v; tc5Enabled = (v & 0x02) != 0; if (!tc5Enabled) tc5Counter = 0; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
-    if (a == 0x42003418u) { tc5Top = v; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks(); if (r != emuDacRate) { emuDacRate = r; meta_audio_reopen(r); } } return; }
+    if (a == 0x42003400u) { tc5CtrlA = v; tc5Enabled = (v & 0x02) != 0; if (!tc5Enabled) tc5Counter = 0; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks(); if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); } } return; }
+    if (a == 0x42003418u) { tc5Top = v; if (tc5Enabled && tc5Top > 0) { double r = ticks_per_sec() / (double)tc5_period_ticks(); if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); } } return; }
     if (a == 0x4200340du) { tc5IntEnMask |= (uint8_t)v; tc5Armed = (tc5IntEnMask & 0x33) != 0; return; }
     if (a == 0x4200340eu) { tc5IntFlagMask &= (uint8_t)~v; return; }
     if (a == 0x40000c02u) { if (dbg() && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v); dbgTc4Cfg++; } return; }
@@ -4531,16 +4533,20 @@ static void pk_audio_cb(Uint8 *stream, int len) {
      * ~7000 latches, 0,32 s de retard constant, et montait sans retour
      * sous les rafales de production) ; en deçà, elle ralentit d'au plus
      * 0,4 % pour la faire remonter. */
-    float step = 1.0f;
+    /* device à taux fixe : la base de consommation = taux DAC du jeu /
+     * taux device (PK_IFREQ compte des latchs à 22050) ; la régulation
+     * corrige le remplissage autour de la cible (~55 ms de latchs) */
+    float base = (float)(emuDacRate / (double)devRate);
+    float step = base;
     {
         float over = (float)pk_aqSize - 1200.0f;
         if (over > 0.0f) {
-            step = 1.0f + over / 22050.0f;
-            if (step > 1.5f) step = 1.5f;
+            step = base * (1.0f + over / 22050.0f);
+            if (step > base * 1.5f) step = base * 1.5f;
         } else {
             float under = -over / 22050.0f;
             if (under > 0.004f) under = 0.004f;
-            step = 1.0f - under;
+            step = base * (1.0f - under);
         }
     }
     float err = 0;
@@ -4571,17 +4577,19 @@ static void audio_cb(void *ud, Uint8 *stream, int len) {
     if (emuTarget == TGT_POKITTO) { pk_audio_cb(stream, len); return; }
     int16_t *out = (int16_t *)stream;
     /* régulation dynamique du débit : la lecture avance de `ratio`
-     * échantillon par sortie (interpolation linéaire), ratio = 1 ± 0,5 %
-     * selon l'écart du remplissage à la cible — encaisse toute dérive
-     * production/consommation (horloge hôte, cadence du jeu) sans trou ni
-     * rognage audible */
+     * échantillons de périphérique par sortie (interpolation linéaire).
+     *  Le périphérique est ouvert UNE fois à taux fixe (48 kHz) : jamais de
+     * renégociation système quand le jeu change sa cadence DAC.  Le ratio
+     * de base = taux DAC du jeu / taux device, corrigé de ±0,5 % selon
+     * l'écart du remplissage à la cible (dérive d'horloges). */
     static double frac;
     int ahead = aq_tail - aq_head;
     if (ahead < 0) ahead += AQ_SIZE;
     double target = AQ_LATENCY * 0.6;
     double err = (ahead - target) / target;
     if (err > 1.0) err = 1.0; else if (err < -1.0) err = -1.0;
-    double ratio = 1.0 + 0.005 * err;
+    double ratio = (emuDacRate / (double)devRate) * (1.0 + 0.005 * err);
+    if (ratio < 0.2) ratio = 0.2; else if (ratio > 5.0) ratio = 5.0;
     for (int i = 0; i < len / 2; i++) {
         if (audioPending) { out[i] = 0; continue; } /* pré-buffer : silence */
         int h = aq_head, t = aq_tail;
@@ -5016,29 +5024,16 @@ static void pk_audio_reopen(int freq) {
     SDL_PauseAudioDevice(dev, 0);
 }
 
-/* (ré)ouvre la sortie META au taux DAC réel du jeu (config TC4) : le
- * callback consomme 1:1, la conversion vers le matériel reste gérée par
- * SDL2.  Plage raisonnable seulement : hors plage, on garde le device. */
-static void meta_audio_reopen(double freq) {
-    static double openRate = 22049.0;
+/* taux DAC réel du jeu (config TC4/TC5) : le périphérique hôte reste
+ * ouvert à taux fixe, seule la consommation s'adapte — plus aucune
+ * fermeture/réouverture qui renégocierait le son de toute la machine.
+ *  Plage raisonnable seulement : hors plage, on garde l'ancien taux. */
+static void meta_audio_set_rate(double freq) {
     if (!audioOk || freq <= 0.0) return;
-    if (freq == openRate) return;
+    if (freq < 8000.0 || freq > 96000.0) return; /* config farfelue : taux inchangé */
+    if (freq == emuDacRate) return;
     emuDacRate = freq;
-    if (freq < 8000.0 || freq > 96000.0) return; /* config farfelue : device inchangé */
-    SDL_AudioSpec want, got;
-    memset(&want, 0, sizeof(want));
-    want.freq = (int)(freq + 0.5);
-    want.format = AUDIO_S16SYS; want.channels = 1;
-    want.samples = 512; want.callback = audio_cb;
-    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
-    if (!dev) return;
-    aq_configure(got.samples, got.freq);
-    if (audioDev) { SDL_PauseAudioDevice(audioDev, 1); SDL_CloseAudioDevice(audioDev); }
-    audioDev = dev;
-    openRate = freq;
-    audioHold = 0;
-    audioPending = 1; /* re-prébuffer avant de reparler */
-    SDL_PauseAudioDevice(dev, 0);
+    aq_configure(devCbSamples, (double)devRate, freq);
     fprintf(stderr, TR("audio : %d Hz (cadence timer du jeu −250 ppm)\n", "audio: %d Hz (game timer clock −250 ppm)\n"), (int)(freq + 0.5));
 }
 
@@ -5075,12 +5070,20 @@ static int sdl_init_all(void) {
 
     SDL_AudioSpec want, got;
     memset(&want, 0, sizeof(want));
-    want.freq = (int)(emuDacRate + 0.5); want.format = AUDIO_S16SYS; want.channels = 1;
+    want.freq = 48000; /* taux fixe : le taux du jeu est rééchantillonné,
+                        * jamais de renégociation du périphérique système */
+    want.format = AUDIO_S16SYS; want.channels = 1;
     /* 512 fige l'émulateur sur emscripten (SPN audio) : ne pas descendre */
     want.samples = 512; want.callback = audio_cb;
     audioDev = SDL_OpenAudioDevice(NULL, 0, &want, &got, 0);
     audioOk = audioDev != 0;
-    if (audioOk) aq_configure(got.samples, got.freq);
+    if (audioOk) {
+        devRate = got.freq ? got.freq : 48000;
+        devCbSamples = got.samples;
+        aq_configure(got.samples, (double)devRate, emuDacRate);
+        fprintf(stderr, TR("audio : périphérique %d Hz (le taux du jeu est rééchantillonné)\n",
+                           "audio: device at %d Hz (game rate resampled)\n"), devRate);
+    }
     if (audioOk) SDL_PauseAudioDevice(audioDev, 0); /* tourne en silence ;
         le pré-buffer est géré par audioPending dans le callback */
     if (!audioOk) fprintf(stderr, TR("audio indisponible : %s\n", "audio unavailable: %s\n"), SDL_GetError());
