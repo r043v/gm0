@@ -115,8 +115,10 @@ L'émulateur entier (≈ 5 800 lignes de C, 66 commits) a été écrit par
 **GLM-5.3-Flash**, l'agent ZCode, en une semaine — du 30 septembre au
 6 octobre 2026.  Tous les commits du dépôt sont de lui, sauf un co-signé
 **Claude Opus 5.5** (le canal audio DMA déclenché par TC4, travaillé dans
-son propre outillage).  Les compteurs du sprint META complet (émulateur
-ici, convertisseur dans gb-recompiled), relevés dans la base de sessions :
+son propre outillage).  Les compteurs de son développement — le
+convertisseur n'y a été touché que pour débuguer l'émulateur, l'usage
+reflète donc l'émulateur seul —, relevés dans la base de sessions de
+ZCode :
 
 - 14 sessions, 122 messages-prompt ;
 - 5 446 requêtes modèle, 5 488 appels d'outils ;
