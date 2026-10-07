@@ -4243,7 +4243,7 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
     uint32_t op, w = 0, fw0 = flashWaits; /* états d'attente : cœur, puis bus pendant l'instruction */
     if (pc < FLASH_SIZE) { /* fetch direct en flash (les deux cibles) */
         if (T == TGT_META) w = nvm_miss(pc); /* META : cache NVM */
-        op = (uint32_t)flash[pc] | (uint32_t)flash[pc + 1] << 8;
+        uint16_t h; memcpy(&h, flash + pc, 2); op = h; /* un chargement 16 bits (hôte petit-boutiste) */
     } else {
         if (step_wild_pc(pc)) return;
         op = fetchHalf(pc);
