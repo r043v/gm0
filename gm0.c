@@ -89,7 +89,7 @@ static uint8_t  sram[SRAM_SIZE];
 static uint32_t regs[16];
 static int fN, fZ, fC, fV;
 static uint32_t tickCount;
-static int sysTickTrigger;
+static uint32_t sysTickBase; /* tick du dernier enroulement de SYST_CVR */
 static uint32_t vectorBase;
 static uint32_t sysTickVector, dmacVector, tc4Vector, tc5Vector;
 static int dmacInterrupt, tc4Interrupt;
@@ -101,6 +101,8 @@ static int irqWork = 1; /* le NVIC a peut-être quelque chose à prendre (voir n
  * maintenant. */
 static uint32_t evtAt;
 static inline void irq_work(void) { irqWork = 1; evtAt = tickCount; }
+/* ticks écoulés dans la période SysTick courante */
+static inline int systick_elapsed(void) { return (int)(tickCount - sysTickBase); }
 static long sysTickEntries;
 
 /* périphériques — PA27 (CS carte SD) et PA25 (CS boutons) hauts dès le
@@ -244,14 +246,19 @@ static uint32_t emuTicksPerUs = 48u;
  * direct-mapped, 8 lignes de 64 bits.  Un défaut coûte l'état d'attente
  * RWS=1 du runtime à 48 MHz ; un succès, rien.  Instructions et données. */
 static uint32_t nvmTag[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
-static uint32_t flashWaits; /* états d'attente de l'instruction courante */
-static inline void nvm_access(uint32_t a) {
-    /* sans branchement : succès/défaut alternent au fil du code (un défaut
-     * toutes les ~4 instructions séquentielles), le prédicteur s'y perdait */
-    uint32_t line = (a >> 3) & 7u, tag = a >> 6;
-    flashWaits += nvmTag[line] != tag;
+/* défaut (0/1) de l'accès a, sans branchement : succès et défauts alternent
+ * au fil du code (un défaut toutes les ~4 instructions séquentielles), le
+ * prédicteur s'y perdait */
+static inline uint32_t nvm_miss(uint32_t a) {
+    uint32_t line = (a >> 3) & 7u, tag = a >> 6, miss = nvmTag[line] != tag;
     nvmTag[line] = tag;
+    return miss;
 }
+/* accès du bus hors du cœur (DMA, pile des exceptions) : compteur global,
+ * monotone — l'interpréteur compte les siens dans un local et y ajoute ce
+ * que ce compteur a pris pendant l'instruction */
+static uint32_t flashWaits;
+static inline void nvm_access(uint32_t a) { flashWaits += nvm_miss(a); }
 
 
 static double pk_core_hz(void); /* fréquence du cœur telle que configurée */
@@ -2119,7 +2126,7 @@ static void pk_blx(uint32_t opcode) {
         /* 42 ticks comme la référence (notre pas en a déjà compté 1) ;
          * regs[15] est déjà sur l'adresse de reprise (BLX+4 = next+2) :
          * on avance les compteurs SANS toucher le PC */
-        for (int i = 0; i < 41; i++) { sysTickTrigger++; tickCount++; }
+        tickCount += 41;
         return;
     }
     setReg(14, regs[15] - 2);       /* LR = BLX + 2 (regs[15] est à +4) */
@@ -3327,7 +3334,7 @@ static uint32_t scs_read(uint32_t a) {
         if (sysTickCountFlag) { v |= 1u << 16; sysTickCountFlag = 0; }
         return v; }
     case 0xe000e014u: return emuTicksPerMs - 1u;                                        /* SYST_RVR */
-    case 0xe000e018u: return (emuTicksPerMs - 1u) - ((uint32_t)sysTickTrigger % emuTicksPerMs); /* SYST_CVR */
+    case 0xe000e018u: return (emuTicksPerMs - 1u) - ((uint32_t)systick_elapsed() % emuTicksPerMs); /* SYST_CVR */
     case 0xe000e01cu: return 0;                                                         /* SYST_CALIB */
     case 0xe000e100u: return nvicIser;                                                  /* ISER */
     case 0xe000e180u: return nvicIser;                                                  /* ICER */
@@ -3346,7 +3353,7 @@ static uint32_t scs_read(uint32_t a) {
 static void scs_write(uint32_t a, uint32_t v, uint32_t m) {
     irq_work();
     switch (a) {
-    case 0xe000e018u: sysTickTrigger = 0; return;          /* SYST_CVR : toute écriture le remet à 0 */
+    case 0xe000e018u: sysTickBase = tickCount; return;          /* SYST_CVR : toute écriture le remet à 0 */
     case 0xe000e100u: nvicIser |= v; return;
     case 0xe000e180u: nvicIser &= ~v; return;
     case 0xe000e200u: nvicPend |= v; return;
@@ -3528,9 +3535,10 @@ static uint32_t bus_read(uint32_t a, int size) {
         return v;
     }
     if (a < 0x40000000u) return 0;                          /* au-delà de la SRAM */
-    if (IS_APB(a)) return periph_read(a, LANES(size, a)) >> (8 * (a & 3u));
-    if (a - 0xe000e000u < 0x1000u) return scs_read(a & ~3u) >> (8 * (a & 3u));
-    return 0;
+    uint32_t v = 0;
+    if (IS_APB(a)) v = periph_read(a, LANES(size, a));
+    else if (a - 0xe000e000u < 0x1000u) v = scs_read(a & ~3u);
+    return (v >> (8 * (a & 3u))) & (size == 4 ? ~0u : (1u << (8 * size)) - 1u);
 }
 
 /* accès du bus (maîtres DMA, pile du cœur) : SRAM d'abord, sinon voie
@@ -3945,13 +3953,13 @@ static void sercom4_write(uint8_t v) {
 /* Avance le temps émulé de n ticks (cycles CPU dans le modèle par
  * défaut) : SysTick, TC4/TC5 (DMA ou interruption) et beats SPI, par lots —
  * les débordements gardent leur phase (compteur -= période). */
-static uint32_t timerAcc;    /* ticks pas encore appliqués aux timers */
-static uint32_t timerBudget; /* ticks avant le prochain événement (0 = à recalculer) */
+static uint32_t timerFrom;     /* tick jusqu'auquel les timers sont appliqués */
+static uint32_t timerDeadline; /* tick de leur prochain événement (= maintenant : à recalculer) */
 
 static void timers_process(uint32_t n) {
     if (emuTarget == TGT_META) {
-        while (sysTickTrigger >= (int)emuTicksPerMs) { /* enroulement de CVR : SysTick en attente */
-            sysTickTrigger -= (int)emuTicksPerMs;
+        while (systick_elapsed() >= (int)emuTicksPerMs) { /* enroulement de CVR : SysTick en attente */
+            sysTickBase += emuTicksPerMs;
             sysTickPend = 1;
             sysTickCountFlag = 1;
             irq_work();
@@ -4012,7 +4020,7 @@ static void timers_process(uint32_t n) {
 static uint32_t timers_next_event(void) {
     uint32_t d = 0xffffffffu;
     if (emuTarget == TGT_META)
-        d = sysTickTrigger < (int)emuTicksPerMs ? emuTicksPerMs - (uint32_t)sysTickTrigger : 1u;
+        d = systick_elapsed() < (int)emuTicksPerMs ? emuTicksPerMs - (uint32_t)systick_elapsed() : 1u;
     if (tc4Enabled && tc4Top > 0) {
         uint32_t per = tc4_period_ticks();
         uint32_t r = tc4Counter < per ? per - tc4Counter : 1u;
@@ -4035,8 +4043,10 @@ static uint32_t timers_next_event(void) {
 /* applique les ticks différés (avant toute écriture périphérique qui
  * pourrait changer l'état des timers, et à chaque échéance) */
 static void timers_sync(void) {
-    if (timerAcc) { uint32_t n = timerAcc; timerAcc = 0; timers_process(n); }
-    timerBudget = 0;
+    uint32_t n = tickCount - timerFrom;
+    timerFrom = tickCount;
+    if (n) timers_process(n);
+    timerDeadline = tickCount;
 }
 
 /* Avance le temps émulé de n ticks.  Les timers ne sont traités qu'à
@@ -4044,18 +4054,22 @@ static void timers_sync(void) {
  * entre deux, seuls les compteurs avancent — même résultat, beaucoup moins
  * de travail par instruction. */
 static void advance_slow(void) {
-    uint32_t a = timerAcc;
-    timerAcc = 0;
-    timers_process(a);
-    timerBudget = timers_next_event();
+    uint32_t n = tickCount - timerFrom;
+    timerFrom = tickCount;
+    timers_process(n);
+    uint32_t d = timers_next_event(); /* borné : l'échéance se compare en signé */
+    timerDeadline = tickCount + (d > 0x40000000u ? 0x40000000u : d);
 }
-static inline void advance(uint32_t n) {
-    sysTickTrigger += (int)n;
+/* ALWAYS_INLINE + cible constante (T) : les fonctions du chemin chaud sont
+ * instanciées par cible dans l'interpréteur (step_t), sans aucun test de
+ * emuTarget ; les appelants hors cœur passent emuTarget */
+#define ALWAYS_INLINE inline __attribute__((always_inline))
+static ALWAYS_INLINE void advance_t(const int T, uint32_t n) {
     tickCount += n;
-    if (emuTarget == TGT_POKITTO) return; /* timers LPC dans pk_machine_step */
-    timerAcc += n;
-    if (timerAcc >= timerBudget) advance_slow();
+    if (T == TGT_POKITTO) return; /* timers LPC dans pk_machine_step */
+    if ((int32_t)(tickCount - timerDeadline) >= 0) advance_slow();
 }
+static inline void advance(uint32_t n) { advance_t(emuTarget, n); }
 
 /* PC + 2 et un tick à appliquer : le temps n'est appliqué qu'une fois par
  * instruction, en fin de step (step_flush), avec son coût en cycles */
@@ -4064,10 +4078,12 @@ static inline void incrementPc(void) {
     regs[15] += 2;
     stepTicks++;
 }
-static inline void step_flush(uint32_t minTicks) {
-    uint32_t t = stepTicks > minTicks ? stepTicks : minTicks;
-    stepTicks = 0;
-    if (t) advance(t);
+static ALWAYS_INLINE void step_flush(const int T, uint32_t minTicks) {
+    if (__builtin_expect(stepTicks != 0, 0)) { /* injection hors pas, HLE Pokitto */
+        if (stepTicks > minTicks) minTicks = stepTicks;
+        stepTicks = 0;
+    }
+    if (minTicks) advance_t(T, minTicks);
 }
 
 /* (traceAllStep est local à step) */
@@ -4121,49 +4137,55 @@ static inline uint32_t addSetCond(uint32_t a, uint32_t b, int carry) {
  * principale (les écritures, elles, allaient au bon endroit).  GF y
  * double-bufferise sa musique streamée : l'ISR jouait des octets de
  * variables du jeu — son haché, saturé, dès l'écran de jeu. */
-static inline uint32_t sram_base(void) {
-    return emuTarget == TGT_POKITTO ? 0x10000000u : 0x20000000u;
+#define SRAM_BASE(T) ((T) == TGT_POKITTO ? 0x10000000u : 0x20000000u)
+#define NMASK(n)     ((n) == 4 ? ~0u : (1u << (8 * (n))) - 1u)
+/* w : états d'attente de l'instruction (local de step_t, tenu en registre) */
+static ALWAYS_INLINE uint32_t ld_t(const int T, uint32_t a, const int n, uint32_t *w) {
+    uint32_t o = a - SRAM_BASE(T), v = 0;
+    if (o <= SRAM_SIZE - n) { memcpy(&v, sram + o, n); return v; }
+    if (T == TGT_POKITTO) return n == 4 ? pk_read_word(a) : n == 2 ? pk_read_half(a) : pk_read_byte(a);
+    if (a <= FLASH_SIZE - n) { *w += nvm_miss(a); memcpy(&v, flash + a, n); return v; }
+    return bus_read(a, n);
 }
-static inline uint32_t ld32(uint32_t a) {
-    uint32_t o = a - sram_base();
-    if (o <= SRAM_SIZE - 4u) { uint32_t v; memcpy(&v, sram + o, 4); return v; }
-    if (emuTarget == TGT_POKITTO) return pk_read_word(a);
-    if (a <= FLASH_SIZE - 4u) { uint32_t v; nvm_access(a); memcpy(&v, flash + a, 4); return v; }
-    return bus_read(a, 4);
-}
-static inline uint32_t ld16(uint32_t a) {
-    uint32_t o = a - sram_base();
-    if (o <= SRAM_SIZE - 2u) { uint16_t v; memcpy(&v, sram + o, 2); return v; }
-    if (emuTarget == TGT_POKITTO) return pk_read_half(a);
-    if (a <= FLASH_SIZE - 2u) { uint16_t v; nvm_access(a); memcpy(&v, flash + a, 2); return v; }
-    return (uint16_t)bus_read(a, 2);
-}
-static inline uint32_t ld8(uint32_t a) {
-    uint32_t o = a - sram_base();
-    if (o < SRAM_SIZE) return sram[o];
-    if (emuTarget == TGT_POKITTO) return pk_read_byte(a);
-    if (a < FLASH_SIZE) { nvm_access(a); return flash[a]; }
-    return (uint8_t)bus_read(a, 1);
-}
-static inline void st32(uint32_t a, uint32_t v) {
-    if (emuTarget == TGT_POKITTO) { pk_write_word(a, v); return; }
+static ALWAYS_INLINE void st_t(const int T, uint32_t a, uint32_t v, const int n) {
+    if (T == TGT_POKITTO) {
+        if (n == 4) pk_write_word(a, v); else if (n == 2) pk_write_half(a, (uint16_t)v); else pk_write_byte(a, (uint8_t)v);
+        return;
+    }
     uint32_t o = a - 0x20000000u;
-    if (o <= SRAM_SIZE - 4u) { memcpy(sram + o, &v, 4); return; }
-    bus_write(a, v, 4);
-}
-static inline void st16(uint32_t a, uint32_t v) {
-    if (emuTarget == TGT_POKITTO) { pk_write_half(a, (uint16_t)v); return; }
-    uint32_t o = a - 0x20000000u;
-    if (o <= SRAM_SIZE - 2u) { uint16_t h = (uint16_t)v; memcpy(sram + o, &h, 2); return; }
-    bus_write(a, (uint16_t)v, 2);
-}
-static inline void st8(uint32_t a, uint32_t v) {
-    if (emuTarget == TGT_POKITTO) { pk_write_byte(a, (uint8_t)v); return; }
-    uint32_t o = a - 0x20000000u;
-    if (o < SRAM_SIZE) { sram[o] = (uint8_t)v; return; }
-    bus_write(a, (uint8_t)v, 1);
+    if (o <= SRAM_SIZE - n) { memcpy(sram + o, &v, n); return; }
+    bus_write(a, v & NMASK(n), n);
 }
 
+/* nombre de registres d'une liste (SWAR : __builtin_popcount est un appel
+ * de libgcc sur le x86-64 de base, il en coûtait un par PUSH/POP) */
+static ALWAYS_INLINE uint32_t popcount16(uint32_t x) {
+    x -= (x >> 1) & 0x5555u;
+    x = (x & 0x3333u) + ((x >> 2) & 0x3333u);
+    x = (x + (x >> 4)) & 0x0f0fu;
+    return (x + (x >> 8)) & 0x1fu;
+}
+/* transferts multiples (PUSH/POP/LDM/STM) : les n registres de la liste,
+ * dans l'ordre croissant, aux adresses croissantes depuis a.  Un bloc
+ * aligné entièrement en SRAM (la pile, presque toujours) est copié
+ * directement après un seul test de plage ; sinon mot par mot par le bus.
+ * Seuls les bits posés sont parcourus. */
+static ALWAYS_INLINE void stm_t(const int T, uint32_t a, uint32_t list, uint32_t n) {
+    uint32_t o = a - SRAM_BASE(T);
+    if (!(a & 3u) && o <= SRAM_SIZE - 4u * n) {
+        for (uint8_t *p = sram + o; list; list &= list - 1, p += 4) memcpy(p, &regs[__builtin_ctz(list)], 4);
+        return;
+    }
+    for (; list; list &= list - 1, a += 4) st_t(T, a, regs[__builtin_ctz(list)], 4);
+}
+static ALWAYS_INLINE void ldm_t(const int T, uint32_t a, uint32_t list, uint32_t n, uint32_t *w) {
+    uint32_t o = a - SRAM_BASE(T);
+    if (!(a & 3u) && o <= SRAM_SIZE - 4u * n) {
+        for (const uint8_t *p = sram + o; list; list &= list - 1, p += 4) memcpy(&regs[__builtin_ctz(list)], p, 4);
+        return;
+    }
+    for (; list; list &= list - 1, a += 4) regs[__builtin_ctz(list)] = ld_t(T, a, 4, w);
+}
 
 static uint32_t lastExecPc;  /* PC de l'instruction exécutée au pas précédent */
 
@@ -4276,28 +4298,32 @@ static void prof_write(void) {
     fclose(f);
 }
 
-static void step(void) {
-    if (stepTicks) step_flush(0); /* ticks d'une injection hors pas */
+/* le pas, instancié par cible (T) et par mode (D : traces TRACE_TAIL/
+ * EMU_TRACE et profil EMU_PROF, hors de la boucle rapide) */
+static ALWAYS_INLINE void step_t(const int T, const int D) {
+#define LD32(a) ld_t(T, (a), 4, &w)
+#define LD16(a) ld_t(T, (a), 2, &w)
+#define LD8(a)  ld_t(T, (a), 1, &w)
+#define ST32(a, v) st_t(T, (a), (v), 4)
+#define ST16(a, v) st_t(T, (a), (v), 2)
+#define ST8(a, v)  st_t(T, (a), (v), 1)
+    if (stepTicks) step_flush(T, 0); /* ticks d'une injection hors pas */
     if ((int32_t)(tickCount - evtAt) >= 0) { /* échéance machine */
-        if (emuTarget == TGT_POKITTO) pk_machine_step();
+        if (T == TGT_POKITTO) pk_machine_step();
         else { nvic_service(); evtAt = irqWork ? tickCount : tickCount + 0x40000000u; }
     }
     while (regs[15] >= 0xfffffff2u) exc_return(); /* EXC_RETURN atteint */
 
     uint32_t pc = regs[15] - 2u;
-    uint32_t op;
-    flashWaits = 0;
+    uint32_t op, w = 0, fw0 = flashWaits; /* états d'attente : cœur, puis bus pendant l'instruction */
     if (pc < FLASH_SIZE) { /* fetch direct en flash (les deux cibles) */
-        if (emuTarget == TGT_META) nvm_access(pc); /* META : cache NVM */
+        if (T == TGT_META) w = nvm_miss(pc); /* META : cache NVM */
         op = (uint32_t)flash[pc] | (uint32_t)flash[pc + 1] << 8;
     } else {
         if (step_wild_pc(pc)) return;
         op = fetchHalf(pc);
     }
-    if (dbgStep) {
-        if (dbgStep < 0) dbgStep = getenv("TRACE_TAIL") || getenv("EMU_TRACE");
-        if (dbgStep) step_debug(pc, op);
-    }
+    if (D && dbgStep) step_debug(pc, op);
     lastExecPc = pc;
     regs[15] = pc + 4u;
     uint32_t cyc = 1;
@@ -4382,40 +4408,40 @@ static void step(void) {
     case 0x47: { /* BX / BLX Rm */
         uint32_t t = regs[(op >> 3) & 15];
         if (op & 0x80) {
-            if (emuTarget == TGT_POKITTO) { pk_blx(op); stepTicks = 0; cyc = 2; break; } /* API ROM interceptée */
+            if (T == TGT_POKITTO) { pk_blx(op); stepTicks = 0; cyc = 2; break; } /* API ROM interceptée */
             regs[14] = (pc + 2u) | 1u;
         }
         BRANCH(t);
         break; }
     /* ---- LDR littéral */
     case 0x48: case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4e: case 0x4f:
-        regs[(op >> 8) & 7] = ld32(((pc + 4u) & ~3u) + ((op & 0xff) << 2)); cyc = 2; break;
+        regs[(op >> 8) & 7] = LD32(((pc + 4u) & ~3u) + ((op & 0xff) << 2)); cyc = 2; break;
     /* ---- load/store registre + registre */
-    case 0x50: case 0x51: st32(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
-    case 0x52: case 0x53: st16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
-    case 0x54: case 0x55: st8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
-    case 0x56: case 0x57: regs[op & 7] = (uint32_t)(int32_t)(int8_t)ld8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
-    case 0x58: case 0x59: regs[op & 7] = ld32(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
-    case 0x5a: case 0x5b: regs[op & 7] = ld16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
-    case 0x5c: case 0x5d: regs[op & 7] = ld8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
-    case 0x5e: case 0x5f: regs[op & 7] = (uint32_t)(int32_t)(int16_t)ld16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x50: case 0x51: ST32(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
+    case 0x52: case 0x53: ST16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
+    case 0x54: case 0x55: ST8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
+    case 0x56: case 0x57: regs[op & 7] = (uint32_t)(int32_t)(int8_t)LD8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x58: case 0x59: regs[op & 7] = LD32(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x5a: case 0x5b: regs[op & 7] = LD16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x5c: case 0x5d: regs[op & 7] = LD8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x5e: case 0x5f: regs[op & 7] = (uint32_t)(int32_t)(int16_t)LD16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
     /* ---- load/store immédiat */
     case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
-        st32(regs[(op >> 3) & 7] + ((op >> 4) & 0x7c), regs[op & 7]); cyc = 2; break;
+        ST32(regs[(op >> 3) & 7] + ((op >> 4) & 0x7c), regs[op & 7]); cyc = 2; break;
     case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d: case 0x6e: case 0x6f:
-        regs[op & 7] = ld32(regs[(op >> 3) & 7] + ((op >> 4) & 0x7c)); cyc = 2; break;
+        regs[op & 7] = LD32(regs[(op >> 3) & 7] + ((op >> 4) & 0x7c)); cyc = 2; break;
     case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
-        st8(regs[(op >> 3) & 7] + ((op >> 6) & 31), regs[op & 7]); cyc = 2; break;
+        ST8(regs[(op >> 3) & 7] + ((op >> 6) & 31), regs[op & 7]); cyc = 2; break;
     case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f:
-        regs[op & 7] = ld8(regs[(op >> 3) & 7] + ((op >> 6) & 31)); cyc = 2; break;
+        regs[op & 7] = LD8(regs[(op >> 3) & 7] + ((op >> 6) & 31)); cyc = 2; break;
     case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
-        st16(regs[(op >> 3) & 7] + ((op >> 5) & 0x3e), regs[op & 7]); cyc = 2; break;
+        ST16(regs[(op >> 3) & 7] + ((op >> 5) & 0x3e), regs[op & 7]); cyc = 2; break;
     case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8c: case 0x8d: case 0x8e: case 0x8f:
-        regs[op & 7] = ld16(regs[(op >> 3) & 7] + ((op >> 5) & 0x3e)); cyc = 2; break;
+        regs[op & 7] = LD16(regs[(op >> 3) & 7] + ((op >> 5) & 0x3e)); cyc = 2; break;
     case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:
-        st32(regs[13] + ((op & 0xff) << 2), regs[(op >> 8) & 7]); cyc = 2; break;
+        ST32(regs[13] + ((op & 0xff) << 2), regs[(op >> 8) & 7]); cyc = 2; break;
     case 0x98: case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: case 0x9f:
-        regs[(op >> 8) & 7] = ld32(regs[13] + ((op & 0xff) << 2)); cyc = 2; break;
+        regs[(op >> 8) & 7] = LD32(regs[13] + ((op & 0xff) << 2)); cyc = 2; break;
     /* ---- ADR, ADD Rd, SP, #imm */
     case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: case 0xa5: case 0xa6: case 0xa7:
         regs[(op >> 8) & 7] = ((pc + 4u) & ~3u) + ((op & 0xff) << 2); break;
@@ -4431,22 +4457,22 @@ static void step(void) {
         default: v &= 0xff; break;                         /* UXTB */
         }
         regs[op & 7] = v; break; }
-    case 0xb4: case 0xb5: { /* PUSH {rlist[, lr]} */
-        uint32_t n = (uint32_t)__builtin_popcount(op & 0x1ff), a = regs[13] - 4u * n;
+    case 0xb4: case 0xb5: { /* PUSH {rlist[, lr]} : LR en bit 14 de la liste */
+        uint32_t n = popcount16(op & 0x1ff), a = regs[13] - 4u * n;
         regs[13] = a;
-        for (int i = 0; i < 8; i++) if (op & (1u << i)) { st32(a, regs[i]); a += 4; }
-        if (op & 0x100) st32(a, regs[14]);
+        stm_t(T, a, (op & 0xffu) | (op & 0x100u) << 6, n);
         cyc = 1 + n; break; }
-    case 0xbc: case 0xbd: { /* POP {rlist[, pc]} */
-        uint32_t n = (uint32_t)__builtin_popcount(op & 0x1ff), a = regs[13];
-        for (int i = 0; i < 8; i++) if (op & (1u << i)) { regs[i] = ld32(a); a += 4; }
-        if (op & 0x100) { uint32_t t = ld32(a); a += 4; regs[13] = a; BRANCH(t); cyc = 3 + n; }
-        else { regs[13] = a; cyc = 1 + n; }
+    case 0xbc: case 0xbd: { /* POP {rlist[, pc]} : PC en bit 15 de la liste */
+        uint32_t n = popcount16(op & 0x1ff), a = regs[13];
+        ldm_t(T, a, (op & 0xffu) | (op & 0x100u) << 7, n, &w);
+        regs[13] = a + 4u * n;
+        if (op & 0x100) { BRANCH(regs[15]); cyc = 3 + n; }
+        else cyc = 1 + n;
         break; }
     case 0xb6: /* CPSID i (B672) / CPSIE i (B662) */
         if ((op & 0xffef) == 0xb662) {
             int dis = (op >> 4) & 1;
-            if (emuTarget == TGT_POKITTO) armIrqEnable = !dis;
+            if (T == TGT_POKITTO) armIrqEnable = !dis;
             else { primask = dis; if (!dis) irq_work(); }
         }
         break;
@@ -4461,13 +4487,13 @@ static void step(void) {
     case 0xbe: case 0xbf: break; /* BKPT, NOP/YIELD/WFE/WFI/SEV */
     /* ---- LDMIA / STMIA */
     case 0xc0: case 0xc1: case 0xc2: case 0xc3: case 0xc4: case 0xc5: case 0xc6: case 0xc7: {
-        uint32_t rn = (op >> 8) & 7, a = regs[rn], n = 0;
-        for (int i = 0; i < 8; i++) if (op & (1u << i)) { st32(a, regs[i]); a += 4; n++; }
-        regs[rn] = a; cyc = 1 + n; break; }
+        uint32_t rn = (op >> 8) & 7, a = regs[rn], n = popcount16(op & 0xff);
+        stm_t(T, a, op & 0xffu, n);
+        regs[rn] = a + 4u * n; cyc = 1 + n; break; }
     case 0xc8: case 0xc9: case 0xca: case 0xcb: case 0xcc: case 0xcd: case 0xce: case 0xcf: {
-        uint32_t rn = (op >> 8) & 7, a = regs[rn], n = 0;
-        for (int i = 0; i < 8; i++) if (op & (1u << i)) { regs[i] = ld32(a); a += 4; n++; }
-        if (!(op & (1u << rn))) regs[rn] = a; /* pas d'écriture de base si Rn est chargé */
+        uint32_t rn = (op >> 8) & 7, a = regs[rn], n = popcount16(op & 0xff);
+        ldm_t(T, a, op & 0xffu, n, &w);
+        if (!(op & (1u << rn))) regs[rn] = a + 4u * n; /* pas d'écriture de base si Rn est chargé */
         cyc = 1 + n; break; }
     /* ---- branchements */
     case 0xd0: if (fZ) goto bcond; break;
@@ -4506,18 +4532,18 @@ static void step(void) {
         if (op == 0xf3ef && (op2 & 0xf000) == 0x8000) { /* MRS Rd, spec */
             uint32_t sysm = op2 & 0xff, v = 0;
             uint32_t apsr = (uint32_t)fN << 31 | (uint32_t)fZ << 30 | (uint32_t)fC << 29 | (uint32_t)fV << 28;
-            uint32_t ipsr = emuTarget == TGT_META ? (uint32_t)exc_active() : 0;
+            uint32_t ipsr = T == TGT_META ? (uint32_t)exc_active() : 0;
             if (sysm <= 3) v = apsr | ((sysm & 1) ? ipsr : 0);       /* APSR, IAPSR, EAPSR, xPSR */
             else if (sysm >= 5 && sysm <= 7) v = (sysm & 1) ? ipsr | (sysm == 7 ? apsr : 0) : 0;
             else if (sysm == 8 || sysm == 9) v = regs[13];          /* MSP (PSP non modélisé) */
-            else if (sysm == 16) v = emuTarget == TGT_META ? (uint32_t)primask : (uint32_t)!armIrqEnable;
+            else if (sysm == 16) v = T == TGT_META ? (uint32_t)primask : (uint32_t)!armIrqEnable;
             regs[(op2 >> 8) & 15] = v;
         } else if ((op & 0xfff0) == 0xf380 && (op2 & 0xff00) == 0x8800) { /* MSR spec, Rn */
             uint32_t sysm = op2 & 0xff, v = regs[op & 15];
             if (sysm <= 3) { fN = (int)(v >> 31); fZ = (int)(v >> 30) & 1; fC = (int)(v >> 29) & 1; fV = (int)(v >> 28) & 1; }
             else if (sysm == 8 || sysm == 9) regs[13] = v & ~3u;
             else if (sysm == 16) {
-                if (emuTarget == TGT_POKITTO) armIrqEnable = !(v & 1);
+                if (T == TGT_POKITTO) armIrqEnable = !(v & 1);
                 else { primask = (int)(v & 1); irq_work(); }
             }
         }
@@ -4527,15 +4553,25 @@ static void step(void) {
         regs[15] = pc + 6u; break; /* 32 bits non ARMv6-M : paire consommée */
     default: break; /* 0xb1, 0xb3, 0xb7-0xb9, 0xbb : non alloués */
     }
-    if (profOn) {
-        if (profOn < 0) {
-            profOn = getenv("EMU_PROF") != NULL;
-            if (profOn) { profFlash = calloc(FLASH_SIZE / 2, 4); profSram = calloc(SRAM_SIZE / 2, 4); }
-        }
-        if (profOn) prof_add(pc, cyc + flashWaits);
-    }
-    step_flush(cyc + flashWaits);
+    w += flashWaits - fw0;
+    if (D && profOn) prof_add(pc, cyc + w);
+    step_flush(T, cyc + w);
 }
+/* traces ou profil demandés (résolus une fois) : la boucle à instrumenter */
+static int step_debug_on(void) {
+    if (dbgStep < 0) dbgStep = getenv("TRACE_TAIL") || getenv("EMU_TRACE");
+    if (profOn < 0) {
+        profOn = getenv("EMU_PROF") != NULL;
+        if (profOn) { profFlash = calloc(FLASH_SIZE / 2, 4); profSram = calloc(SRAM_SIZE / 2, 4); }
+    }
+    return dbgStep || profOn;
+}
+#undef LD32
+#undef LD16
+#undef LD8
+#undef ST32
+#undef ST16
+#undef ST8
 #undef BRANCH
 
 /* --------------------------------------------------------- SDL + main */
@@ -4829,7 +4865,7 @@ static void reset_core(void) {
     primask = 0;
     nvic_reset();
     audio_rebase();
-    tickCount = 0; sysTickTrigger = 0; sysTickEntries = 0;
+    tickCount = 0; sysTickBase = 0; sysTickEntries = 0;
     evtAt = 0; irqWork = 1; /* échéance immédiate au premier pas */
     sysTickVector = dmacVector = tc4Vector = tc5Vector = 0;
     dmacInterrupt = tc4Interrupt = 0;
@@ -4858,7 +4894,7 @@ static void reset_core(void) {
     spiDmaCh = -1; spiBeatAcc = 0; spiBeatTicks = 20; spiBaud = 0;
     memset(dmacIntFlag, 0, sizeof dmacIntFlag);
     tc4Top = tc4Counter = 0; tc4Period = 907;
-    timerAcc = 0; timerBudget = 0;
+    timerFrom = timerDeadline = tickCount;
     tc4Fires = tc4Writes = 0;
     lcd_xStart = lcd_xEnd = lcd_yStart = lcd_yEnd = lcd_x = lcd_y = 0;
     lcd_argIndex = lcd_lastCommand = lcd_tmp = 0;
@@ -5345,14 +5381,28 @@ static void update_title_pct(void) {
  * comme sur le compteur (qui wrappe) du Cortex-M0+.  La forme
  * « tick < cible » non signée gelait l'émulateur pour de bon (lapinou,
  * frame ~7000, % du HUD wasm figé à 0). */
-/* « hot » : la boucle d'interprétation va en .text.hot, groupée et à
+/* « hot » : les boucles d'interprétation vont en .text.hot, groupées et à
  * l'abri des déplacements que provoque toute modification du code froid
- * (le même cœur variait de ±10 % selon son placement), et GCC y inline
- * step et ses accès mémoire plus volontiers.  NB : forcer always_inline
- * sur step coûtait 5-10 % (il perturbe l'inlining de ses appelés). */
+ * (le même cœur variait de ±10 % selon son placement).  Une boucle par
+ * cible, step_t y est forcé en ligne avec la cible constante : plus aucun
+ * test de emuTarget par instruction ni par accès mémoire (forcer l'inlining
+ * de l'ancien step, cible lue à l'exécution, coûtait au contraire 5-10 %). */
 __attribute__((noinline, hot))
+static void step_batch_meta(uint32_t target) {
+    while ((int32_t)(tickCount - target) < 0) step_t(TGT_META, 0);
+}
+__attribute__((noinline, hot))
+static void step_batch_pokitto(uint32_t target) {
+    while ((int32_t)(tickCount - target) < 0) step_t(TGT_POKITTO, 0);
+}
+__attribute__((noinline, cold))
+static void step_batch_debug(uint32_t target) {
+    while ((int32_t)(tickCount - target) < 0) step_t(emuTarget, 1);
+}
 static void step_batch(uint32_t target) {
-    while ((int32_t)(tickCount - target) < 0) step();
+    if (step_debug_on()) step_batch_debug(target);
+    else if (emuTarget == TGT_POKITTO) step_batch_pokitto(target);
+    else step_batch_meta(target);
 }
 
 static void run_emulated_frame(void) {
