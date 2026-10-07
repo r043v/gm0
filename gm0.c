@@ -3925,12 +3925,8 @@ static void sercom4_write(uint8_t v) {
 static uint32_t timerFrom;     /* tick jusqu'auquel les timers sont appliqués */
 static uint32_t timerDeadline; /* tick de leur prochain événement (= maintenant : à recalculer) */
 
-/* un TC n'est cadencé que s'il compte (activé, CC0 posé) — et TC5 seulement
- * armé, ou quand le canal DMA choisi par CHID est le sien (historique) */
-static int tc_live(int i) {
-    const struct tc *t = &tcs[i];
-    return t->enabled && t->top > 0 && (i == 0 || t->armed || dma_is_tc(dmac_chid, i));
-}
+/* un TC compte dès qu'il est activé, CC0 posé */
+static int tc_live(int i) { return tcs[i].enabled && tcs[i].top > 0; }
 
 static void timers_process(uint32_t n) {
     if (emuTarget == TGT_META) {
