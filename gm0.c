@@ -153,8 +153,10 @@ static uint32_t tc5CtrlA, tc5Top, tc5Counter, tc5Period;
 static uint32_t tc5Fires;
 static int      tc5Interrupt;
 
-/* ST7735 */
+/* écran émulé (RGB565, SCR_W x SCR_H) : un seul tampon pour les deux
+ * cibles — ST7735 META 160x128, ST7775 Pokitto 220x176 */
 static uint16_t pix[MAX_SCREEN_W * MAX_SCREEN_H];
+/* ST7735 */
 static int lcd_xStart, lcd_xEnd, lcd_yStart, lcd_yEnd, lcd_x, lcd_y;
 static uint32_t nvmAddr;         /* NVMCTRL ADDR (0x41004008) */
 static uint8_t nvmIntFlag = 1;   /* INTFLAG (0x41004014) : bit0 READY */
@@ -266,7 +268,6 @@ static void     pk_blx(uint32_t opcode);
 static void     pk_interrupt(uint32_t id);
 static void     pk_adc_frame(void);
 static void     pk_eeprom_save(void);
-static void     pk_card_export(void);
 static void     pk_btn_gpio(uint8_t mask, int pressed);
 static void     pk_sd_machine_reset(void);
 static void     pk_screen_reconfig(void);
@@ -1240,7 +1241,10 @@ static void fat_build_from_vfiles(void) {
 
 /* écriture CMD24 : répercute dans le fichier local si le secteur appartient
  * à un fichier du répertoire */
+static int sdDirty; /* carte écrite depuis le montage (--out-img) */
+static char outImgPath[512];
 static void sd_write_persist(uint32_t lba, const uint8_t *data) {
+    sdDirty = 1;
     for (int i = 0; i < fatFileCount; i++) {
         if (lba >= fatFiles[i].lba && (lba - fatFiles[i].lba) * 512 < fatFiles[i].bytes) {
             if (fatFiles[i].mem) {
@@ -1261,6 +1265,23 @@ static void sd_write_persist(uint32_t lba, const uint8_t *data) {
             return;
         }
     }
+}
+
+/* carte en fin de session (les deux cibles) : --out-img si elle a été
+ * écrite, FAT_DUMP_EXIT toujours */
+static void card_export(const char *path, int always) {
+#ifndef __EMSCRIPTEN__
+    uint8_t *card = sd_card_data();
+    size_t sz = sd_card_size();
+    if (!path || !path[0] || !card || !sz || (!always && !sdDirty)) return;
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(card, 1, sz, f);
+    fclose(f);
+    printf(TR("carte exportée : %s (%zu Kio)\n", "card exported: %s (%zu KiB)\n"), path, sz / 1024);
+#else
+    (void)path; (void)always;
+#endif
 }
 
 
@@ -1448,7 +1469,6 @@ static uint8_t pad_byte_24(uint8_t b) {
 static SDL_GameController *pad; /* définitions complètes dans la section SDL */
 static SDL_Joystick *joyFb;
 static char fwPath[1024];
-static char outImgPath[512];
 static uint32_t emu_nextFrameTick = 334860u; /* pas initial (frame_ticks suit
                                               * la cible) — la META ne passe
                                               * par aucun reset avant le
@@ -1563,11 +1583,8 @@ static uint32_t pk_sd_resetCounter;
  * streaming CMD18) coûtait plus que le reste de la machine SD réunie. */
 static uint8_t pk_sd_response[600];
 static int pk_sd_respHead, pk_sd_respLen;
-static int pk_sd_dirty; /* export via --out-img */
 static uint16_t pk_sd_crc[256];
 
-static uint8_t *pk_sd_card(void) { return sd_card_data(); }
-static size_t pk_sd_card_size(void) { return sd_card_size(); }
 
 static void pk_sd_resp(const uint8_t *b, int n) {
     for (int i = 0; i < n; i++) {
@@ -1586,13 +1603,13 @@ static void pk_sd_resp_pop(void) {
 
 static void pk_sd_read_sector(uint32_t lba) {
     uint8_t r[2 + 512 + 2]; /* token + données + CRC16 */
-    uint8_t *card = pk_sd_card();
+    uint8_t *card = sd_card_data();
     size_t base = (size_t)lba * 512;
     uint16_t crc = 0;
     r[0] = 0;
     r[1] = 0xFE; /* token de données */
     for (int i = 0; i < 512; i++) {
-        uint8_t b = (card && base + i < pk_sd_card_size()) ? card[base + i] : 0xFF;
+        uint8_t b = (card && base + i < sd_card_size()) ? card[base + i] : 0xFF;
         r[2 + i] = b;
         crc = (uint16_t)((crc << 8) ^ pk_sd_crc[((crc >> 8) ^ b) & 0xFF]);
     }
@@ -1643,12 +1660,6 @@ static void pk_sd_exec(uint32_t cmd, uint32_t arg) {
             { uint8_t r = 4; pk_sd_resp(&r, 1); }
             break;
     }
-}
-
-/* répercute une écriture CMD24 dans la carte montée (FAT d'un dossier ou
- * d'un zip : même persistance que la META) */
-static void pk_sd_sector_written(uint32_t lba, const uint8_t *data) {
-    sd_write_persist(lba, data);
 }
 
 static void pk_sd_write(uint32_t b32) {
@@ -1728,17 +1739,16 @@ static void pk_sd_write(uint32_t b32) {
             pk_spi_in(&pk_spi0, 0, 1);
             break;
         case 12: { /* données du secteur */
-            uint8_t *card = pk_sd_card();
-            if (card && pk_sd_writeAddress < pk_sd_card_size())
+            uint8_t *card = sd_card_data();
+            if (card && pk_sd_writeAddress < sd_card_size())
                 card[pk_sd_writeAddress] = b;
             pk_sd_writeAddress++;
             pk_sd_writeCount--;
             if (!pk_sd_writeCount) {
                 pk_sd_state++;
-                pk_sd_dirty = 1;
                 if (card)
-                    pk_sd_sector_written((pk_sd_writeAddress - 512) / 512,
-                                         card + (pk_sd_writeAddress - 512));
+                    sd_write_persist((pk_sd_writeAddress - 512) / 512,
+                                     card + (pk_sd_writeAddress - 512));
             }
             pk_spi_in(&pk_spi0, 0, 1);
             return;
@@ -1762,7 +1772,6 @@ static void pk_sd_machine_reset(void) {
 }
 
 /* --- écran 220x176 bit-bang GPIO (ST7775 de la référence) */
-static uint16_t pk_lcd[MAX_SCREEN_W * MAX_SCREEN_H];
 static int pk_lcdDirty = 1;
 static uint32_t pk_colStart, pk_colEnd = 175, pk_pageStart, pk_pageEnd = 219;
 static uint32_t pk_col, pk_page;
@@ -1793,7 +1802,7 @@ static void pk_lcd_cmd22(uint16_t d) {
     int cd = ce - cs, pd = pe - ps;
     int x = cs + (int)pk_col, y = ps + (int)pk_page;
     if (!(x < 0 || x >= 176 || y < 0 || y >= 220)) {
-        uint16_t *p = &pk_lcd[x * 220 + y];
+        uint16_t *p = &pix[x * 220 + y];
         if (*p != d) { *p = d; pk_lcdDirty = 1; }
     }
     if (!pk_lcdV) {
@@ -2714,7 +2723,7 @@ static void pk_reset_core(void) {
     pk_sd_enabled = 1;
 
     pk_lcd_reset();
-    memset(pk_lcd, 0, sizeof pk_lcd);
+    memset(pix, 0, sizeof pix);
     pk_lcdDirty = 1;
 
     /* audio */
@@ -2819,23 +2828,6 @@ static void pk_debug_dump(void) {
                 pk_ct[n].r[0], armIrqEnable);
     fprintf(stderr, "SysTick CSR=%x RVR=%u CVR=%u\n", pk_systickCSR, pk_systickRVR, pk_systickCVR);
 }
-
-/* export de la carte SD modifiée (--out-img) */
-static void pk_card_export(void) {
-#ifndef __EMSCRIPTEN__
-    if (!outImgPath[0] || !pk_sd_dirty) return;
-    uint8_t *card = pk_sd_card();
-    size_t sz = pk_sd_card_size();
-    if (!card || !sz) return;
-    FILE *f = fopen(outImgPath, "wb");
-    if (!f) return;
-    fwrite(card, 1, sz, f);
-    fclose(f);
-    printf(TR("carte exportée : %s (%zu Kio)\n", "card exported: %s (%zu KiB)\n"), outImgPath, sz / 1024);
-#endif
-}
-
-
 
 static long stWrites = 0, ramwrTotal = 0;
 /* le panneau META est câblé BGR ; une init qui déclare MADCTL.BGR=1
@@ -4594,7 +4586,7 @@ static const uint32_t dmgShade[4] = { /* ARGB, de la plus sombre à la plus clai
 static void scale_apply(void);
 
 static void blit(SDL_Renderer *ren) {
-    const uint16_t *src = emuTarget == TGT_POKITTO ? pk_lcd : pix;
+    const uint16_t *src = pix;
     if (!dispFilter) {
         for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
             uint16_t p = src[i];
@@ -4836,7 +4828,7 @@ static void sd_unload(void) {
     sd_reset_state();
     sd_initialized = 0;
     pk_sd_machine_reset();
-    pk_sd_dirty = 0;
+    sdDirty = 0;
 }
 
 /* réinitialise la machine en conservant la carte SD montée
@@ -4952,29 +4944,23 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
     fwData = malloc(len ? len : 1);
     memcpy(fwData, data, len);
     fwLen = len;
-    if (emuTarget == TGT_POKITTO) {
-        memset(flash, 0x00, FLASH_SIZE); /* la référence ne remplit pas */
-        size_t n = plen < FLASH_SIZE ? plen : FLASH_SIZE;
-        if (n == 0) { fprintf(stderr, TR("firmware vide\n", "empty firmware\n")); return; }
-        memcpy(flash, payload, n);
-        snprintf(fwPath, sizeof(fwPath), "%s", display);
-        const char *b = strrchr(fwPath, '/');
-        fwName = b ? b + 1 : fwPath;
-        fwLoaded = 1;
-        pk_reset_core(); /* vecteurs lisibles ici */
-        pk_eeprom_load();
-        printf(TR("firmware Pokitto : %s (%zu Ko)\n", "Pokitto firmware: %s (%zu KB)\n"), display, len / 1024);
-        return;
-    }
-    memset(flash, 0xff, FLASH_SIZE); /* comme le TS : flash remplie de 0xff */
-    size_t n = plen < (FLASH_SIZE - 0x4000) ? plen : (FLASH_SIZE - 0x4000);
+    /* Pokitto : flash à 0 dès l'adresse 0 (comme la référence) ; META :
+     * 0xff, application derrière le bootloader de 16 Ko (comme le TS) */
+    int pk = emuTarget == TGT_POKITTO;
+    uint32_t base = pk ? 0 : 0x4000u;
+    size_t n = plen < FLASH_SIZE - base ? plen : FLASH_SIZE - base;
     if (n == 0) { fprintf(stderr, TR("firmware vide\n", "empty firmware\n")); return; }
-    memcpy(flash + 0x4000, payload, n);
+    memset(flash, pk ? 0x00 : 0xff, FLASH_SIZE);
+    memcpy(flash + base, payload, n);
     snprintf(fwPath, sizeof(fwPath), "%s", display);
     const char *b = strrchr(fwPath, '/');
     fwName = b ? b + 1 : fwPath;
     fwLoaded = 1;
-    printf(TR("firmware : %s (%zu Ko)\n", "firmware: %s (%zu KB)\n"), display, len / 1024);
+    if (pk) {
+        pk_reset_core(); /* vecteurs lisibles ici */
+        pk_eeprom_load();
+    }
+    printf(TR("firmware %s : %s (%zu Ko)\n", "%s firmware: %s (%zu KB)\n"), pk ? "Pokitto" : "META", display, len / 1024);
 }
 
 /* F5 : redémarre le firmware courant (la Pokitto garde sa carte et son
@@ -5429,11 +5415,27 @@ static void frame_end(void) {
     update_title_pct();
 }
 
+/* EMU_TRACE : empreinte d'écran toutes les 60 frames, plus l'état du bus
+ * SPI/LCD META (derniers octets, écritures RAMWR, fenêtre) */
+static void trace_frame(uint32_t frame) {
+    static uint32_t lastPrint;
+    if (frame - lastPrint < 60) return;
+    lastPrint = frame;
+    uint32_t h = 0x811c9dc5, nz = 0;
+    for (unsigned i = 0; i < SCR_W * SCR_H; i++) h = (h ^ pix[i]) * 0x01000193u;
+    for (unsigned q = 0; q < SCR_W * SCR_H; q += 7) if (pix[q]) nz++;
+    fprintf(stderr, "  derniers octets SPI: %02x %02x %02x %02x %02x %02x %02x %02x (nz=%ld/%ld)\n",
+            serLast[0], serLast[1], serLast[2], serLast[3],
+            serLast[4], serLast[5], serLast[6], serLast[7], serNz, stWrites);
+    fprintf(stderr, "[frame %u] hash=%08x nz=%u stWr=%ld ramwr=%ld x=%u y=%u cmd=%02x\n",
+            frame, h, nz, stWrites, ramwrTotal, lcd_x, lcd_y, lcd_lastCommand);
+}
+
 /* capture de l'écran courant en PPM (--shot, node headless) */
 static void screen_write_ppm(const char *path) {
     FILE *f = fopen(path, "wb");
     if (!f) return;
-    const uint16_t *src = emuTarget == TGT_POKITTO ? pk_lcd : pix;
+    const uint16_t *src = pix;
     fprintf(f, "P6\n%u %u\n255\n", SCR_W, SCR_H);
     for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
         uint16_t c = src[i];
@@ -5591,29 +5593,7 @@ int main(int argc, char **argv) {
         frame_end();
 
         blit(emuRen);
-        if (trace) { /* empreinte d'écran périodique */
-            static uint32_t lastPrint = 0;
-            if (frame - lastPrint >= 60) {
-                lastPrint = frame;
-                const uint16_t *srcp = emuTarget == TGT_POKITTO ? pk_lcd : pix;
-                uint32_t h = 0x811c9dc5;
-                int distinct = 0;
-                uint16_t seen[16] = {0};
-                for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
-                    h = (h ^ srcp[i]) * 0x01000193u;
-                    int k = 0;
-                    for (; k < 16; k++) if (seen[k] == srcp[i]) break;
-                    if (k == 16) distinct++;
-                }
-                uint32_t nz = 0;
-                for (unsigned q = 0; q < SCR_W * SCR_H; q += 7) if (srcp[q]) nz++;
-                            fprintf(stderr, "  derniers octets SPI: %02x %02x %02x %02x %02x %02x %02x %02x (nz=%ld/%ld)\n",
-                        serLast[0], serLast[1], serLast[2], serLast[3],
-                        serLast[4], serLast[5], serLast[6], serLast[7], serNz, stWrites);
-                fprintf(stderr, "[frame %u] hash=%08x distinct<=%d nz=%u stWr=%ld ramwr=%ld x=%u y=%u cmd=%02x\n",
-                        frame, h, distinct, nz, stWrites, ramwrTotal, lcd_x, lcd_y, lcd_lastCommand);
-            }
-        }
+        if (trace) trace_frame(frame);
         /* temps réel : une frame = 1/59,7 s, jamais plus vite.  Échéance
          * sans dette : en retard de plus de 4 frames (stall, drag de
          * fenêtre, drop), on repart de maintenant au lieu de rattraper. */
@@ -5641,16 +5621,12 @@ int main(int argc, char **argv) {
     prof_write();
     pk_debug_dump();
     pk_eeprom_save();
-    pk_card_export();
+    card_export(outImgPath, 0);
+    card_export(getenv("FAT_DUMP_EXIT"), 1);
     { const char *fd = getenv("FLASH_DUMP"); /* flash après auto-patch du jeu */
       if (fd && emuTarget == TGT_META) {
         FILE *g = fopen(fd, "wb");
         if (g) { fwrite(flash, 1, FLASH_SIZE, g); fclose(g); }
-      } }
-    { const char *fd = getenv("FAT_DUMP_EXIT"); /* carte SD après la session */
-      if (fd && sd_card_data()) {
-        FILE *g = fopen(fd, "wb");
-        if (g) { fwrite(sd_card_data(), 1, sd_card_size(), g); fclose(g); }
       } }
     if (rawWallMsTotal > 0.0) /* vitesse brute du run, hors attente de pacing */
         fprintf(stderr, TR("[bench] frames=%u wall=%.2fs emu=%.2fs brut=%.0f%% (%.0f MHz effectifs)\n", "[bench] frames=%u wall=%.2fs emu=%.2fs raw=%.0f%% (%.0f MHz effective)\n"),
