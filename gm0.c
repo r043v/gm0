@@ -3563,7 +3563,7 @@ static uint8_t fetchByte(uint32_t a) {
 }
 
 /* montre générique d'écriture (WATCH_ADDR), pour le débogage */
-static uint32_t prevInstPc;  /* PC à l'entrée du pas courant (la boucle le tient à jour) */
+static uint32_t lastExecPc;  /* PC de l'instruction en cours (du pas précédent, entre deux pas) */
 /* programmation flash (auto-patch des loaders) : la valeur écrite est
  * stockée en flash (le tampon de page et sa commande WP sont confondus) et
  * le code fraîchement écrit est exécuté aux pas suivants.  L'alias
@@ -3582,7 +3582,7 @@ static void flash_store(uint32_t a, uint32_t v, int bytes) {
     if (nvmDbg < 0) nvmDbg = getenv("NVM_DEBUG") ? 1 : 0;
     if (nvmDbg) {
         static int n; if (n < 300) fprintf(stderr, "[nvm] tick=%u pc=%x flash[%x] <- %0*x (%d o)\n",
-                                          tickCount, prevInstPc, a, bytes * 2,
+                                          tickCount, lastExecPc, a, bytes * 2,
                                           v & ((1u << (bytes * 8)) - 1), bytes);
         n++;
     }
@@ -4187,7 +4187,6 @@ static ALWAYS_INLINE void ldm_t(const int T, uint32_t a, uint32_t list, uint32_t
     for (; list; list &= list - 1, a += 4) regs[__builtin_ctz(list)] = ld_t(T, a, 4, w);
 }
 
-static uint32_t lastExecPc;  /* PC de l'instruction exécutée au pas précédent */
 
 /* TRACE_TAIL=<n> : tampon circulaire des n dernières lignes de trace ;
  * déversé quand un PC fou est détecté (le tick du crash varie selon les
@@ -4307,10 +4306,14 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
 #define ST32(a, v) st_t(T, (a), (v), 4)
 #define ST16(a, v) st_t(T, (a), (v), 2)
 #define ST8(a, v)  st_t(T, (a), (v), 1)
-    if (stepTicks) step_flush(T, 0); /* ticks d'une injection hors pas */
-    if ((int32_t)(tickCount - evtAt) >= 0) { /* échéance machine */
-        if (T == TGT_POKITTO) pk_machine_step();
-        else { nvic_service(); evtAt = irqWork ? tickCount : tickCount + 0x40000000u; }
+    /* un seul branchement, rarement pris : ticks d'une injection hors pas,
+     * échéance machine */
+    if (__builtin_expect((stepTicks != 0) | ((int32_t)(tickCount - evtAt) >= 0), 0)) {
+        if (stepTicks) step_flush(T, 0);
+        if ((int32_t)(tickCount - evtAt) >= 0) {
+            if (T == TGT_POKITTO) pk_machine_step();
+            else { nvic_service(); evtAt = irqWork ? tickCount : tickCount + 0x40000000u; }
+        }
     }
     while (regs[15] >= 0xfffffff2u) exc_return(); /* EXC_RETURN atteint */
 
