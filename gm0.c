@@ -936,15 +936,19 @@ static void fat_write_dir_data(uint32_t first, FatEnt *entries, int n, uint32_t 
 }
 
 /* place le contenu du répertoire ; renvoie les entrées allouées */
-static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
-                     FatEnt **outEntries, int *outN) {
+/* Une carte se construit depuis un dossier (natif) ou depuis des fichiers
+ * virtuels (navigateur : drop, zip) : seules la liste des entrées et la
+ * source des données diffèrent, le placement est commun (fat_walk). */
+#define FAT_MAX_ENTRIES 200
+
+/* entrées d'un dossier local */
+static int fat_list_dir(const char *dir, FatEnt *ents) {
     DIR *d = opendir(dir);
-    if (!d) { *outEntries = NULL; *outN = 0; return; }
+    if (!d) return 0;
     struct dirent *e;
     char used[256][13]; int nUsed = 0; /* 8.3 avec point : 12 caractères + NUL */
-    FatEnt *ents = calloc(256, sizeof(FatEnt));
     int n = 0;
-    while ((e = readdir(d)) && n < 200) {
+    while ((e = readdir(d)) && n < FAT_MAX_ENTRIES) {
         if (e->d_name[0] == '.') continue;
         char full[1024];
         snprintf(full, sizeof(full), "%s/%s", dir, e->d_name);
@@ -957,48 +961,99 @@ static void fat_walk(const char *dir, uint32_t parentFirst, int isRoot,
         n++;
     }
     closedir(d);
-    /* alloue dossiers puis fichiers ; écrit les données */
-    for (int i = 0; i < n; i++) {
-        if (ents[i].isDir) {
-            ents[i].first = fat_alloc_dir_data();
-        } else {
-            int clusters = (int)((ents[i].size + fatSpc * FAT_SECTOR - 1) / (fatSpc * FAT_SECTOR));
-            if (clusters == 0) clusters = 1;
-            ents[i].first = fat_alloc(clusters);
-            uint32_t flba = fat_data_lba(ents[i].first);
-            size_t fwant = (size_t)clusters * fatSpc * FAT_SECTOR;
-            if (flba * FAT_SECTOR + fwant > fatImageSize) {
-                /* le fichier ne tient pas sur la carte : sauté (la garde
-                 * de fat_alloc borne la table, celle-ci borne les données) */
-                fprintf(stderr, TR("carte SD : %s hors capacité, ignoré\n", "SD card: %s over capacity, ignored\n"), ents[i].path);
-                continue;
-            }
-            FILE *g = fopen(ents[i].path, "rb");
-            if (g) {
-                uint8_t *data = malloc(fwant);
-                memset(data, 0, fwant);
-                size_t got = fread(data, 1, ents[i].size, g);
-                (void)got;
-                memcpy(fatImage + flba * FAT_SECTOR, data, fwant);
-                free(data);
-                fclose(g);
-                if (fatFileCount < 512) {
-                    fatFiles[fatFileCount].lba = fat_data_lba(ents[i].first);
-                    fatFiles[fatFileCount].bytes = ents[i].size;
-                    snprintf(fatFiles[fatFileCount].path, sizeof(fatFiles[fatFileCount].path), "%s", ents[i].path);
-                    fatFileCount++;
-                }
-            }
+    return n;
+}
+
+/* entrées virtuelles sous `prefix` (fichiers d'abord, puis dossiers) */
+static int fat_list_vfiles(const char *prefix, FatEnt *ents) {
+    int prefixLen = (int)strlen(prefix);
+    char used[256][13]; int nUsed = 0;
+    int n = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < nvfiles && n < FAT_MAX_ENTRIES; i++) {
+            const char *p = vfiles[i].path;
+            if (strncmp(p, prefix, prefixLen) != 0) continue;
+            const char *rest = p + prefixLen;
+            if (!*rest) continue;
+            const char *slash = strchr(rest, '/');
+            int isDir = slash != NULL;
+            if ((pass == 0) != (!isDir)) continue;
+            int nameLen = isDir ? (int)(slash - rest) : (int)strlen(rest);
+            char name[1024];
+            memcpy(name, rest, nameLen); name[nameLen] = 0;
+            /* dossier déjà vu (plusieurs fichiers dedans) */
+            int seen = 0;
+            for (int j = 0; j < n; j++)
+                if ((int)strlen(ents[j].path) == prefixLen + nameLen &&
+                    strncmp(ents[j].path, p, prefixLen + nameLen) == 0) { seen = 1; break; }
+            if (seen) continue;
+            to83(name, used, nUsed++, ents[n].name83);
+            ents[n].isDir = isDir;
+            ents[n].size = isDir ? 0 : (uint32_t)vfiles[i].size;
+            snprintf(ents[n].path, sizeof(ents[n].path), "%.*s", prefixLen + nameLen, p);
+            n++;
         }
     }
-    /* place les sous-dossiers (récursif) */
+    return n;
+}
+
+/* données d'un fichier dans `dst` (déjà mis à zéro) ; renvoie le tampon
+ * mémoire du fichier virtuel (persistance navigateur), NULL en natif */
+static uint8_t *fat_fill(const FatEnt *e, int vfs, uint8_t *dst) {
+    if (vfs) {
+        for (int j = 0; j < nvfiles; j++)
+            if (strcmp(vfiles[j].path, e->path) == 0) {
+                memcpy(dst, vfiles[j].data, vfiles[j].size);
+                return vfiles[j].data;
+            }
+        return NULL;
+    }
+    FILE *g = fopen(e->path, "rb");
+    if (g) { size_t got = fread(dst, 1, e->size, g); (void)got; fclose(g); }
+    return NULL;
+}
+
+/* place les entrées de `where` (dossier local, ou préfixe virtuel) :
+ * clusters des dossiers puis des fichiers, données, puis sous-dossiers */
+static void fat_walk(const char *where, int vfs, uint32_t parentFirst, int isRoot,
+                     FatEnt **outEntries, int *outN) {
+    FatEnt *ents = calloc(256, sizeof(FatEnt));
+    int n = vfs ? fat_list_vfiles(where, ents) : fat_list_dir(where, ents);
     for (int i = 0; i < n; i++) {
-        if (ents[i].isDir) {
-            FatEnt *sub = NULL; int nSub = 0;
-            fat_walk(ents[i].path, ents[i].first, 0, &sub, &nSub);
-            fat_write_dir_data(ents[i].first, sub, nSub, ents[i].first, isRoot ? 0 : parentFirst, isRoot);
-            free(sub);
+        if (ents[i].isDir) { ents[i].first = fat_alloc_dir_data(); continue; }
+        int clusters = (int)((ents[i].size + fatSpc * FAT_SECTOR - 1) / (fatSpc * FAT_SECTOR));
+        if (clusters == 0) clusters = 1;
+        ents[i].first = fat_alloc(clusters);
+        uint32_t flba = fat_data_lba(ents[i].first);
+        size_t fwant = (size_t)clusters * fatSpc * FAT_SECTOR;
+        if (flba * FAT_SECTOR + fwant > fatImageSize) {
+            /* ne tient pas sur la carte : sauté (la garde de fat_alloc
+             * borne la table, celle-ci borne les données) */
+            fprintf(stderr, TR("carte SD : %s hors capacité, ignoré\n", "SD card: %s over capacity, ignored\n"), ents[i].path);
+            continue;
         }
+        uint8_t *dst = fatImage + flba * FAT_SECTOR;
+        memset(dst, 0, fwant);
+        uint8_t *mem = fat_fill(&ents[i], vfs, dst);
+        if (fatFileCount < 512) { /* réécriture des secteurs modifiés (sd_write_persist) */
+            fatFiles[fatFileCount].lba = flba;
+            fatFiles[fatFileCount].bytes = ents[i].size;
+            fatFiles[fatFileCount].mem = mem;
+            /* chemin aussi pour les fichiers virtuels : c'est la clé de
+             * sauvegarde navigateur (vide, tous les fichiers partageaient
+             * une seule clé et rien n'était jamais restauré) */
+            snprintf(fatFiles[fatFileCount].path, sizeof(fatFiles[fatFileCount].path), "%s", ents[i].path);
+            fatFileCount++;
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (!ents[i].isDir) continue;
+        FatEnt *sub = NULL; int nSub = 0;
+        char subWhere[1040];
+        snprintf(subWhere, sizeof(subWhere), vfs ? "%s/" : "%s", ents[i].path);
+        fat_walk(subWhere, vfs, ents[i].first, 0, &sub, &nSub);
+        fat_write_dir_data(ents[i].first, sub, nSub, ents[i].first, isRoot ? 0 : parentFirst, isRoot);
+        free(sub);
     }
     *outEntries = ents; *outN = n;
 }
@@ -1167,82 +1222,8 @@ static void fat_build_from_dir(const char *dir) {
     (void)fat_probe_dir;
     fat_bootstrap_for(64u * 1024 * 1024, 16);
     rootEnts = NULL; rootN = 0;
-    fat_walk(dir, 0, 1, &rootEnts, &rootN);
+    fat_walk(dir, 0, 0, 1, &rootEnts, &rootN);
     fat_finish(dir);
-}
-
-/* ---- construction depuis les fichiers virtuels (navigateur) ---- */
-
-static void fat_walk_vfiles(const char *prefix, uint32_t parentFirst, int isRoot,
-                            FatEnt **outEntries, int *outN) {
-    int prefixLen = (int)strlen(prefix);
-    char used[256][13]; int nUsed = 0; /* 8.3 avec point : 12 caractères + NUL */
-    FatEnt *ents = calloc(256, sizeof(FatEnt));
-    int n = 0;
-    /* premier niveau : fichiers du préfixe sans '/', puis dossiers */
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < nvfiles && n < 200; i++) {
-            const char *p = vfiles[i].path;
-            if (strncmp(p, prefix, prefixLen) != 0) continue;
-            const char *rest = p + prefixLen;
-            if (!*rest) continue;
-            const char *slash = strchr(rest, '/');
-            int isDir = slash != NULL;
-            if ((pass == 0) != (!isDir)) continue;
-            int nameLen = isDir ? (int)(slash - rest) : (int)strlen(rest);
-            char name[1024];
-            memcpy(name, rest, nameLen); name[nameLen] = 0;
-            /* doublon déjà vu (plusieurs fichiers dans le même dossier) */
-            int seen = 0;
-            for (int j = 0; j < n; j++)
-                if ((int)strlen(ents[j].path) == prefixLen + nameLen &&
-                    strncmp(ents[j].path, p, prefixLen + nameLen) == 0) { seen = 1; break; }
-            if (seen) continue;
-            to83(name, used, nUsed++, ents[n].name83);
-            ents[n].isDir = isDir;
-            ents[n].size = isDir ? 0 : (uint32_t)vfiles[i].size;
-            snprintf(ents[n].path, sizeof(ents[n].path), "%.*s", prefixLen + nameLen, p);
-            n++;
-        }
-    }
-    /* alloue dossiers puis fichiers ; écrit les données */
-    for (int i = 0; i < n; i++) {
-        if (ents[i].isDir) {
-            ents[i].first = fat_alloc_dir_data();
-        } else {
-            int clusters = (int)((ents[i].size + fatSpc * FAT_SECTOR - 1) / (fatSpc * FAT_SECTOR));
-            if (clusters == 0) clusters = 1;
-            ents[i].first = fat_alloc(clusters);
-            /* retrouve les données du vfile */
-            for (int j = 0; j < nvfiles; j++) {
-                if (strcmp(vfiles[j].path, ents[i].path) == 0) {
-                    uint8_t *dst = fatImage + fat_data_lba(ents[i].first) * FAT_SECTOR;
-                    memset(dst, 0, (size_t)clusters * fatSpc * FAT_SECTOR);
-                    memcpy(dst, vfiles[j].data, vfiles[j].size);
-                    if (fatFileCount < 512) {
-                        fatFiles[fatFileCount].lba = fat_data_lba(ents[i].first);
-                        fatFiles[fatFileCount].bytes = ents[i].size;
-                        fatFiles[fatFileCount].mem = vfiles[j].data;
-                        fatFiles[fatFileCount].path[0] = 0;
-                        fatFileCount++;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    /* sous-dossiers (récursif) */
-    for (int i = 0; i < n; i++) {
-        if (ents[i].isDir) {
-            FatEnt *sub = NULL; int nSub = 0;
-            char subPrefix[1024];
-            snprintf(subPrefix, sizeof(subPrefix), "%s/", ents[i].path);
-            fat_walk_vfiles(subPrefix, ents[i].first, 0, &sub, &nSub);
-            fat_write_dir_data(ents[i].first, sub, nSub, ents[i].first, isRoot ? 0 : parentFirst, isRoot);
-            free(sub);
-        }
-    }
-    *outEntries = ents; *outN = n;
 }
 
 static void fat_build_from_vfiles(void) {
@@ -1253,7 +1234,7 @@ static void fat_build_from_vfiles(void) {
     if (total < 4u * 1024 * 1024) total = 4u * 1024 * 1024; /* plancher 4 Mo */
     fat_bootstrap_for(total, vfile_dir_count());
     rootEnts = NULL; rootN = 0;
-    fat_walk_vfiles("", 0, 1, &rootEnts, &rootN);
+    fat_walk("", 1, 0, 1, &rootEnts, &rootN);
     fat_finish("fichiers déposés");
 }
 
@@ -3889,8 +3870,10 @@ static void writeHalf(uint32_t a, uint16_t v) {
     if (a == 0x4200340du) { tc_inten(1, v); return; }
     if (a == 0x4200340eu) { tc5IntFlagMask &= (uint8_t)~v; return; }
     if (a == 0x40000c02u) { if (dbg() && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v); dbgTc4Cfg++; } return; }
-    if (a == 0x40000c04u) { fprintf(stderr, "[gclk] GENDIV <- %x\n", v); return; }
-    if (a == 0x40000c08u) { fprintf(stderr, "[gclk] GENCTRL <- %x\n", v); return; }
+    if (a == 0x40000c04u || a == 0x40000c08u) { /* GENDIV/GENCTRL : sans effet */
+        if (dbg()) fprintf(stderr, "[gclk] %s <- %x\n", a == 0x40000c04u ? "GENDIV" : "GENCTRL", v);
+        return;
+    }
     if ((a & ~0x1fu) == 0x41004400u) { port_write(0, a & 0x1f, v); return; }
     if ((a & ~0x1fu) == 0x41004480u) { port_write(1, a & 0x1f, v); return; }
     writeWord(a, v);
@@ -4714,35 +4697,33 @@ static void audio_cb(void *ud, Uint8 *stream, int len) {
 static uint32_t homeHeld;
 static unsigned machineEpoch; /* incrémenté quand un drop réinitialise la machine */
 
+/* clavier : une table par cible (dispositions différentes : « a » est la
+ * gauche du ZQSD/WASD META mais le bouton A de la référence Pokitto) ;
+ * Espace = A, Ctrl = B, Entrée = C/menu sur les deux */
+struct keymap { SDL_Keycode sym; uint8_t mask; };
+static const struct keymap keysMeta[] = {
+    { SDLK_DOWN, BTN_DOWN }, { SDLK_s, BTN_DOWN },
+    { SDLK_LEFT, BTN_LEFT }, { SDLK_q, BTN_LEFT }, { SDLK_a, BTN_LEFT },
+    { SDLK_RIGHT, BTN_RIGHT }, { SDLK_d, BTN_RIGHT },
+    { SDLK_UP, BTN_UP }, { SDLK_z, BTN_UP }, { SDLK_w, BTN_UP },
+    { SDLK_j, BTN_A }, { SDLK_SPACE, BTN_A },
+    { SDLK_k, BTN_B }, { SDLK_LCTRL, BTN_B }, { SDLK_RCTRL, BTN_B },
+    { SDLK_u, BTN_MENU }, { SDLK_RETURN, BTN_MENU }, { SDLK_KP_ENTER, BTN_MENU },
+    { SDLK_i, BTN_HOME }, { SDLK_ASTERISK, BTN_HOME }, { SDLK_KP_MULTIPLY, BTN_HOME },
+};
+static const struct keymap keysPokitto[] = { /* A/B/C/D de la référence C++ */
+    { SDLK_UP, BTN_UP }, { SDLK_i, BTN_UP }, { SDLK_DOWN, BTN_DOWN }, { SDLK_k, BTN_DOWN },
+    { SDLK_LEFT, BTN_LEFT }, { SDLK_j, BTN_LEFT }, { SDLK_RIGHT, BTN_RIGHT }, { SDLK_l, BTN_RIGHT },
+    { SDLK_a, BTN_A }, { SDLK_SPACE, BTN_A },
+    { SDLK_s, BTN_B }, { SDLK_b, BTN_B }, { SDLK_LCTRL, BTN_B }, { SDLK_RCTRL, BTN_B },
+    { SDLK_d, BTN_MENU }, { SDLK_c, BTN_MENU }, { SDLK_RETURN, BTN_MENU }, { SDLK_KP_ENTER, BTN_MENU },
+    { SDLK_f, BTN_HOME },                                  /* D (éclairage) */
+};
 static uint8_t key_bit(SDL_Keycode sym) {
-    if (emuTarget == TGT_POKITTO) { /* A/B/C/D de la référence C++ */
-        switch (sym) {
-            case SDLK_UP: case SDLK_i: return BTN_UP;
-            case SDLK_DOWN: case SDLK_k: return BTN_DOWN;
-            case SDLK_LEFT: case SDLK_j: return BTN_LEFT;
-            case SDLK_RIGHT: case SDLK_l: return BTN_RIGHT;
-            case SDLK_a: return BTN_A;
-            case SDLK_s: case SDLK_b: return BTN_B;
-            case SDLK_d: case SDLK_c: return BTN_MENU;         /* C */
-            case SDLK_f: return BTN_HOME;                      /* D (éclairage) */
-            /* comme sur META : Espace=A, Ctrl=B, Entrée=C (menu) */
-            case SDLK_SPACE: return BTN_A;
-            case SDLK_LCTRL: case SDLK_RCTRL: return BTN_B;
-            case SDLK_RETURN: case SDLK_KP_ENTER: return BTN_MENU;
-            default: return 0;
-        }
-    }
-    switch (sym) {
-        case SDLK_DOWN: case SDLK_s: return BTN_DOWN;
-        case SDLK_LEFT: case SDLK_q: case SDLK_a: return BTN_LEFT;
-        case SDLK_RIGHT: case SDLK_d: return BTN_RIGHT;
-        case SDLK_UP: case SDLK_z: case SDLK_w: return BTN_UP;
-        case SDLK_j: case SDLK_SPACE: return BTN_A;            /* espace = A */
-        case SDLK_k: case SDLK_LCTRL: case SDLK_RCTRL: return BTN_B; /* ctrl = B */
-        case SDLK_u: case SDLK_RETURN: case SDLK_KP_ENTER: return BTN_MENU; /* entrée = start/menu */
-        case SDLK_i: case SDLK_ASTERISK: case SDLK_KP_MULTIPLY: return BTN_HOME; /* * = select/home */
-        default: return 0;
-    }
+    const struct keymap *m = emuTarget == TGT_POKITTO ? keysPokitto : keysMeta;
+    size_t n = emuTarget == TGT_POKITTO ? sizeof keysPokitto / sizeof *m : sizeof keysMeta / sizeof *m;
+    for (size_t i = 0; i < n; i++) if (m[i].sym == sym) return m[i].mask;
+    return 0;
 }
 
 static void btn_press(uint8_t mask) {
@@ -4761,29 +4742,15 @@ static void btn_release(uint8_t mask) {
 }
 
 /* manette (SDL_GameController) */
+/* manette : même disposition pour les deux cibles (X/Y = C/D de la
+ * Pokitto, sans effet de plus sur la META que Start/Back) */
 static uint8_t pad_button_mask(uint8_t b) {
-    if (emuTarget == TGT_POKITTO) {
-        switch (b) {
-            case SDL_CONTROLLER_BUTTON_A: return BTN_A;
-            case SDL_CONTROLLER_BUTTON_B: return BTN_B;
-            case SDL_CONTROLLER_BUTTON_X: return BTN_MENU;      /* C */
-            case SDL_CONTROLLER_BUTTON_Y: return BTN_HOME;      /* D */
-            case SDL_CONTROLLER_BUTTON_START: return BTN_MENU;
-            case SDL_CONTROLLER_BUTTON_BACK: return BTN_HOME;
-            /* croix directionnelle, comme sur META (les boutons du pad
-             * pokitto sont des GPIO, via pk_btn_gpio) */
-            case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return BTN_DOWN;
-            case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return BTN_LEFT;
-            case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return BTN_RIGHT;
-            case SDL_CONTROLLER_BUTTON_DPAD_UP: return BTN_UP;
-            default: return 0;
-        }
-    }
     switch (b) {
         case SDL_CONTROLLER_BUTTON_A: return BTN_A;
         case SDL_CONTROLLER_BUTTON_B: return BTN_B;
-        case SDL_CONTROLLER_BUTTON_START: return BTN_MENU;
-        case SDL_CONTROLLER_BUTTON_BACK: case SDL_CONTROLLER_BUTTON_GUIDE: return BTN_HOME;
+        case SDL_CONTROLLER_BUTTON_X: case SDL_CONTROLLER_BUTTON_START: return BTN_MENU;
+        case SDL_CONTROLLER_BUTTON_Y: case SDL_CONTROLLER_BUTTON_BACK:
+        case SDL_CONTROLLER_BUTTON_GUIDE: return BTN_HOME;
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return BTN_DOWN;
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return BTN_LEFT;
         case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return BTN_RIGHT;
@@ -4810,8 +4777,8 @@ static uint8_t joy_button_mask(uint8_t b) {
     switch (b) {
         case 0: return BTN_A;
         case 1: return BTN_B;
-        case 2: return emuTarget == TGT_POKITTO ? BTN_MENU : BTN_MENU;  /* C / MENU */
-        case 3: return BTN_HOME;                                        /* D / HOME */
+        case 2: return BTN_MENU; /* C / MENU */
+        case 3: return BTN_HOME; /* D / HOME */
         default: return 0;
     }
 }
@@ -5431,6 +5398,52 @@ static void run_emulated_frame(void) {
     audio_frame();
 }
 
+/* ---- boucle principale : morceaux communs aux boucles natif et wasm ---- */
+
+/* un drop/changement de jeu a réinitialisé la machine : resynchronise le
+ * pas de frame et le chronométrage du titre */
+static void frame_epoch_sync(void) {
+    static unsigned seen;
+    if (machineEpoch == seen) return;
+    seen = machineEpoch;
+    emu_nextFrameTick = tickCount + frame_ticks();
+    titleTick = tickCount;
+    titleMs = SDL_GetTicks();
+}
+
+/* n frames émulées ; la perf brute (titre « brut N % », ligne [bench])
+ * compte le temps émulé produit par le temps mural passé à émuler */
+static void emulate_frames(int n) {
+    if (!fwLoaded || n <= 0) return;
+    uint64_t t0 = SDL_GetPerformanceCounter();
+    for (int i = 0; i < n; i++) run_emulated_frame();
+    double emu = (double)n * frame_ticks() * 1000.0 / ticks_per_sec();
+    double wall = (double)(SDL_GetPerformanceCounter() - t0) * 1000.0 / (double)SDL_GetPerformanceFrequency();
+    rawEmuMs += emu; rawWallMs += wall;
+    rawEmuMsTotal += emu; rawWallMsTotal += wall;
+}
+
+/* fin de frame : stick analogique Pokitto, % de vitesse */
+static void frame_end(void) {
+    if (emuTarget == TGT_POKITTO) pk_adc_frame();
+    update_title_pct();
+}
+
+/* capture de l'écran courant en PPM (--shot, node headless) */
+static void screen_write_ppm(const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    const uint16_t *src = emuTarget == TGT_POKITTO ? pk_lcd : pix;
+    fprintf(f, "P6\n%u %u\n255\n", SCR_W, SCR_H);
+    for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
+        uint16_t c = src[i];
+        uint8_t rgb[3] = { (uint8_t)(((c >> 11) & 0x1f) << 3), (uint8_t)(((c >> 5) & 0x3f) << 2),
+                           (uint8_t)((c & 0x1f) << 3) };
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+}
+
 #if defined(EMU_NODE_HEADLESS)
 /* ------------------------------------------- node headless (debug) --- */
 /* prog firmware.bin carte_dir|.zip [frames] [capture.ppm] — la capture
@@ -5463,21 +5476,7 @@ int main(int argc, char **argv) {
         if (pix[i]) nz++;
     }
     fprintf(stderr, "ECRAN %08x nz=%d\n", h, nz);
-    if (argc > 4) {
-        FILE *g = fopen(argv[4], "wb");
-        if (g) {
-            fprintf(g, "P6\n%d %d\n255\n", SCR_W, SCR_H);
-            for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
-                uint16_t p = pix[i];
-                unsigned char rgb[3] = {
-                    (unsigned char)(((p >> 11) & 0x1f) * 255 / 31),
-                    (unsigned char)(((p >> 5) & 0x3f) * 255 / 63),
-                    (unsigned char)((p & 0x1f) * 255 / 31) };
-                fwrite(rgb, 1, 3, g);
-            }
-            fclose(g);
-        }
-    }
+    if (argc > 4) screen_write_ppm(argv[4]);
     return 0;
 }
 
@@ -5556,7 +5555,6 @@ int main(int argc, char **argv) {
     uint64_t perfFreq = SDL_GetPerformanceFrequency();
     const uint64_t frameDur = (uint64_t)((double)perfFreq / 59.7275 + 0.5); /* 1/59,7 s */
     uint64_t nextPace = 0; /* échéance temps réel de la prochaine frame */
-    unsigned seenEpoch = 0;
     titleMs = SDL_GetTicks();
     titleTick = tickCount;
 
@@ -5567,32 +5565,8 @@ int main(int argc, char **argv) {
     while (running) {
         running = poll_events();
         update_diagnostics(frame);
-        if (homeHeld && SDL_GetTicks() - homeHeld > 3000) { /* reset maison */ }
-        if (machineEpoch != seenEpoch) {
-            /* un drop a réinitialisé la machine : resynchronise le pas de
-             * frame et le chronométrage du titre */
-            seenEpoch = machineEpoch;
-            emu_nextFrameTick = tickCount + frame_ticks();
-            titleTick = tickCount;
-            titleMs = SDL_GetTicks();
-        }
+        frame_epoch_sync();
         if (maxFrames && frame >= maxFrames) break;
-#ifdef __EMSCRIPTEN__
-#else
-        /* test headless : EMU_PRESS_A=<frame> appuie sur A 6 frames
-         * (idem EMU_PRESS_B / EMU_PRESS_MENU — « A+B » des titres, Start) */
-        static int pressA = -1;
-        static int pressB = -1;
-        static int pressM = -1;
-        if (pressA < 0) pressA = getenv("EMU_PRESS_A") ? atoi(getenv("EMU_PRESS_A")) : 0;
-        if (pressB < 0) pressB = getenv("EMU_PRESS_B") ? atoi(getenv("EMU_PRESS_B")) : 0;
-        if (pressM < 0) pressM = getenv("EMU_PRESS_MENU") ? atoi(getenv("EMU_PRESS_MENU")) : 0;
-        if (pressA && (frame == pressA)) btn_press(BTN_A);
-        if (pressA && (frame == pressA + 6)) btn_release(BTN_A);
-        if (pressB && (frame == pressB)) btn_press(BTN_B);
-        if (pressB && (frame == pressB + 6)) btn_release(BTN_B);
-        if (pressM && (frame == pressM)) btn_press(BTN_MENU);
-        if (pressM && (frame == pressM + 6)) btn_release(BTN_MENU);
         { /* EMU_INPUT="frame:touches:durée,..." — touches parmi U D L R A B
            * M(enu) H(ome), ex. "200:H:45,260:A:3,280:B:3" (menu d'options) */
             static const char *in = (const char *)1;
@@ -5611,21 +5585,10 @@ int main(int argc, char **argv) {
                 q = strchr(q, ','); if (q) q++;
             }
         }
-#endif
 
-        if (fwLoaded) {
-            Uint64 emuT0 = SDL_GetPerformanceCounter();
-            run_emulated_frame();
-            /* perf brute (titre « brut N % ») : le temps émulé produit par
-             * le temps mural réellement passé à émuler, hors attente */
-            double benchEmuMs = (double)frame_ticks() * 1000.0 / ticks_per_sec();
-            double benchWallMs = (double)(SDL_GetPerformanceCounter() - emuT0) * 1000.0 / perfFreq;
-            rawEmuMs += benchEmuMs; rawWallMs += benchWallMs;
-            rawEmuMsTotal += benchEmuMs; rawWallMsTotal += benchWallMs;
-        }
+        emulate_frames(1);
         frame++;
-        if (emuTarget == TGT_POKITTO) pk_adc_frame();
-        update_title_pct();
+        frame_end();
 
         blit(emuRen);
         if (trace) { /* empreinte d'écran périodique */
@@ -5671,20 +5634,8 @@ int main(int argc, char **argv) {
     }
 
     if (shotPath[0]) {
-        FILE *sf = fopen(shotPath, "wb");
-        if (sf) {
-            const uint16_t *srcp = emuTarget == TGT_POKITTO ? pk_lcd : pix;
-            fprintf(sf, "P6\n%u %u\n255\n", SCR_W, SCR_H);
-            for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
-                uint16_t pc = srcp[i];
-                uint8_t rgb[3] = { (uint8_t)((((pc >> 11) & 0x1f) << 3)),
-                                   (uint8_t)((((pc >> 5) & 0x3f) << 2)),
-                                   (uint8_t)(((pc & 0x1f) << 3)) };
-                fwrite(rgb, 1, 3, sf);
-            }
-            fclose(sf);
-            printf(TR("capture : %s\n", "shot: %s\n"), shotPath);
-        }
+        screen_write_ppm(shotPath);
+        printf(TR("capture : %s\n", "shot: %s\n"), shotPath);
     }
     wav_finish();
     prof_write();
@@ -5852,7 +5803,6 @@ void emu_card_finish(void) {
 }
 
 static Uint32 wasmFrame = 0;
-static unsigned seenEpoch = 0;
 static double wasmLastFrame = 0;
 static Uint32 hudMs; /* dernier push du HUD dans la page */
 
@@ -5875,13 +5825,7 @@ void emu_restart(void) {
 static void wasm_loop(void) {
     if (!poll_events()) emscripten_cancel_main_loop();
     update_diagnostics(wasmFrame);
-    if (machineEpoch != seenEpoch) {
-        /* un drop a réinitialisé la machine : resynchronise le pas de frame */
-        seenEpoch = machineEpoch;
-        emu_nextFrameTick = tickCount + frame_ticks();
-        titleTick = tickCount;
-        titleMs = (Uint32)emscripten_get_now();
-    }
+    frame_epoch_sync();
     /* une frame émulée par rAF (59,94 Hz ≈ 59,73) ; en retard de plus de
      * 4 frames (onglet caché, stall) : pas de rattrapage.  due est ARRONDI
      * (pas tronqué) : un rAF à 60,0 Hz exact donne 16,68 ms < frameMs, la
@@ -5891,18 +5835,13 @@ static void wasm_loop(void) {
     if (wasmLastFrame == 0) wasmLastFrame = now;
     int due = (int)((now - wasmLastFrame) / frameMs + 0.5);
     if (due > 4) { due = 1; wasmLastFrame = now; }
-    if (fwLoaded && booted && !wasmPaused) {
-        double emuT0 = emscripten_get_now();
-        for (int i = 0; i < due; i++) run_emulated_frame();
-        /* perf brute (titre « brut N % »), comme la boucle native */
-        rawEmuMs += (double)due * frame_ticks() * 1000.0 / ticks_per_sec();
-        rawWallMs += emscripten_get_now() - emuT0;
-        wasmFrame += (Uint32)due;
+    if (booted && !wasmPaused) {
+        emulate_frames(due);
+        if (fwLoaded) wasmFrame += (Uint32)due;
     }
-    if (emuTarget == TGT_POKITTO) pk_adc_frame();
     wasmLastFrame += due * frameMs;
     if (now - wasmLastFrame > frameMs) wasmLastFrame = now;
-    update_title_pct();
+    frame_end();
     /* % en haut à droite (derrière le canvas, visible dans les bandes) et
      * titre du jeu dans le texte du bas (mise à jour au rythme du %) */
     if (fwLoaded && titleMs != hudMs && titleBuf[0]) {
@@ -5920,7 +5859,7 @@ static void wasm_loop(void) {
 EMSCRIPTEN_KEEPALIVE
 int main(void) {
     memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
-    titleMs = (Uint32)emscripten_get_now();
+    titleMs = SDL_GetTicks();
     titleTick = tickCount;
     if (sdl_init_all() != 0) return 1;
     emscripten_set_main_loop(wasm_loop, 0, 1);
