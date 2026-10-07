@@ -456,8 +456,9 @@ static void wav_finish(void) {
     fwrite(w4, 1, 4, wavFile);
     fclose(wavFile);
     wavFile = NULL;
+    double wavRate = emuTarget == TGT_POKITTO ? (double)devRate : emuDacRate;
     printf(TR("WAV : %u échantillons (%.1f s à %.0f Hz)\n", "WAV: %u samples (%.1f s at %.0f Hz)\n"), wavSamples,
-           (double)wavSamples / emuDacRate, emuDacRate);
+           (double)wavSamples / wavRate, wavRate);
 }
 
 static void dac_write(uint16_t v) {
@@ -1805,15 +1806,32 @@ static void pk_lcd_write(uint32_t cd, uint16_t v) {
 }
 
 /* --- audio R2R GPIO + HLE */
+/* File R2R : (instant émulé ABSOLU, valeur) — une entrée par changement
+ * de niveau.  Producteur = thread d'émulation (pk_aqEnd), consommateur =
+ * callback SDL (pk_aqStart), thread à part en natif : chaque index n'est
+ * écrit que d'un côté (l'ancien pk_aqSize++/-- des deux threads dérivait
+ * par mises à jour perdues).  L'horodatage absolu remplace les deltas
+ * bornés à 3/22050 s : une valeur tenue plusieurs échantillons (fréquent
+ * dans les ziques 8 kHz de GF, dédoublonnées) était tronquée — musique
+ * compressée dans le temps, file à sec. */
 #define PK_AQ_SIZE (1u << 15)
 #define PK_AQ_MASK (PK_AQ_SIZE - 1)
-#define PK_IFREQ (1.0f / 22050.0f)
+#define PK_AQ_TARGET 0.060  /* avance visée du producteur sur la lecture (s) */
+#define PK_AQ_MAXLAG 0.250  /* au-delà : reprise franche (stall, device rouvert) */
+#define PK_AQ_MERGE  2e-6   /* rafale bit à bit (SET/CLR, B[n]) : une seule valeur */
 static uint8_t pk_aqData[PK_AQ_SIZE];
-static float pk_aqDelta[PK_AQ_SIZE];
-static uint32_t pk_aqStart, pk_aqEnd, pk_aqSize;
-static float pk_audioHoldF;
+static double pk_aqTime[PK_AQ_SIZE];
+static volatile uint32_t pk_aqStart, pk_aqEnd;
+static double pk_aqNow;          /* horloge émulée du producteur (s), publiée */
+static double pk_aqPlay;         /* position de lecture du consommateur (s) */
+static int pk_aqRefill = 1;      /* consommateur à sec : attend PK_AQ_TARGET */
+static uint8_t pk_aqHold = 0x80; /* dernière valeur jouée (le DAC tient) */
 static uint8_t pk_prevData = 0xFF;
 static uint32_t pk_prevTicks;
+static double pk_prevTime;       /* instant de pk_prevTicks (s) */
+static int pk_pendValid;         /* changement retenu, pas encore publié */
+static uint8_t pk_pendData;
+static double pk_pendTime;
 static unsigned long pk_latchCount, pk_ctIrqCount, pk_ctCross, pk_irq34, pk_latchMid, pk_latchSound;
 static FILE *latchDump;
 static int latchDumpTried; /* EMU_LATCH_DUMP lu une seule fois (getenv par
@@ -1868,6 +1886,23 @@ static void pk_audio_check_hle(uint32_t rate) {
 /* valeur écrite sur le R2R : POUT1[31:28] | POUT2[23:20] */
 static void pk_audio_gpio_write(void);
 
+/* horloge émulée absolue (s) : intègre les ticks à la fréquence courante
+ * (le cœur passe de 12 MHz IRC à la PLL au boot) */
+static double pk_audio_clock(void) {
+    pk_prevTime += (double)(uint32_t)(tickCount - pk_prevTicks) / pk_core_hz();
+    pk_prevTicks = tickCount;
+    return pk_prevTime;
+}
+static void pk_audio_flush_pending(void) {
+    if (!pk_pendValid) return;
+    pk_pendValid = 0;
+    uint32_t e = pk_aqEnd, n = (e + 1) & PK_AQ_MASK;
+    if (n == __atomic_load_n(&pk_aqStart, __ATOMIC_ACQUIRE)) return; /* pleine : le consommateur resynchronisera */
+    pk_aqData[e] = pk_pendData;
+    pk_aqTime[e] = pk_pendTime;
+    __atomic_store_n(&pk_aqEnd, n, __ATOMIC_RELEASE);
+}
+
 static void pk_audio_write(uint8_t data) {
     if (pk_hleState == PK_HLE_ENABLED) return;
     pk_prevData = data;
@@ -1885,26 +1920,25 @@ static void pk_audio_write(uint8_t data) {
                 fprintf(stderr, "[val] latch#%lu val=%u tick=%u\n", pk_latchSound, data, tickCount);
         }
     }
-    float clock = (float)pk_core_hz();
-    float delta = (float)(uint32_t)(tickCount - pk_prevTicks) / clock;
-    pk_prevTicks = tickCount;
-    /* trou dans les latches (pause, menu, stall hôte) : il ne doit pas
-     * s'encoder comme un retard permanent de la file — le décalage audible
-     * se cumulait de la durée de chaque pause, session après session */
-    if (delta > 3.0f * PK_IFREQ) delta = 3.0f * PK_IFREQ;
-    /* la consommation normalise chaque entrée à d/(PK_IFREQ x emuDacRate)
-     * secondes murales : avec emuDacRate = 22050 (PK_IFREQ), chaque latch
-     * joue SA vraie durée émulée, quelle que soit la cadence du jeu
-     * (8 kHz chez GF comme 22 kHz ailleurs) — ne PAS dériver emuDacRate :
-     * le suivre réduisait les ziques à 2,75x leur vitesse. */
-    pk_aqDelta[pk_aqEnd] = delta;
-    pk_aqData[pk_aqEnd] = data;
-    pk_aqEnd = (pk_aqEnd + 1) & PK_AQ_MASK;
-    if (pk_aqStart == pk_aqEnd) pk_aqStart = (pk_aqStart + 1) & PK_AQ_MASK;
-    else pk_aqSize++;
+    double t = pk_audio_clock();
+    /* GF pose ses 8 bits un par un (SET/CLR, ~10 cycles d'écart) : les
+     * valeurs intermédiaires d'une même rafale fusionnent dans le
+     * changement retenu ; seul l'état stable part dans la file */
+    if (pk_pendValid && t - pk_pendTime < PK_AQ_MERGE) { pk_pendData = data; return; }
+    pk_audio_flush_pending();
+    pk_pendValid = 1; pk_pendData = data; pk_pendTime = t;
 }
 
-static int pk_audio_ready(void) { return pk_aqSize >= 600; }
+/* fin de frame : publie le changement retenu (rafale terminée) et
+ * l'horloge émulée — le consommateur avance même sans latch (silence,
+ * valeur tenue) */
+static void pk_audio_frame(void) {
+    double t = pk_audio_clock();
+    if (pk_pendValid && t - pk_pendTime >= PK_AQ_MERGE) pk_audio_flush_pending();
+    __atomic_store(&pk_aqNow, &t, __ATOMIC_RELEASE);
+}
+
+static int pk_audio_ready(void) { return 1; } /* pré-buffer géré au callback */
 
 /* Fréquence du cœur telle que le firmware l'a configurée : IRC 12 MHz tant
  * que MAINCLKSEL ne pointe pas la sortie PLL, sinon 12 MHz x M (SYSPLLCTRL).
@@ -1954,6 +1988,28 @@ static void pk_audio_gpio_write(void) {
      * (sinon les doubles déclencheurs pollueraient la cadence mesurée) */
     if (v == pk_prevData && pk_latchCount) return;
     pk_audio_write(v);
+}
+
+/* banques octet (B, 0xA0000000 + 0x20 x port + broche) et mot (W, 0x1000 +
+ * 4 x (0x20 x port + broche)) : port et broche d'un offset, -1 hors broche */
+static int pk_gpio_pin_of(uint32_t n, uint32_t *port) {
+    uint32_t p = n >> 5, b = n & 31u;
+    if (p > 2 || (p != 1 && b > 23)) return -1;
+    *port = p;
+    return (int)b;
+}
+/* écriture d'un registre B/W : toute valeur non nulle met la broche à 1 ;
+ * passe par pk_pout_write (PIN suit, latch R2R au niveau, CS de la SD) */
+static void pk_gpio_pin_write(uint32_t n, uint32_t v) {
+    uint32_t p;
+    int b = pk_gpio_pin_of(n, &p);
+    if (b < 0) return;
+    pk_pout_write(p, (pk_pout[p] & ~(1u << b)) | ((uint32_t)(v != 0) << b));
+}
+static uint32_t pk_gpio_pin_read(uint32_t n) {
+    uint32_t p;
+    int b = pk_gpio_pin_of(n, &p);
+    return b < 0 ? 0 : (pk_pin[p] >> b) & 1u;
 }
 
 static void pk_gpio_input(uint32_t pinId, uint32_t bit, uint32_t val) {
@@ -2288,23 +2344,15 @@ static uint32_t pk_reg_peek(uint32_t a) {
     }
     if (a >= 0xA0000000u && a < 0xB0000000u) { /* GPIO */
         uint32_t off = a - 0xA0000000u;
-        if (off < 0x1000) { /* banque octet */
-            uint32_t p, b;
-            if (off < 0x18) { p = 0; b = off; }
-            else if (off < 0x40) { p = 1; b = off - 0x20; }
-            else if (off < 0x58) { p = 2; b = off - 0x40; }
-            else return 0;
-            uint32_t bit = b; /* l'adresse octet encode déjà la broche */
-            return ((pk_pin[p] >> bit) & 1);
+        if (off < 0x1000) { /* banque octet : un octet par broche, le mot
+                             * aligné en porte quatre (lanes extraites par
+                             * pk_read_byte/half) */
+            off &= ~3u;
+            return pk_gpio_pin_read(off) | pk_gpio_pin_read(off + 1) << 8 |
+                   pk_gpio_pin_read(off + 2) << 16 | pk_gpio_pin_read(off + 3) << 24;
         }
-        if (off < 0x2000) { /* banque mot */
-            uint32_t p, bit;
-            if (off < 0x60) { p = 0; bit = off >> 2; }
-            else if (off >= 0x80 && off < 0x100) { p = 1; bit = (off - 0x80) >> 2; }
-            else if (off >= 0x100 && off < 0x180) { p = 2; bit = (off - 0x100) >> 2; }
-            else return 0;
-            return (pk_pin[p] >> bit) & 1;
-        }
+        if (off < 0x2000) /* banque mot : 0 ou 0xFFFFFFFF */
+            return pk_gpio_pin_read((off - 0x1000u) >> 2) ? 0xFFFFFFFFu : 0;
         if (off >= 0x2000 && off < 0x3000) { /* banque principale */
             uint32_t idx = (off - 0x2000) >> 2;
             if (idx >= 64 && idx < 67) return pk_pin[idx - 64];
@@ -2477,27 +2525,10 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
     }
     if (a >= 0xA0000000u && a < 0xB0000000u) { /* GPIO */
         uint32_t off = a - 0xA0000000u;
-        if (off < 0x1000) { /* banque octet */
-            uint32_t p, b;
-            if (off < 0x18) { p = 0; b = off; }
-            else if (off < 0x40) { p = 1; b = off - 0x20; }
-            else if (off < 0x58) { p = 2; b = off - 0x40; }
-            else return;
-            uint32_t bit = b; /* l'adresse octet encode déjà la broche */
-            if (v & 0xFF) pk_pout[p] |= 1u << bit;
-            else pk_pout[p] &= ~(1u << bit);
-            if (a == 0xA0000057u) pk_audio_gpio_write(); /* bit 23 latching */
-            return;
-        }
-        if (off < 0x2000) { /* banque mot */
-            uint32_t p, bit;
-            if (off < 0x60) { p = 0; bit = off >> 2; }
-            else if (off >= 0x80 && off < 0x100) { p = 1; bit = (off - 0x80) >> 2; }
-            else if (off >= 0x100 && off < 0x180) { p = 2; bit = (off - 0x100) >> 2; }
-            else return;
-            pk_pout_write(p, (pk_pout[p] & ~(1u << bit)) | ((!!v) << bit));
-            return;
-        }
+        /* banque octet en accès mot : la broche de l'adresse seule (les
+         * accès octet/demi-mot passent par pk_gpio_byte_write) */
+        if (off < 0x1000) { pk_gpio_pin_write(off, v & 0xFFu); return; }
+        if (off < 0x2000) { pk_gpio_pin_write((off - 0x1000u) >> 2, v); return; }
         if (off >= 0x2000 && off < 0x3000) { /* banque principale */
             uint32_t idx = (off - 0x2000) >> 2;
             if (idx < 3) { pk_dir[idx] = v; return; }
@@ -2506,19 +2537,16 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
             if (idx >= 96 && idx < 99) { /* MPIN */
                 uint32_t w = idx - 96;
                 pk_pout_write(w, (pk_pout[w] & pk_mask[w]) | (v & ~pk_mask[w]));
-                if (w == 2 && pk_mask[2] == ~0x00F00000u) pk_audio_gpio_write();
                 return;
             }
             if (idx >= 128 && idx < 131) { /* SET */
                 uint32_t w = idx - 128;
                 pk_pout_write(w, pk_pout[w] | v);
-                if (w == 2 && (v & (1u << 23))) pk_audio_gpio_write();
                 return;
             }
             if (idx >= 160 && idx < 163) { /* CLR */
                 uint32_t w = idx - 160;
                 pk_pout_write(w, pk_pout[w] & ~v);
-                if (w == 2 && (v & (1u << 23))) pk_audio_gpio_write();
                 return;
             }
             if (idx >= 192 && idx < 195) { /* TOGGLE */
@@ -2606,12 +2634,22 @@ static inline void pk_write_word(uint32_t a, uint32_t v) {
     }
     pk_reg_write(a, v);
 }
+/* banque GPIO octet : un registre par broche à CHAQUE adresse — la voie
+ * générique (mot aligné + fusion de lanes) perdait la broche visée : seules
+ * les broches d'offset multiple de 4 répondaient (bouton A P1_9, writeDAC
+ * P1[28..31]/P2[20..23] de PokittoLib...) */
+__attribute__((noinline))
+static void pk_gpio_byte_write(uint32_t a, uint32_t v, int n) {
+    for (int i = 0; i < n; i++)
+        pk_gpio_pin_write(a - 0xA0000000u + (uint32_t)i, (v >> (8 * i)) & 0xFFu);
+}
 static inline void pk_write_half(uint32_t a, uint16_t v) {
     if ((a & 1u) == 0u && pk_in_ram(a, 2)) {
         uint8_t *p = sram + (a - 0x10000000u);
         p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
         return;
     }
+    if (a - 0xA0000000u < 0x1000u) { pk_gpio_byte_write(a & ~1u, v, 2); return; }
     uint32_t al = a & ~3u;
     uint32_t old = pk_reg_peek(al);
     uint32_t lane = (uint32_t)(a & 2) << 3;
@@ -2619,6 +2657,7 @@ static inline void pk_write_half(uint32_t a, uint16_t v) {
 }
 static inline void pk_write_byte(uint32_t a, uint8_t v) {
     if (pk_in_ram(a, 1)) { sram[a - 0x10000000u] = v; return; }
+    if (a - 0xA0000000u < 0x1000u) { pk_gpio_byte_write(a, v, 1); return; }
     uint32_t al = a & ~3u;
     uint32_t old = pk_reg_peek(al);
     uint32_t sh = (uint32_t)(a & 3) << 3;
@@ -2726,7 +2765,15 @@ static void pk_reset_core(void) {
     pk_hleIrqAddress = 0;
     pk_hleBuffer = NULL;
     pk_hlePlayhead = NULL;
-    pk_aqStart = pk_aqEnd = pk_aqSize = 0;
+    /* la file est partagée avec le callback (thread à part en natif) */
+    if (audioDev) SDL_LockAudioDevice(audioDev);
+    pk_aqStart = pk_aqEnd = 0;
+    pk_aqNow = pk_aqPlay = 0.0;
+    pk_aqRefill = 1;
+    pk_aqHold = 0x80;
+    pk_pendValid = 0;
+    pk_prevTime = 0.0;
+    if (audioDev) SDL_UnlockAudioDevice(audioDev);
     pk_prevData = 0xFF;
     pk_prevTicks = 0;
     aq_head = aq_tail = 0;
@@ -2749,8 +2796,8 @@ static void pk_reset_core(void) {
 }
 
 /* EEPROM : chargée/sauvegardée à côté du .bin (natif uniquement) */
-static void pk_eeprom_path(char *out, size_t n) {
-    snprintf(out, n, "%s", fwPath);
+static void pk_eeprom_path(char *out, size_t n, const char *fw) {
+    snprintf(out, n, "%s", fw);
     char *dot = strrchr(out, '.');
     if (dot && strchr(out, '/')) {
         /* ne tronque que si l'extension est courte */
@@ -2759,10 +2806,33 @@ static void pk_eeprom_path(char *out, size_t n) {
     snprintf(out + strlen(out), n - strlen(out), ".eeprom");
 }
 
+/* EEPROM vierge : réglages PokittoLib d'usine.  Le volume global se lit
+ * à EESETTINGS_VOL (4000) — à 0, les jeux lib se coupent eux-mêmes (GF :
+ * table de volume indexée par vol>>5, entrée 0 = x0) : silence total au
+ * premier lancement natif et TOUJOURS en wasm (pas d'EEPROM persistée).
+ * 170 = la valeur que la lib pose en test de production. */
+static void pk_eeprom_defaults(void) {
+    memset(pk_eeprom, 0, sizeof pk_eeprom);
+    pk_eeprom[4000] = 170;
+}
+
+/* jeu propriétaire de l'EEPROM en mémoire (fwPath peut déjà désigner le
+ * jeu suivant, voire un jeu META) */
+static char pk_eepromOwner[sizeof fwPath];
+static void pk_eeprom_save_as(const char *fw);
+
 static void pk_eeprom_load(void) {
+    /* même jeu (F5, re-dépôt) : l'EEPROM en mémoire fait foi — elle n'est
+     * écrite sur disque qu'à la sortie, et n'existe qu'en mémoire en wasm */
+    char *loadedFor = pk_eepromOwner;
+    if (loadedFor[0] && strcmp(loadedFor, fwPath) == 0) return;
+    if (loadedFor[0]) pk_eeprom_save_as(loadedFor); /* jeu précédent */
+    snprintf(loadedFor, sizeof pk_eepromOwner, "%s", fwPath);
+    pk_eeprom_defaults();
+    pk_eepromDirty = 0;
 #ifndef __EMSCRIPTEN__
     char path[1100];
-    pk_eeprom_path(path, sizeof path);
+    pk_eeprom_path(path, sizeof path, fwPath);
     FILE *f = fopen(path, "rb");
     if (!f) return;
     size_t n = fread(pk_eeprom, 1, sizeof pk_eeprom, f);
@@ -2772,11 +2842,11 @@ static void pk_eeprom_load(void) {
 #endif
 }
 
-static void pk_eeprom_save(void) {
+static void pk_eeprom_save_as(const char *fw) {
 #ifndef __EMSCRIPTEN__
     if (!pk_eepromDirty) return;
     char path[1100];
-    pk_eeprom_path(path, sizeof path);
+    pk_eeprom_path(path, sizeof path, fw);
     FILE *f = fopen(path, "wb");
     if (!f) return;
     fwrite(pk_eeprom, 1, sizeof pk_eeprom, f);
@@ -2784,6 +2854,9 @@ static void pk_eeprom_save(void) {
     pk_eepromDirty = 0;
     printf(TR("eeprom : %s\n", "eeprom: %s\n"), path);
 #endif
+}
+static void pk_eeprom_save(void) {
+    if (pk_eepromOwner[0]) pk_eeprom_save_as(pk_eepromOwner);
 }
 
 /* DEBUG temporaire : état IRQ/timers */
@@ -4123,23 +4196,32 @@ static inline uint32_t addSetCond(uint32_t a, uint32_t b, int carry) {
  * puis la voie Pokitto (pk_read_/pk_write_ inlinés, second test de cible),
  * puis flash/segments META.  Avant, chaque accès Pokitto traversait ces
  * tests puis les fonctions de bus qui recommençaient : deux sauts
- * hors-ligne de plus par accès. */
+ * hors-ligne de plus par accès.
+ *  La SRAM principale est à 0x20000000 sur META mais à 0x10000000 sur
+ * Pokitto — où 0x20000000/0x20004000 sont SRAM1 et la SRAM USB, des
+ * banques DISTINCTES : la base fixe 0x20000000 y relisait la SRAM
+ * principale (les écritures, elles, allaient au bon endroit).  GF y
+ * double-bufferise sa musique streamée : l'ISR jouait des octets de
+ * variables du jeu — son haché, saturé, dès l'écran de jeu. */
+static inline uint32_t sram_base(void) {
+    return emuTarget == TGT_POKITTO ? 0x10000000u : 0x20000000u;
+}
 static inline uint32_t ld32(uint32_t a) {
-    uint32_t o = a - 0x20000000u;
+    uint32_t o = a - sram_base();
     if (o <= SRAM_SIZE - 4u) { uint32_t v; memcpy(&v, sram + o, 4); return v; }
     if (emuTarget == TGT_POKITTO) return pk_read_word(a);
     if (a <= FLASH_SIZE - 4u) { uint32_t v; nvm_access(a); memcpy(&v, flash + a, 4); return v; }
     return fetchWord(a);
 }
 static inline uint32_t ld16(uint32_t a) {
-    uint32_t o = a - 0x20000000u;
+    uint32_t o = a - sram_base();
     if (o <= SRAM_SIZE - 2u) { uint16_t v; memcpy(&v, sram + o, 2); return v; }
     if (emuTarget == TGT_POKITTO) return pk_read_half(a);
     if (a <= FLASH_SIZE - 2u) { uint16_t v; nvm_access(a); memcpy(&v, flash + a, 2); return v; }
     return fetchHalf(a);
 }
 static inline uint32_t ld8(uint32_t a) {
-    uint32_t o = a - 0x20000000u;
+    uint32_t o = a - sram_base();
     if (o < SRAM_SIZE) return sram[o];
     if (emuTarget == TGT_POKITTO) return pk_read_byte(a);
     if (a < FLASH_SIZE) { nvm_access(a); return flash[a]; }
@@ -4627,63 +4709,50 @@ static void pk_hle_audio_cb(void *ud, Uint8 *stream, int len) {
     for (int i = 0; i < n; i++) wav_put((int16_t)((srcb[i] ^ 0x80) << 8));
 }
 
-/* audio Pokitto non HLE : ring (delta, octet) -> u8 22050 Hz, rééchantillonné
- * exactement comme la référence ; chaque octet sorti alimente aussi le WAV */
+/* audio Pokitto non HLE : la lecture parcourt la file au temps émulé.
+ * pk_aqPlay avance d'une période device par échantillon de sortie,
+ * corrigée de ±0,5 % selon l'avance du producteur sur la cible (dérive
+ * d'horloges) ; la valeur sortie est le dernier latch dont l'instant est
+ * passé — chaque niveau dure exactement sa durée émulée, quelle que soit
+ * la cadence du jeu (8 kHz GF, 22 kHz lib...). */
 static unsigned long pk_cbCalls, pk_cbSamples;
 static Uint32 pk_cbFirstMs;
 static void pk_audio_cb(Uint8 *stream, int len) {
-    /* le device est S16SYS : len octets = len/2 échantillons.  L'ancien
-     * traitement U8 consommait deux fois trop de contenu par callback
-     * (son 2x trop rapide, mesuré 44160 « échantillons »/s) et écrivait
-     * des octets pleins échelle dans des int16 (distorsion générale). */
+    /* device S16SYS : len octets = len/2 échantillons */
     int16_t *out = (int16_t *)stream;
     int n = len / 2;
     if (pk_cbFirstMs == 0) pk_cbFirstMs = SDL_GetTicks();
     pk_cbCalls++; pk_cbSamples += (uint32_t)n;
+    double now;
+    __atomic_load(&pk_aqNow, &now, __ATOMIC_ACQUIRE);
+    double lag = now - pk_aqPlay;
+    if (lag > PK_AQ_MAXLAG) { /* stall hôte, device rouvert : reprise franche */
+        pk_aqPlay = now - PK_AQ_TARGET;
+        lag = PK_AQ_TARGET;
+    }
+    if (pk_aqRefill && lag >= PK_AQ_TARGET) pk_aqRefill = 0;
+    double err = (lag - PK_AQ_TARGET) / PK_AQ_TARGET;
+    if (err > 1.0) err = 1.0; else if (err < -1.0) err = -1.0;
+    double step = (1.0 + 0.005 * err) / (double)devRate;
+    uint32_t st = pk_aqStart, end = __atomic_load_n(&pk_aqEnd, __ATOMIC_ACQUIRE);
     if (ENVFLAG("EMU_DMA_TRACE") && (pk_cbCalls % 100 == 1))
-        fprintf(stderr, "[cb] calls=%lu samples=%lu (%.1f/s mural) n=%d aqSize=%u\n",
+        fprintf(stderr, "[cb] calls=%lu samples=%lu (%.1f/s mural) n=%d file=%u avance=%.1f ms\n",
                 pk_cbCalls, pk_cbSamples,
                 (double)pk_cbSamples * 1000.0 / (SDL_GetTicks() - pk_cbFirstMs + 1),
-                n, pk_aqSize);
-    /* Régulation du remplissage, comme le chemin META : la cible est ~55 ms
-     * de latches ; au-delà, la consommation accélère d'autant (la latence
-     * retombe en une fraction de seconde — la file pokitto plafonnait à
-     * ~7000 latches, 0,32 s de retard constant, et montait sans retour
-     * sous les rafales de production) ; en deçà, elle ralentit d'au plus
-     * 0,4 % pour la faire remonter. */
-    /* device à taux fixe : la base de consommation = taux DAC du jeu /
-     * taux device (PK_IFREQ compte des latchs à 22050) ; la régulation
-     * corrige le remplissage autour de la cible (~55 ms de latchs) */
-    float base = (float)(emuDacRate / (double)devRate);
-    float step = base;
-    {
-        float over = (float)pk_aqSize - 1200.0f;
-        if (over > 0.0f) {
-            step = base * (1.0f + over / 22050.0f);
-            if (step > base * 1.5f) step = base * 1.5f;
-        } else {
-            float under = -over / 22050.0f;
-            if (under > 0.004f) under = 0.004f;
-            step = base * (1.0f - under);
-        }
-    }
-    float err = 0;
+                n, (end - st) & PK_AQ_MASK, lag * 1000.0);
     for (int i = 0; i < n; i++) {
         int16_t s;
-        if (pk_aqSize) {
-            while (pk_aqSize) {
-                float d = pk_aqDelta[pk_aqStart] + err - PK_IFREQ * step;
-                if (d > 0) { pk_aqDelta[pk_aqStart] = d; err = 0; break; }
-                pk_audioHoldF = pk_aqData[pk_aqStart];
-                err = -d;
-                pk_aqStart = (pk_aqStart + 1) & PK_AQ_MASK;
-                pk_aqSize--;
-            }
+        if (!pk_aqRefill) {
+            pk_aqPlay += step;
+            if (pk_aqPlay > now) { pk_aqPlay = now; pk_aqRefill = 1; audUnder++; } /* à sec */
         }
-        /* à sec (pause, menu, stall) : la dernière valeur se tient, comme
-         * le DAC matériel — l'ancien « saute au présent » rejouait 600
-         * latches déjà consommés à chaque reprise */
-        int raw = (int16_t)(((uint8_t)pk_audioHoldF ^ 0x80) << 8);
+        while (st != end && pk_aqTime[st] <= pk_aqPlay) {
+            pk_aqHold = pk_aqData[st];
+            st = (st + 1) & PK_AQ_MASK;
+        }
+        /* à sec ou en pré-buffer : la dernière valeur se tient, comme le
+         * DAC matériel */
+        int raw = (int16_t)((pk_aqHold ^ 0x80) << 8);
         /* couplage AC de l'ampli Pokitto, comme sur la META (d936f63) :
          * le loader tient un repos DC arbitraire (63) — sans blocage, ce
          * rail mange la moitié de la dynamique et claque à chaque
@@ -4696,6 +4765,7 @@ static void pk_audio_cb(Uint8 *stream, int len) {
         out[i] = s;
         if (wavFile) wav_put(s);
     }
+    __atomic_store_n(&pk_aqStart, st, __ATOMIC_RELEASE);
 }
 
 /* audio SDL : l'ISR écrit dans aq ; le callbackSDL consomme */
@@ -5211,6 +5281,10 @@ static int noPad(void) {
 }
 
 static int sdl_init_all(void) {
+    /* manette lue même sans le focus : après un glisser-déposer, c'est le
+     * gestionnaire de fichiers qui le garde — SDL jetait alors tous les
+     * événements manette (« plus de manette » au jeu déposé suivant) */
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO |
                  (noPad() ? 0 : SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK)) != 0) {
         fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -5287,6 +5361,7 @@ static int poll_events(void) {
             }
             SDL_free(fp);
             refresh_title();
+            SDL_RaiseWindow(emuWin); /* le clavier revient au jeu déposé */
         }
 #endif
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F5) {
@@ -5388,11 +5463,15 @@ static void update_diagnostics(Uint32 frame) {
          * Les compteurs hôte sont pk_cbCalls/pk_cbSamples — audCb* ne
          * bouge que sur la voie META et donnait cb=0, trompeur. */
         uint32_t cbs = pk_cbCalls - diagLastC;
-        fprintf(stderr, "[audio] f=%u latches=%lu (%.0f/s, muets=%lu son=%lu) hle=%s | hote: cb=%u éch/cb=%u sous-débit=%u file=%u\n",
+        double now, lag;
+        __atomic_load(&pk_aqNow, &now, __ATOMIC_ACQUIRE);
+        lag = now - pk_aqPlay;
+        fprintf(stderr, "[audio] f=%u latches=%lu (%.0f/s, muets=%lu son=%lu) hle=%s | hote: cb=%u éch/cb=%u à-sec=%u file=%u avance=%.0f ms\n",
                 frame, pk_latchCount - diagLastL, (double)(pk_latchCount - diagLastL) / sec,
                 pk_latchMid, pk_latchSound,
                 pk_hleState == PK_HLE_ENABLED ? "on" : "off",
-                cbs, cbs ? (pk_cbSamples - diagLastN) / cbs : 0, audUnder - diagLastU, pk_aqSize);
+                cbs, cbs ? (unsigned)((pk_cbSamples - diagLastN) / cbs) : 0u, audUnder - diagLastU,
+                (pk_aqEnd - pk_aqStart) & PK_AQ_MASK, lag * 1000.0);
         diagLastL = pk_latchCount; diagLastC = pk_cbCalls;
         diagLastN = pk_cbSamples; diagLastU = audUnder;
     } else {
@@ -5474,6 +5553,7 @@ static void run_emulated_frame(void) {
      * l'émulateur restait ~12 825 frames sans aucune instruction
      * (214 s figées à la 3,6e minute de jeu, interruptions mortes). */
     emu_nextFrameTick = tickCount + frame_ticks();
+    if (emuTarget == TGT_POKITTO) pk_audio_frame();
 }
 
 #if defined(EMU_NODE_HEADLESS)
@@ -5614,7 +5694,8 @@ int main(int argc, char **argv) {
             uint8_t hdr[44] = {0};
             memcpy(hdr, "RIFF", 4); memcpy(hdr + 8, "WAVEfmt ", 8);
             hdr[16] = 16; hdr[20] = 1; hdr[22] = 1;
-            uint32_t rate = emuTarget == TGT_POKITTO ? 22050 : 22049;
+            /* Pokitto : écrit par pk_audio_cb au taux du device */
+            uint32_t rate = emuTarget == TGT_POKITTO ? (uint32_t)devRate : 22049;
             hdr[24] = rate & 0xff; hdr[25] = (rate >> 8) & 0xff;
             uint32_t br = rate * 2;
             hdr[28] = br & 0xff; hdr[29] = (br >> 8) & 0xff;
