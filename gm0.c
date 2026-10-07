@@ -91,8 +91,8 @@ static int fN, fZ, fC, fV;
 static uint32_t tickCount;
 static uint32_t sysTickBase; /* tick du dernier enroulement de SYST_CVR */
 static uint32_t vectorBase;
-static uint32_t sysTickVector, dmacVector, tc4Vector, tc5Vector;
-static int dmacInterrupt, tc4Interrupt;
+static uint32_t sysTickVector, dmacVector;
+static int dmacInterrupt;
 static int irqWork = 1; /* le NVIC a peut-être quelque chose à prendre (voir nvic_service) */
 /* échéance machine commune aux deux cibles : step ne fait qu'une
  * comparaison par instruction ; à l'échéance, machine_events traite
@@ -133,27 +133,29 @@ static void sercom4_ctrl_write(uint32_t r, uint32_t v, uint32_t m) {
 }
 static uint8_t  buttonData = 0xff;
 
-/* TC4 + DAC */
-static int      tc4Enabled, tc4Armed;
-static uint8_t  tc4IntEnMask, tc4IntFlagMask; /* INTENSET/INTFLAG lisibles (jeux maison) */
 static int      primask; /* CPSID/CPSIE : masque les injections d'interruptions */
 static int      sysTickCountFlag; /* SysTick CSR.COUNTFLAG : wrap CVR depuis la dernière lecture */
-static uint32_t tc4CtrlA; /* valeur complète de CTRLA (prescaler bits 8-10) */
-static uint32_t tc4Top, tc4Counter, tc4Period = 907;
-static uint32_t tc4Fires, tc4Writes;
+static uint32_t dacWrites; /* écritures DAC DATA (EMU_AUDIO_STATS) */
 static uint32_t audStarvedTicks, audRestarts; /* EMU_AUDIO_STATS */
-static int      tc4Interrupt;
 
-/* TC5 (0x42003400, IRQ20) : l'audio de la lib officielle (Sound::begin →
- * tcConfigure, TC5_Handler = Audio_Handler, INTENSET.MC0, CC0 =
- * 48 MHz/SOUND_FREQ − 1).  Sound_Handler_Wav::update stream les WAV
- * depuis cette ISR : sans elle, les jeux lib à musique (Picomon) vident
- * leur tampon et attendent pour toujours — écran noir après le titre. */
-static int      tc5Enabled, tc5Armed;
-static uint8_t  tc5IntEnMask, tc5IntFlagMask;
-static uint32_t tc5CtrlA, tc5Top, tc5Counter, tc5Period;
-static uint32_t tc5Fires;
-static int      tc5Interrupt;
+/* TC4 et TC5 : le même périphérique (COUNT16, débordement à CC0), une
+ * instance chacun.  TC4 : l'audio des firmwares gbrecomp et des jeux
+ * maison — interruption OVF, ou beats DMA sans interruption.  TC5 (IRQ20) :
+ * l'audio de la lib officielle (Sound::begin → tcConfigure, TC5_Handler =
+ * Audio_Handler, INTENSET.MC0, CC0 = 48 MHz/SOUND_FREQ − 1) ;
+ * Sound_Handler_Wav::update stream les WAV depuis cette ISR : sans elle,
+ * les jeux lib à musique (Picomon) vident leur tampon et attendent pour
+ * toujours — écran noir après le titre. */
+struct tc {
+    int      enabled, armed, interrupt;  /* CTRLA.ENABLE, INTEN OVF/MC*, IRQ à poser au NVIC */
+    uint8_t  intEn, intFlag;             /* INTENSET/INTFLAG lisibles (jeux maison) */
+    uint32_t ctrlA, top, counter, fires; /* CTRLA (prescaler bits 8-10), CC0, compteur libre */
+    uint32_t vector;                     /* handler, relevé au boot */
+    uint32_t cA, cT, cU, cP;             /* période en cache (clé : CTRLA, CC0, ticks/µs) */
+};
+static struct tc tcs[2];                 /* TC4, TC5 */
+#define TC_IRQ(i)          (IRQ_TC4 + (i))
+#define DMAC_TRIG_TC_OVF(i) (DMAC_TRIG_TC4_OVF + (uint32_t)(i))
 
 /* écran émulé (RGB565, SCR_W x SCR_H) : un seul tampon pour les deux
  * cibles — ST7735 META 160x128, ST7775 Pokitto 220x176 */
@@ -339,43 +341,14 @@ static uint32_t tc_period_ticks(uint32_t ctrlA, uint32_t top) {
     uint32_t per = (uint32_t)(((uint64_t)cycles * emuTicksPerUs + 24u) / 48u);
     return per < 2 ? 2 : per;
 }
-/* mises en cache : ces périodes étaient recalculées (division 64 bits) à
- * chaque instruction émulée par incrementPc */
-static uint32_t tc4_period_ticks(void) {
-    static uint32_t cA = ~0u, cT = ~0u, cU = ~0u, cP;
-    if (tc4CtrlA != cA || tc4Top != cT || emuTicksPerUs != cU) {
-        cA = tc4CtrlA; cT = tc4Top; cU = emuTicksPerUs;
-        cP = tc_period_ticks(cA, cT);
+/* en cache : la période était recalculée (division 64 bits) à chaque
+ * instruction émulée par incrementPc */
+static uint32_t tc_period(struct tc *t) {
+    if (t->ctrlA != t->cA || t->top != t->cT || emuTicksPerUs != t->cU) {
+        t->cA = t->ctrlA; t->cT = t->top; t->cU = emuTicksPerUs;
+        t->cP = tc_period_ticks(t->cA, t->cT);
     }
-    return cP;
-}
-static uint32_t tc5_period_ticks(void) {
-    static uint32_t cA = ~0u, cT = ~0u, cU = ~0u, cP;
-    if (tc5CtrlA != cA || tc5Top != cT || emuTicksPerUs != cU) {
-        cA = tc5CtrlA; cT = tc5Top; cU = emuTicksPerUs;
-        cP = tc_period_ticks(cA, cT);
-    }
-    return cP;
-}
-
-/* écritures CTRLA/CC0/INTEN* des TC4/TC5 (décodées par tc_write) */
-static void tc4_write_ctrla(uint32_t v) {
-    tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0;
-    if (!tc4Enabled) tc4Counter = 0;
-}
-static void tc4_write_cc0(uint32_t v) { tc4Top = v; }
-static void tc5_write_ctrla(uint32_t v) {
-    tc5CtrlA = v; tc5Enabled = (v & 0x02) != 0;
-    if (!tc5Enabled) tc5Counter = 0;
-}
-static void tc5_write_cc0(uint32_t v) { tc5Top = v; }
-static void tc_inten(int is5, uint32_t v) {
-    if (is5) { tc5IntEnMask |= (uint8_t)v; tc5Armed = (tc5IntEnMask & 0x33) != 0; }
-    else     { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; }
-}
-static void tc_intclr(int is5, uint32_t v) {
-    if (is5) { tc5IntEnMask &= (uint8_t)~v; tc5Armed = (tc5IntEnMask & 0x33) != 0; }
-    else     { tc4IntEnMask &= (uint8_t)~v; tc4Armed = (tc4IntEnMask & 0x33) != 0; }
+    return t->cP;
 }
 
 /* ------------------------------------------------------------- audio ---
@@ -537,7 +510,7 @@ static void audio_frame(void) {
 static uint16_t dacData; /* DAC DATA (écritures partielles fusionnées) */
 static void dac_write(uint16_t v) {
     dacData = v;
-    tc4Writes++;
+    dacWrites++;
     v &= 0x3ffu; /* le TS masque sur 10 bits (DAC->DATA & 0x3ff) */
     /* 0..1023 (milieu 512) -> pleine échelle 16 bits, SATURÉ : la lib
      * officielle écrit DATA=0 au repos (« output 0 when not in use »,
@@ -3047,11 +3020,8 @@ static void dmac_chan_swrst(uint32_t ch) {
 static void dma_sercom4_rx_beat(void);
 static int dmaBeatSkipSd; /* un beat DMA d'affichage ne doit pas horloger la carte */
 static int sdTxCh = -1;   /* canal TX de la carte SD pendant une écriture de secteur */
-static int dma_is_tc4(uint32_t ch) {
-    return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC4_OVF;
-}
-static int dma_is_tc5(uint32_t ch) {
-    return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC5_OVF;
+static int dma_is_tc(uint32_t ch, int i) { /* canal déclenché par le débordement de TC4+i */
+    return ch < DMAC_CHANNELS && dmaTrig[ch] == DMAC_TRIG_TC_OVF(i);
 }
 
 static void dma_load(uint32_t ch, uint32_t desc) {
@@ -3248,8 +3218,7 @@ static int exc_active(void) { return excDepth ? excNum[excDepth - 1] : 0; }
 static uint32_t exc_vector(int exc) {
     if (exc == 15) return sysTickVector;
     if (exc == 16 + IRQ_DMAC) return dmacVector;
-    if (exc == 16 + IRQ_TC4) return tc4Vector;
-    if (exc == 16 + IRQ_TC5) return tc5Vector;
+    if ((unsigned)(exc - 16 - IRQ_TC4) < 2u) return tcs[exc - 16 - IRQ_TC4].vector;
     return fetchWord(vectorBase + 4u * (uint32_t)exc) & ~1u;
 }
 
@@ -3287,8 +3256,8 @@ static int dmac_line(void) {
 static void nvic_service(void) {
     if (!irqWork) return; /* rien n'a changé depuis le dernier examen */
     if (dmacInterrupt) { dmacInterrupt = 0; nvicPend |= 1u << IRQ_DMAC; }
-    if (tc4Interrupt) { tc4Interrupt = 0; nvicPend |= 1u << IRQ_TC4; }
-    if (tc5Interrupt) { tc5Interrupt = 0; nvicPend |= 1u << IRQ_TC5; }
+    for (int i = 0; i < 2; i++)
+        if (tcs[i].interrupt) { tcs[i].interrupt = 0; nvicPend |= 1u << TC_IRQ(i); }
     /* bloqué (PRIMASK, priorité) ou rien de prêt : on attend le prochain
      * changement (nouvelle IRQ, SysTick, CPSIE/MSR, retour d'exception,
      * écriture NVIC), qui relève irqWork */
@@ -3321,8 +3290,8 @@ static void nvic_return(void) {
     if (excDepth) {
         int exc = excNum[--excDepth];
         if (exc == 16 + IRQ_DMAC && dmac_line()) nvicPend |= 1u << IRQ_DMAC;
-        if (exc == 16 + IRQ_TC4 && (tc4IntFlagMask & tc4IntEnMask)) nvicPend |= 1u << IRQ_TC4;
-        if (exc == 16 + IRQ_TC5 && (tc5IntFlagMask & tc5IntEnMask)) nvicPend |= 1u << IRQ_TC5;
+        int i = exc - 16 - IRQ_TC4; /* TC : drapeau encore levé et activé */
+        if ((unsigned)i < 2u && (tcs[i].intFlag & tcs[i].intEn)) nvicPend |= 1u << TC_IRQ(i);
     }
 }
 
@@ -3510,9 +3479,8 @@ static uint32_t periph_read(uint32_t a, uint32_t m) {
     case P_SERCOM5:
         return r == 0x18 ? 0x07 : r == 0x28 ? 0x80 : 0;     /* INTFLAG, DATA */
     case P_TC4: case P_TC5: {                               /* INTENCLR/SET, INTFLAG */
-        int is5 = APB_PERIPH(a) == P_TC5;
-        uint32_t en = is5 ? tc5IntEnMask : tc4IntEnMask, fl = is5 ? tc5IntFlagMask : tc4IntFlagMask;
-        return r == 0x0c ? en * 0x0101u | fl << 16 : 0;
+        const struct tc *t = &tcs[APB_PERIPH(a) == P_TC5];
+        return r == 0x0c ? t->intEn * 0x0101u | (uint32_t)t->intFlag << 16 : 0;
     }
     case P_ADC: /* INTFLAG.RESRDY (0x18), RESULT (0x1A) */
         return r == 0x18 ? 1u | ((m >> 16) ? adc_random() << 16 : 0) : 0;
@@ -3659,7 +3627,7 @@ static void dmac_chid_chctrlb_write(uint32_t ch, uint32_t v, uint32_t m) {
  * et ENABLE (=2) : transfert via descripteur */
 static void dmac_chid_chctrla_write(uint32_t ch, uint32_t v) {
     if (v & 0x01u) { dmac_chan_swrst(ch); return; } /* SWRST */
-    if (dma_is_tc4(ch)) { /* canal audio (TC4) */
+    if (dma_is_tc(ch, 0)) { /* canal audio (TC4) */
         if ((v & 0x03u) == 0x02u) { if (!dmaOn[ch]) audRestarts++; if (!dmaOn[ch]) dma_load(ch, dmac_baseAddr + ch * 0x10); }
         else dmaOn[ch] = 0; /* désactivation */
         return;
@@ -3807,23 +3775,24 @@ static void dmac_write(uint32_t r, uint32_t v, uint32_t m) {
     }
 }
 
-/* TC4/TC5 (COUNT16) : registres communs, état séparé */
-static void tc_write(int is5, uint32_t r, uint32_t v, uint32_t m) {
+/* TC4/TC5 (COUNT16) */
+static void tc_write(int i, uint32_t r, uint32_t v, uint32_t m) {
+    struct tc *t = &tcs[i];
     switch (r) {
     case 0x00:                                                      /* CTRLA */
         if (!(m & 0xffffu)) return;
-        if (is5) { tc5_write_ctrla(MERGE(tc5CtrlA, v, m & 0xffffu)); return; }
-        if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA <- %x\n", v); dbgTc4Cfg++; }
-        tc4_write_ctrla(MERGE(tc4CtrlA, v, m & 0xffffu));
+        if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] TC%d CTRLA <- %x\n", 4 + i, v); dbgTc4Cfg++; }
+        t->ctrlA = MERGE(t->ctrlA, v, m & 0xffffu);
+        t->enabled = (t->ctrlA & 0x02) != 0;
+        if (!t->enabled) t->counter = 0;
         return;
     case 0x0c:                                                      /* INTENCLR, INTENSET, INTFLAG */
-        if (m & 0xffu) tc_intclr(is5, v & 0xffu);
-        if (m & 0xff00u) tc_inten(is5, (v >> 8) & 0xffu);           /* OVF=0x01 (jeux maison), MC0=0x10 (lib) */
-        if (m & 0xff0000u) *(is5 ? &tc5IntFlagMask : &tc4IntFlagMask) &= (uint8_t)~(v >> 16); /* acquittement */
+        if (m & 0xffu) t->intEn &= (uint8_t)~v;
+        if (m & 0xff00u) t->intEn |= (uint8_t)(v >> 8);             /* OVF=0x01 (jeux maison), MC0=0x10 (lib) */
+        if (m & 0xff0000u) t->intFlag &= (uint8_t)~(v >> 16);       /* acquittement */
+        t->armed = (t->intEn & 0x33) != 0;
         return;
-    case 0x18:                                                      /* CC0 */
-        if (is5) tc5_write_cc0(MERGE(tc5Top, v, m)); else tc4_write_cc0(MERGE(tc4Top, v, m));
-        return;
+    case 0x18: t->top = MERGE(t->top, v, m); return;                /* CC0 */
     }
 }
 
@@ -3956,6 +3925,13 @@ static void sercom4_write(uint8_t v) {
 static uint32_t timerFrom;     /* tick jusqu'auquel les timers sont appliqués */
 static uint32_t timerDeadline; /* tick de leur prochain événement (= maintenant : à recalculer) */
 
+/* un TC n'est cadencé que s'il compte (activé, CC0 posé) — et TC5 seulement
+ * armé, ou quand le canal DMA choisi par CHID est le sien (historique) */
+static int tc_live(int i) {
+    const struct tc *t = &tcs[i];
+    return t->enabled && t->top > 0 && (i == 0 || t->armed || dma_is_tc(dmac_chid, i));
+}
+
 static void timers_process(uint32_t n) {
     if (emuTarget == TGT_META) {
         while (systick_elapsed() >= (int)emuTicksPerMs) { /* enroulement de CVR : SysTick en attente */
@@ -3965,43 +3941,26 @@ static void timers_process(uint32_t n) {
             irq_work();
         }
     }
-    if (tc4Enabled && tc4Top > 0) {
-        /* cadence dérivée de la vraie config (MFRQ) : F = GCLK_TC4 /
-         * (prescale × (CC0+1)), GCLK audio = 48 MHz ; le timer tourne
-         * librement comme le vrai TC4.  Sans interruption (tc4Armed = 0),
-         * chaque débordement déclenche un beat des canaux DMA TC4. */
-        uint32_t per = tc4_period_ticks();
-        tc4Period = per;
-        tc4Counter += n;
-        while (tc4Counter >= per) {
-            tc4Counter -= per;
-            tc4Fires++;
-            if (tc4Armed) {
-                tc4IntFlagMask |= tc4IntEnMask & 0x11u; /* OVF/MC0 posés, lus par le handler */
-                tc4Interrupt = 1; irq_work();
+    /* cadence dérivée de la vraie config (MFRQ) : F = GCLK_TC /
+     * (prescale × (CC0+1)), GCLK audio = 48 MHz ; le timer tourne librement.
+     * Débordement : interruption si elle est activée, sinon un beat des
+     * canaux DMA qu'il déclenche (l'audio META_AUDIO_DMA) */
+    for (int i = 0; i < 2; i++) {
+        struct tc *t = &tcs[i];
+        if (!tc_live(i)) continue;
+        uint32_t per = tc_period(t);
+        t->counter += n;
+        while (t->counter >= per) {
+            t->counter -= per;
+            t->fires++;
+            if (t->armed) {
+                t->intFlag |= t->intEn & 0x11u; /* OVF/MC0 posés, lus par le handler */
+                t->interrupt = 1; irq_work();
             } else {
                 int served = 0;
                 for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
-                    if (dmaTrig[ch] == DMAC_TRIG_TC4_OVF && dmaOn[ch]) { dma_beat(ch); served = 1; }
+                    if (dmaTrig[ch] == DMAC_TRIG_TC_OVF(i) && dmaOn[ch]) { dma_beat(ch); served = 1; }
                 if (!served) audStarvedTicks++; /* beat perdu : canal audio arrêté */
-            }
-        }
-    }
-    if (tc5Enabled && tc5Top > 0 && (tc5Armed || dma_is_tc5(dmac_chid))) {
-        /* TC5 : interruption (Audio_Handler de la lib : mixer + WAV) ou
-         * beats DMA (audio DMA lib) */
-        uint32_t per = tc5_period_ticks();
-        tc5Period = per;
-        tc5Counter += n;
-        while (tc5Counter >= per) {
-            tc5Counter -= per;
-            tc5Fires++;
-            if (tc5Armed) {
-                tc5IntFlagMask |= tc5IntEnMask & 0x11u; /* OVF/MC0 */
-                tc5Interrupt = 1; irq_work();
-            } else {
-                for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
-                    if (dmaTrig[ch] == DMAC_TRIG_TC5_OVF) dma_beat(ch);
             }
         }
     }
@@ -4021,14 +3980,10 @@ static uint32_t timers_next_event(void) {
     uint32_t d = 0xffffffffu;
     if (emuTarget == TGT_META)
         d = systick_elapsed() < (int)emuTicksPerMs ? emuTicksPerMs - (uint32_t)systick_elapsed() : 1u;
-    if (tc4Enabled && tc4Top > 0) {
-        uint32_t per = tc4_period_ticks();
-        uint32_t r = tc4Counter < per ? per - tc4Counter : 1u;
-        if (r < d) d = r;
-    }
-    if (tc5Enabled && tc5Top > 0 && (tc5Armed || dma_is_tc5(dmac_chid))) {
-        uint32_t per = tc5_period_ticks();
-        uint32_t r = tc5Counter < per ? per - tc5Counter : 1u;
+    for (int i = 0; i < 2; i++) {
+        if (!tc_live(i)) continue;
+        uint32_t per = tc_period(&tcs[i]);
+        uint32_t r = tcs[i].counter < per ? per - tcs[i].counter : 1u;
         if (r < d) d = r;
     }
     if (spiDmaCh >= 0) {
@@ -4870,8 +4825,9 @@ static void reset_core(void) {
     audio_rebase();
     tickCount = 0; sysTickBase = 0; sysTickEntries = 0;
     evtAt = 0; irqWork = 1; /* échéance immédiate au premier pas */
-    sysTickVector = dmacVector = tc4Vector = tc5Vector = 0;
-    dmacInterrupt = tc4Interrupt = 0;
+    sysTickVector = dmacVector = 0;
+    dmacInterrupt = 0;
+    memset(tcs, 0, sizeof tcs);
     dmac_baseAddr = dmac_wrbAddr = dmac_desc = dmac_chid = 0;
     for (uint32_t k = 0; k < DMAC_CHANNELS; k++) {
         dmaResumeAt[k] = 0;
@@ -4887,18 +4843,11 @@ static void reset_core(void) {
     portB_out = portA_dir = portB_dir = 0;
     ser4_data = 0x80;
     spiRxN = 0; spiLastDone = spiPrevDone = 0;
-    tc4Enabled = tc4Armed = 0;
-    tc4IntEnMask = tc4IntFlagMask = 0;
-    tc4CtrlA = 0; dacData = 0;
-    tc5Enabled = tc5Armed = 0;
-    tc5IntEnMask = tc5IntFlagMask = 0;
-    tc5CtrlA = tc5Top = tc5Counter = 0;
-    tc5Fires = 0; tc5Interrupt = 0;
+    dacData = 0;
     spiDmaCh = -1; spiBeatAcc = 0; spiBeatTicks = 20; spiBaud = 0;
     memset(dmacIntFlag, 0, sizeof dmacIntFlag);
-    tc4Top = tc4Counter = 0; tc4Period = 907;
     timerFrom = timerDeadline = tickCount;
-    tc4Fires = tc4Writes = 0;
+    dacWrites = 0;
     lcd_xStart = lcd_xEnd = lcd_yStart = lcd_yEnd = lcd_x = lcd_y = 0;
     lcd_argIndex = lcd_lastCommand = lcd_tmp = 0;
     lcdBgrSwapped = 0;
@@ -5055,10 +5004,9 @@ static void boot_vectors(void) {
     incrementPc();
     sysTickVector = fetchWord(vectorBase + 0x3c) & ~1u;
     dmacVector = fetchWord(vectorBase + 0x58) & ~1u;
-    tc4Vector = fetchWord(vectorBase + 0x8c) & ~1u;
-    tc5Vector = fetchWord(vectorBase + 0x90) & ~1u;
+    for (int i = 0; i < 2; i++) tcs[i].vector = fetchWord(vectorBase + 4u * (16 + TC_IRQ(i))) & ~1u;
     fprintf(stderr, "SP=%08x PC=%08x systick=%08x dmac=%08x tc4=%08x tc5=%08x\n",
-            regs[13], regs[15], sysTickVector, dmacVector, tc4Vector, tc5Vector);
+            regs[13], regs[15], sysTickVector, dmacVector, tcs[0].vector, tcs[1].vector);
 }
 
 static void refresh_title(void) {
@@ -5326,10 +5274,10 @@ static void update_diagnostics(Uint32 frame) {
         fprintf(stderr, " | hle=%s\n", pk_hleState == PK_HLE_ENABLED ? "on" : "off");
     else
         fprintf(stderr, " | dac/s=%.0f famine=%.1f%% relances=%u\n",
-                (tc4Writes - diagLastW) / sec,
-                100.0 * (audStarvedTicks - diagLastS) / ((tickCount - diagLastT) / (double)tc4_period_ticks()),
+                (dacWrites - diagLastW) / sec,
+                100.0 * (audStarvedTicks - diagLastS) / ((tickCount - diagLastT) / (double)tc_period(&tcs[0])),
                 audRestarts - diagLastR);
-    diagLastW = tc4Writes; diagLastS = audStarvedTicks; diagLastR = audRestarts;
+    diagLastW = dacWrites; diagLastS = audStarvedTicks; diagLastR = audRestarts;
     diagLastL = aqP.levels; diagLastC = aqC.cbCalls; diagLastN = aqC.cbSamples; diagLastU = aqC.under;
     diagLastT = tickCount;
 }
