@@ -1,200 +1,234 @@
-# gm0 — Gamebuino META (SAMD21) **and Pokitto** (LPC11U6x) emulator, Cortex-M0+/M0 (C/SDL2 + WebAssembly)
+# gm0
 
-> **Version française** : [README.fr.md](README.fr.md)
+**A cycle-counted emulator for the Gamebuino META (SAMD21, Cortex-M0+) and
+the Pokitto (LPC11U6x, Cortex-M0), written in C with an SDL2 frontend and a
+WebAssembly build.**
 
-One emulator for both consoles: a silicon-faithful **ARMv6-M Thumb
-interpreter** (a **Cortex-M0+** on the META, a **Cortex-M0** on the
-Pokitto — cycle-counted, with the real peripherals: ports, SERCOM4/5,
-DMAC, SysTick, TC4/TC5+DAC, NVIC; LPC-side SYSCON/CT32B/SCT/SSP on the
-Pokitto), an SPI SD card (raw image or FAT16 folder built on the fly),
-an SDL2 frontend and a WebAssembly build (same C core).  The target is
-auto-detected at load time (META SAMD21 / Pokitto LPC11U6x), or forced
-with `--target`.
+> Version française : [README.fr.md](README.fr.md)
 
-## Project status
+gm0 runs unmodified firmware for both consoles from a single binary.  The
+target is detected from the firmware image (initial stack pointer in SAMD21
+or LPC SRAM) and can be forced with `--target`.  The same C core is compiled
+natively and to WebAssembly.
 
-- **META (SAMD21)**: playable — homebrew games without the standard
-  library (lapinou: screen DMA clocked by the SPI baud rate, custom SD
-  and audio drivers), official-library games (Celeste in game, Cats &
-  Coins, Picomon, Yatzy, Reuben Quest; "SD INIT OK", saves written),
-  site loaders;
-- **Pokitto (LPC11U6x)**: full boot (bit-bang LCD, timers, IAP, ROM API,
-  persistent 4 KB EEPROM), native `.pop` container support, Pandemic
-  rendered, Galaxy Fighters (.pop + music streamed from the card);
-- **converted firmwares** (the converter is a separate project): the
-  0.4.0+ DMA/SPI protocols (TC4 DMA audio, SD streaming) are followed;
-- **web**: the same core compiles to wasm — served page or single-file
-  standalone (file://, no network).
+- **CPU** — ARMv6-M Thumb interpreter, cycle-counted per the Cortex-M0+
+  timing tables, including NVM cache misses on the META.
+- **META peripherals** — PORT, SERCOM4/5 (ST7735 display, SPI SD card,
+  button shift register), DMAC (triggered channels, chained descriptors,
+  suspend/resume), TC4/TC5, DAC, SysTick, NVIC with real priorities and
+  exception stacking, minimal NVMCTRL.
+- **Pokitto peripherals** — SYSCON/PLL, CT32B, SCT, SSP, GPIO, IAP and ROM
+  API, persistent 4 KB EEPROM, native `.pop` container support.
+- **Storage** — SPI SD card backed by a raw image, a `.zip`, or a host folder
+  converted to FAT16 on the fly; saves written by games are written back.
 
-## Platform support
+## Status
 
-| Feature | Native (C/SDL2) | WebAssembly |
+| Target | State | Tested titles |
 |---|---|---|
-| Screen | resizable window, integer/fitted/stretched scaling (**F10**), fullscreen (**F11**) | canvas, crisp pixels, browser scaling |
-| Sound | SDL2 output locked to the game timer (±0.5 % regulation) | WebAudio, starts on first gesture |
-| Gamepad | SDL_GameController, hot-plug, labelled mappings | Gamepad API (through Emscripten's SDL port), same mappings |
-| META keys | arrows/ZQSD/WASD, **Enter**=MENU, **Space**=A, **Ctrl**=B, **\***=HOME (or J/K/U/I) | identical |
-| Pokitto keys | IJKL/arrows, **A/S/B/D/F** — or Enter=C, Space=A, Ctrl=B | identical |
-| Pause / reset | **F5** = reset (no keyboard pause) | dock ⏸ (pause) and ⏹ (reset) buttons |
-| Loading a game | CLI argument or drag & drop: `.bin`, `.img`, `.zip`, folder | drag & drop or 📄/📁: `.bin`, `.pop`, `.zip`, folder |
-| SD card | folder → FAT16 on the fly (dynamic size), raw `.img`, `.zip` = full card; `.GB` streaming | `.zip` = full card; `.GB` streaming (in-memory FAT16) |
-| Saves | `.SAV`/`.STA` written back to files; Pokitto EEPROM `<game>.eeprom` persisted | in memory — lost when the tab closes |
-| Flash writes (loader auto-patch) | modelled | ignored |
-| Speed % | window title (± raw % without pacing) | tab title + page corner |
-| One-click games | — | right dock (`wasm/games.js`); single-file standalone usable from `file://` |
-| Headless / capture | `--frames`, `--shot`, `--wav`, end-of-run `[bench]` line | — |
-| Debugging | environment variables `EMU_*`, `SD_DEBUG`… | browser console |
+| Gamebuino META | Playable | lapinou (bare-metal drivers), Celeste, Cats & Coins, Picomon, Yatzy, Reuben Quest, site loaders, converted Game Boy firmwares (DMA/SPI protocols 0.4.0+) |
+| Pokitto | Playable | Pandemic, Galaxy Fighters (`.pop` with music streamed from the card) |
+| WebAssembly | Playable | same core; served page or single self-contained HTML file |
 
-## Performance
-
-Absolute numbers depend on the host (CPU, RAM, OS, load) — the durable
-fact is the median: both consoles run at **≈ 4× (META) and ≈ 3×
-(Pokitto) real time** natively on a mid-range laptop, and the wasm build
-holds real time in the browser (≈ 55 % of native on META, ≈ 33 % on
-Pokitto).
-
-## Features
-
-- **drop** a `.bin` (firmware), a raw `.img`, a `.zip` (= full SD card,
-  `.pop` accepted as firmware on Pokitto) or a **folder** (card only)
-  onto the window; dynamic-size FAT16 card, `.SAV` files written by the
-  game are written back to disk;
-- resizable window (**F10**: scaling modes, **F11**: fullscreen),
-  **F8** = Game Boy filter (4-shade DMG palette + dot-matrix grid), speed
-  **%** in the title (unbounded: >100 = running too fast), debt-free
-  deadline pacing, **F5** = reset;
-- SDL_GameController gamepad (hot-plug) + keyboard (META and Pokitto);
-- modified card export (`--out-img`), ignoring faulty flash writes
-  (`-w/-W`), session audio WAV (`--wav`), screenshots (`--shot`),
-  bounded headless runs (`--frames`);
-- wasm: pause/stop/loading dock, offline game list (`wasm/games.js`),
-  single-file standalone with games embedded in base64;
-- debugging: per-address cycle profile (`EMU_PROF`), DMA/SPI/LCD/SD
-  traces, input scripting (`EMU_INPUT`), FAT/flash/framebuffer dumps.
+The repository ships no games or firmware.
 
 ## Building
 
-Native, via CMake (SDL2 + zlib required; Linux, macOS, Windows MinGW):
+Native build with CMake (requires SDL2 and zlib; Linux, macOS, Windows via
+MSYS2 MinGW-w64):
 
-    cmake -B build .
-    cmake --build build      # -> build/gm0
+```sh
+cmake -B build .
+cmake --build build          # produces build/bin/gm0
+```
 
-French interface: `cmake -B build-fr -DGM0_FR=ON && cmake --build build-fr`
-(the default interface is English).
+The interface is in English by default; configure with `-DGM0_FR=ON` for
+French.
 
-Browser (emsdk required, `emcc` on PATH): `make wasm` →
-`wasm/gm0-standalone.html`, a single self-contained file (wasm embedded
-in base64, usable straight from file://).
+WebAssembly build (requires emsdk with `emcc` on `PATH`):
 
-## Usage (native)
+```sh
+make wasm                    # produces wasm/gm0-standalone.html
+```
 
-    gm0 [firmware.bin] [card] [--frames N] [--shot out.ppm] [--wav out.wav]
+The output is a single file with the wasm module embedded; it can be opened
+directly from `file://`.  A hosted build is available at
+<https://r043v.github.io/gm0/> (emulator only — load your own games).
 
-- with no argument the window opens empty: **drop** a game onto it;
-- `<card>` = a `.img` image OR a folder (FAT16 built on the fly); for
-  the META the card defaults to the firmware's directory, for the
-  Pokitto it is always an explicit argument;
-- META keys: arrows/ZQSD/WASD, **Enter**=Start (MENU), **Space**=A,
-  **Ctrl**=B, **\***=Select (HOME), or J=A, K=B, U=MENU, I=HOME; the
-  shift-register order follows the game's SPI speed
-  (`EMU_BTN_ORDER=lapinou` forces the homebrew order);
-- Pokitto keys: I/K/J/L or arrows, **A**=A, **S/B**=B, **D/C**=C,
-  **F**=backlight — or META-style (Enter=C, Space=A, Ctrl=B);
-- options: `--target meta|pokitto`, `--out-img <file>`, `-w [n]`, `-W`.
+## Usage
 
-Headless (tests, captures):
+```sh
+gm0 [firmware] [card] [options]
+```
 
-    SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy gm0 \
-      game.bin card --frames 300 --shot /tmp/shot.ppm
+| Argument | Meaning |
+|---|---|
+| `firmware` | `.bin`, or `.pop` (Pokitto) |
+| `card` | `.img` raw image, `.zip` (full card), or a folder (FAT16 built on the fly). On the META the card defaults to the firmware's folder. |
+| `--target meta\|pokitto` | force the target |
+| `--frames N` | run N frames, then exit |
+| `--shot file.ppm` | write a screenshot at exit |
+| `--wav file.wav` | record the session audio (48 kHz, rendered from emulated time) |
+| `--out-img file.img` | export the card on exit if it was modified |
+| `-w [n]`, `-W` | Pokitto: ignore the next *n* (or all) faulting flash writes instead of raising a HardFault |
 
-## Browser usage
+Started without arguments, the window opens empty; games can be dropped onto
+it (`.bin`, `.img`, `.zip`, folder).  The run ends with a `[bench]` line
+reporting raw emulation speed.
 
-Open `wasm/gm0-standalone.html` (double-click — no server needed, it
-works from file://) or play directly at
-<https://r043v.github.io/gm0/> (GitHub Pages, emulator only — drag &
-drop your own games).
+Headless runs (tests, captures):
+
+```sh
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
+  gm0 game.bin card/ --frames 300 --shot shot.ppm
+```
+
+### Controls
+
+| | META | Pokitto |
+|---|---|---|
+| D-pad | arrows, ZQSD/WASD | arrows, IJKL |
+| A / B | Space or J / Ctrl or K | Space or A / Ctrl, S or B |
+| MENU / C | Enter or U | Enter, D or C |
+| HOME / backlight | `*` or I (hold 3 s to reset the game) | F |
+
+| Key | Action |
+|---|---|
+| F5 | reset |
+| F8 | Game Boy display filter (4-shade palette, dot-matrix grid) |
+| F10 | scaling mode: integer, fitted, stretched |
+| F11 | fullscreen |
+
+Game controllers are supported through SDL_GameController with hot-plug, on
+both targets.  The META button shift-register bit order follows the SPI speed
+the game reads it at; `EMU_BTN_ORDER=lapinou` forces the homebrew order.
+
+### Platform differences
+
+| Feature | Native | WebAssembly |
+|---|---|---|
+| Audio | SDL2, locked to emulated time (±0.5 % rate regulation) | WebAudio, starts on first user gesture |
+| Saves | `.SAV`/`.STA` written back to disk; Pokitto EEPROM persisted as `<game>.eeprom` | in memory, lost when the tab closes |
+| Flash self-programming (loaders) | emulated | ignored |
+| Game list | — | one-click dock (`wasm/games.js`), games can be embedded in the standalone file |
+| Pause | — | dock buttons (pause, stop) |
+
+## Accuracy
+
+gm0 targets the hardware rather than other emulators: parity with the
+original TypeScript emulator was dropped deliberately in October 2026.
+
+- Instructions are charged their Cortex-M0+ cycle cost (ALU 1, load/store 2,
+  taken branch 2, BL 3, LDM/STM/PUSH/POP 1+N, POP {pc} 3+N), plus a wait
+  state on each miss of the 8-line NVM cache (instruction and data).
+- The NVIC implements PRIMASK, strict-priority preemption, the 8-word
+  exception frame with STKALIGN, and level-triggered lines that are
+  re-evaluated on exception return.
+- Peripheral registers are accessed by byte lane: an access of any width
+  updates exactly the bytes it covers.
+- TC4/TC5 run at the rate derived from their CTRLA prescaler and CC0; the
+  SPI DMA to the display is clocked by the SERCOM baud rate while the CPU
+  keeps running.
+
+## Performance
+
+Measured on the development machine (x86-64, GCC 16, `-O3 -flto`), raw speed
+without frame pacing, as a multiple of real time:
+
+| Title | Target | Speed |
+|---|---|---|
+| lapinou | META | 4.4× |
+| Celeste | META | 4.6× |
+| Cats & Coins | META | 5.5× |
+| converted Game Boy firmware (sml) | META | 5.0× |
+| Pandemic | Pokitto | 4.1× |
+
+Numbers depend on the host and its load.  The WebAssembly build runs at full
+speed in current browsers.
+
+## Debugging
+
+Diagnostics are enabled through environment variables; the most useful:
+
+| Variable | Effect |
+|---|---|
+| `EMU_INPUT="frame:keys:len,..."` | scripted input (keys among `UDLRABMH`), e.g. `200:A:5,300:R:40` |
+| `EMU_NOPACE=1` | run as fast as possible (benchmarks) |
+| `EMU_TRACE=1` | screen hash every 60 frames, periodic CPU trace |
+| `TRACE_TAIL=N` | keep the last N executed instructions, dumped on a wild PC |
+| `EMU_PROF=file` | per-address cycle profile written at exit |
+| `EMU_AUDIO_STATS=1` | audio producer/consumer statistics |
+| `EMU_FIXED_RTC=t`, `ADC_FIXED=1` | deterministic RTC and ADC |
+| `EMU_DEBUG=1`, `SD_DEBUG=1`, `NVM_DEBUG=1`, `EMU_DMA_DEBUG=1`, `EMU_LCD_DEBUG=1` | peripheral traces |
+| `FAT_DUMP=file`, `FAT_DUMP_EXIT=file` | write the FAT image as built at mount, or the card at exit |
+| `FLASH_DUMP=file` | write the META flash at exit (after any self-programming) |
 
 ## Known limitations
 
-- **Windows**: MSYS2 MinGW-w64 required (`dirent.h`); MSVC untested;
-- **wasm**: flash writes are ignored (site-loader auto-patches stay
-  inert) and `.SAV` saves are not exported across sessions (memory
-  buffers);
-- cards are built as **FAT16** (superfloppy or MBR depending on target);
-- the repository contains **no games and no firmwares** (user content);
-- tick-for-tick parity with the original TypeScript emulator was
-  **deliberately dropped** (2026-10-05) in favour of real hardware.
+- Windows requires MSYS2 MinGW-w64 (`dirent.h`); MSVC is untested.
+- In WebAssembly, flash writes are ignored and saves do not survive the
+  session.
+- Cards are built as FAT16 (superfloppy or MBR depending on the target).
 
-## Todo
+Planned and investigated work is tracked in [TODO.md](TODO.md).
 
-- export saves/EEPROM across sessions in wasm;
-- flash writes in wasm (parity with native for loaders);
-- multi-platform CI (Linux/macOS/Windows) and binary releases;
-- real screenshots in this README;
-- FAT32 for larger cards.
+## Development
 
-## Genesis & credits
+gm0 was written entirely by AI coding agents; no C code was typed by hand.
+The first version — about 5,800 lines of C and 66 commits, from September 30
+to October 6, 2026 — was produced by GLM-5.3-Flash through the ZCode agent.
+Statistics for that week, from the session database:
 
-This project is **100 % vibe-coded**: not a single line of C typed by
-hand.  The whole emulator (≈ 5,800 lines of C, 66 commits) was written
-by **GLM-5.3-Flash**, the ZCode agent, in one week — September 30 to
-October 6, 2026.  Every commit in this repository is theirs, except one
-co-signed by **Claude Opus 5.5** (the TC4-triggered DMA audio channel,
-built in Claude's own tooling).  The counters for the whole development
-— the converter was only ever touched to debug the emulator, so usage
-reflects the emulator alone — straight from the session database:
-
-- 14 sessions, 122 prompt messages;
+- 14 sessions, 122 prompts;
 - 5,446 model requests, 5,488 tool calls;
-- **1.84 billion tokens** processed (1.82 B read from cache, ~4.2 M
-  generated), ~52 h of cumulative model time.
+- 1.84 billion tokens processed (1.82 billion cache reads, about 4.2 million
+  generated), about 52 hours of cumulative model time.
 
-Two sources had their **logic extracted**:
+Later refactoring, hardware-accuracy fixes and performance work were
+co-authored with Claude Opus 5.5 in Claude Code.
 
-- **Andy O'Neill's TypeScript emulator** (MIT) — the first C port
+## Credits and references
+
+Logic was ported from two MIT-licensed emulators:
+
+- **gamebuino-emulator** by Andy O'Neill (TypeScript) — the first C port
   reproduced it tick for tick:
   [aoneill01/gamebuino-emulator](https://github.com/aoneill01/gamebuino-emulator);
-- **Felipe Manga's PokittoEmu** — the LPC11U6x/Cortex-M0 core is a
-  faithful C port of it:
-  [felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu).
+- **PokittoEmu** by Felipe Manga — the LPC11U6x/Cortex-M0 side is a C port
+  of it: [felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu).
 
-**Official datasheets** for everything else (real ARMv6-M core,
-DMAC/SERCOM/TC/NVIC, SPI SD card, panel):
+Everything else follows the vendor documentation:
 
-- SAM D21/DA1 — Microchip, DS40001882:
+- Microchip SAM D21/DA1 datasheet, DS40001882 —
   <https://www.microchip.com/en-us/product/ATSAMD21G18>;
-- LPC11U6x — NXP (datasheet + user manual UM10732):
+- NXP LPC11U6x datasheet and user manual UM10732 —
   <https://www.nxp.com/docs/en/data-sheet/LPC11U6X.pdf>;
-- ST7735 — Sitronix (NDA'd PDF, public copies abound);
-- ARMv6-M Architecture Reference Manual:
+- Sitronix ST7735 controller datasheet;
+- ARMv6-M Architecture Reference Manual —
   <https://developer.arm.com/documentation/ddi0419/latest>.
 
-Plus **reverse-engineering of real hardware** — deep analysis and
-debugging, no code copied:
+Hardware behaviour was also established by analysing real software, without
+reusing any of its code: the lapinou source (bare-metal display, SD and audio
+drivers, which exposed the display DMA/SPI protocol, TC4 clocking and the
+chip-select pull-ups), META binaries, and the official
+[Gamebuino META library](https://github.com/Gamebuino/Gamebuino-META)
+(SdFat stack, DMAC descriptors, TC5 audio), stepped through in the emulator.
 
-- the **lapinou source** on META (hand-written screen/SD/audio drivers,
-  no standard library): it revealed the screen's real DMA/SPI protocol,
-  the TC4 clocking and the CS/pull-up quirks;
-- **META binaries** and the **official META library**
-  ([Gamebuino/Gamebuino-META](https://github.com/Gamebuino/Gamebuino-META)):
-  stepped through in the emulator for the SdFat stack, the library's
-  DMAC descriptors and TC5 audio.
-
-Ecosystem: [gamebuino.com](https://gamebuino.com) on the META side;
-[PokittoLib](https://github.com/pokitto/PokittoLib) on the Pokitto side.
+Ecosystems: [gamebuino.com](https://gamebuino.com) for the META,
+[PokittoLib](https://github.com/pokitto/PokittoLib) for the Pokitto.
 
 ## License
 
-gm0 is licensed under **[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.fr)**
+gm0 is released under
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 (© 2026 r043v): attribution, non-commercial, share-alike.
 
-The logic extracted from two **MIT** emulators stays under MIT — their
-notices are preserved in [LICENSE](LICENSE):
+Logic derived from the two MIT-licensed emulators remains under MIT; their
+notices are reproduced in [LICENSE](LICENSE):
 [aoneill01/gamebuino-emulator](https://github.com/aoneill01/gamebuino-emulator)
 (Andy O'Neill, 2017) and
 [felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu)
-(Felipe Manga, 2017).  Everything else carries no obligation:
-implementing behaviour documented in datasheets (Microchip, NXP,
-Sitronix, ARM) creates no derivative of those documents, and neither
-the lapinou source nor META binaries nor the official library
-contributed a single line of code (analysis only).
+(Felipe Manga, 2017).  Implementing behaviour described in vendor
+datasheets (Microchip, NXP, Sitronix, Arm) does not create a derivative of
+those documents, and no code was taken from the lapinou source, META
+binaries, or the official library.
