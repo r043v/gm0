@@ -230,6 +230,7 @@ static uint32_t maxFrames;
 #define LANES(n, a)      (((n) == 4 ? ~0u : (1u << (8 * (n))) - 1u) << (8 * ((a) & 3u)))
 #define LANE8(x, k)      (((x) >> (8 * (k))) & 0xffu)
 #define MERGE(old, v, m) (((old) & ~(m)) | ((v) & (m)))
+#define ALWAYS_INLINE    inline __attribute__((always_inline))
 
 #define TGT_META    0
 #define TGT_POKITTO 1
@@ -296,6 +297,13 @@ static uint8_t  fetchByte(uint32_t a);
 static void     writeWord(uint32_t a, uint32_t v);
 static void     writeHalf(uint32_t a, uint16_t v);
 static void     writeByte(uint32_t a, uint8_t v);
+/* un beat DMA de 1, 2 ou 4 octets */
+static uint32_t bus_load(uint32_t a, uint32_t size) {
+    return size == 1 ? fetchByte(a) : size == 2 ? fetchHalf(a) : fetchWord(a);
+}
+static void bus_store(uint32_t a, uint32_t v, uint32_t size) {
+    if (size == 1) writeByte(a, (uint8_t)v); else if (size == 2) writeHalf(a, (uint16_t)v); else writeWord(a, v);
+}
 static void     pushStack(uint32_t v);
 static uint32_t popStack(void);
 static void     setReg(int i, uint32_t v);
@@ -1443,16 +1451,8 @@ static int zip_load_card(const uint8_t *data, size_t len) {
  * jeux maison : left,right,up,a,b,menu,down,home) ; l'entrée b = ordre lib
  * (down,left,right,up,a,b,menu,home) */
 static uint8_t pad_byte_24(uint8_t b) {
-    uint8_t r = 0;
-    if (b & 0x01u) r |= 1u << 6;   /* down */
-    if (b & 0x02u) r |= 1u << 0;   /* left */
-    if (b & 0x04u) r |= 1u << 1;   /* right */
-    if (b & 0x08u) r |= 1u << 2;   /* up */
-    if (b & 0x10u) r |= 1u << 3;   /* a */
-    if (b & 0x20u) r |= 1u << 4;   /* b */
-    if (b & 0x40u) r |= 1u << 5;   /* menu */
-    if (b & 0x80u) r |= 1u << 7;   /* home */
-    return r;
+    /* down (bit 0) -> 6 ; left, right, up, a, b, menu (1-6) -> 0-5 ; home reste en 7 */
+    return (uint8_t)(((b >> 1) & 0x3fu) | (b & 0x01u) << 6 | (b & 0x80u));
 }
 
 
@@ -3116,9 +3116,7 @@ static void dma_beat(uint32_t ch) {
         if (sdClock) dma_sercom4_rx_beat(); /* plein-duplex SD */
     } else {
         spiDmaWrite = 1;
-        if (size == 1) writeByte(dst, fetchByte(src));
-        else if (size == 2) writeHalf(dst, fetchHalf(src));
-        else writeWord(dst, fetchWord(src));
+        bus_store(dst, bus_load(src, size), size);
         spiDmaWrite = 0;
     }
     if (++dmaIdx[ch] >= dmaCnt[ch]) {
@@ -3158,9 +3156,7 @@ static void dma_sercom4_rx_beat(void) {
         uint32_t size = 1u << ((dmaCtrl[ch] >> 8) & 3u);
         uint32_t dst = dmaDst[ch];
         if (dmaCtrl[ch] & (1u << 11)) dst += (dmaIdx[ch] - dmaCnt[ch]) * size;
-        if (size == 1) writeByte(dst, ser4_data);
-        else if (size == 2) writeHalf(dst, ser4_data);
-        else writeWord(dst, ser4_data);
+        bus_store(dst, ser4_data, size);
         if (++dmaIdx[ch] >= dmaCnt[ch]) {
             dmacIntFlag[ch] |= 0x02;
             dma_wrb_write(ch);
@@ -3509,26 +3505,6 @@ static uint32_t bus_read(uint32_t a, int size) {
     return (v >> (8 * (a & 3u))) & (size == 4 ? ~0u : (1u << (8 * size)) - 1u);
 }
 
-/* accès du bus (maîtres DMA, pile du cœur) : SRAM d'abord, sinon voie
- * Pokitto ou bus META */
-static uint32_t fetchWord(uint32_t a) {
-    if (emuTarget == TGT_POKITTO) return pk_read_word(a);
-    uint32_t o = a - 0x20000000u;
-    if (o <= SRAM_SIZE - 4u) { uint32_t v; memcpy(&v, sram + o, 4); return v; }
-    return bus_read(a, 4);
-}
-static uint16_t fetchHalf(uint32_t a) {
-    if (emuTarget == TGT_POKITTO) return pk_read_half(a);
-    uint32_t o = a - 0x20000000u;
-    if (o <= SRAM_SIZE - 2u) { uint16_t v; memcpy(&v, sram + o, 2); return v; }
-    return (uint16_t)bus_read(a, 2);
-}
-static uint8_t fetchByte(uint32_t a) {
-    if (emuTarget == TGT_POKITTO) return pk_read_byte(a);
-    uint32_t o = a - 0x20000000u;
-    if (o < SRAM_SIZE) return sram[o];
-    return (uint8_t)bus_read(a, 1);
-}
 
 /* montre générique d'écriture (WATCH_ADDR), pour le débogage */
 static uint32_t lastExecPc;  /* PC de l'instruction en cours (du pas précédent, entre deux pas) */
@@ -3713,9 +3689,7 @@ static void dmac_chid_chctrla_write(uint32_t ch, uint32_t v) {
         unsigned h = 0x811c9dc5;
         for (uint32_t k = 0; k < btcnt; k++) {
             uint32_t s = srcinc ? src + (k - btcnt) * size : src;
-            if (size == 1) h = (h ^ fetchByte(s)) * 0x01000193u;
-            else if (size == 2) h = (h ^ fetchHalf(s)) * 0x01000193u;
-            else h = (h ^ fetchWord(s)) * 0x01000193u;
+            h = (h ^ bus_load(s, size)) * 0x01000193u;
         }
         fprintf(stderr, "[dma] ch=%u src=%x dst=%x n=%u sz=%u lcd_y=%u tick=%u hash=%08x\n",
                 (unsigned)ch, src, dst, btcnt, size, lcd_y, tickCount, h);
@@ -3724,9 +3698,7 @@ static void dmac_chid_chctrla_write(uint32_t ch, uint32_t v) {
         uint32_t s = srcinc ? src + (i - btcnt) * size : src;
         uint32_t d = dstinc ? dst + (i - btcnt) * size : dst;
         spiDmaWrite = 1;
-        if (size == 1) writeByte(d, fetchByte(s));
-        else if (size == 2) writeHalf(d, fetchHalf(s));
-        else writeWord(d, fetchWord(s));
+        bus_store(d, bus_load(s, size), size);
         spiDmaWrite = 0;
     }
     dma_wrb_write(ch);
@@ -3846,24 +3818,55 @@ static void bus_write(uint32_t a, uint32_t v, int size) {
     else if (a - 0xe000e000u < 0x1000u) scs_write(a & ~3u, wv, m); /* SCS : NVIC, SysTick, SCB */
 }
 
-static void writeWord(uint32_t a, uint32_t v) {
-    if (emuTarget == TGT_POKITTO) { pk_write_word(a, v); return; }
-    uint32_t o = a - 0x20000000u;
-    if (o <= SRAM_SIZE - 4u) { memcpy(sram + o, &v, 4); return; }
-    bus_write(a, v, 4);
+/* accès mémoire du cœur : plage SRAM testée en premier (les deux cibles),
+ * puis la voie Pokitto (pk_read_/pk_write_ inlinés, second test de cible),
+ * puis flash/segments META.  Avant, chaque accès Pokitto traversait ces
+ * tests puis les fonctions de bus qui recommençaient : deux sauts
+ * hors-ligne de plus par accès.
+ *  La SRAM principale est à 0x20000000 sur META mais à 0x10000000 sur
+ * Pokitto — où 0x20000000/0x20004000 sont SRAM1 et la SRAM USB, des
+ * banques DISTINCTES : la base fixe 0x20000000 y relisait la SRAM
+ * principale (les écritures, elles, allaient au bon endroit).  GF y
+ * double-bufferise sa musique streamée : l'ISR jouait des octets de
+ * variables du jeu — son haché, saturé, dès l'écran de jeu. */
+#define SRAM_BASE(T) ((T) == TGT_POKITTO ? 0x10000000u : 0x20000000u)
+#define NMASK(n)     ((n) == 4 ? ~0u : (1u << (8 * (n))) - 1u)
+/* w : états d'attente de l'instruction (local de step_t, tenu en registre) */
+static ALWAYS_INLINE uint32_t ld_t(const int T, uint32_t a, const int n, uint32_t *w) {
+    uint32_t o = a - SRAM_BASE(T), v = 0;
+    if (o <= SRAM_SIZE - n) { memcpy(&v, sram + o, n); return v; }
+    if (T == TGT_POKITTO) return n == 4 ? pk_read_word(a) : n == 2 ? pk_read_half(a) : pk_read_byte(a);
+    if (a <= FLASH_SIZE - n) { *w += nvm_miss(a); memcpy(&v, flash + a, n); return v; }
+    return bus_read(a, n);
 }
-static void writeHalf(uint32_t a, uint16_t v) {
-    if (emuTarget == TGT_POKITTO) { pk_write_half(a, v); return; }
+static ALWAYS_INLINE void st_t(const int T, uint32_t a, uint32_t v, const int n) {
+    if (T == TGT_POKITTO) {
+        if (n == 4) pk_write_word(a, v); else if (n == 2) pk_write_half(a, (uint16_t)v); else pk_write_byte(a, (uint8_t)v);
+        return;
+    }
     uint32_t o = a - 0x20000000u;
-    if (o <= SRAM_SIZE - 2u) { memcpy(sram + o, &v, 2); return; }
-    bus_write(a, v, 2);
+    if (o <= SRAM_SIZE - n) { memcpy(sram + o, &v, n); return; }
+    bus_write(a, v & NMASK(n), n);
 }
-static void writeByte(uint32_t a, uint8_t v) {
-    if (emuTarget == TGT_POKITTO) { pk_write_byte(a, v); return; }
-    uint32_t o = a - 0x20000000u;
-    if (o < SRAM_SIZE) { sram[o] = v; return; }
-    bus_write(a, v, 1);
-}
+
+/* accès du bus (maîtres DMA, pile du cœur, traces) : les mêmes chemins
+ * que le cœur, cible lue à l'exécution ; les défauts du cache NVM vont au
+ * compteur global */
+#define BUS_ACCESSORS(n, type, Name)                                                 \
+    static type fetch##Name(uint32_t a) {                                            \
+        uint32_t w = 0, v = emuTarget == TGT_POKITTO ? ld_t(TGT_POKITTO, a, n, &w)   \
+                                                     : ld_t(TGT_META, a, n, &w);     \
+        flashWaits += w;                                                             \
+        return (type)v;                                                              \
+    }                                                                                \
+    static void write##Name(uint32_t a, type v) {                                    \
+        if (emuTarget == TGT_POKITTO) st_t(TGT_POKITTO, a, v, n);                    \
+        else st_t(TGT_META, a, v, n);                                                \
+    }
+BUS_ACCESSORS(4, uint32_t, Word)
+BUS_ACCESSORS(2, uint16_t, Half)
+BUS_ACCESSORS(1, uint8_t, Byte)
+#undef BUS_ACCESSORS
 
 /* --------------------------------------------------- DMAC (écran) */
 
@@ -4011,10 +4014,9 @@ static void advance_slow(void) {
     uint32_t d = timers_next_event(); /* borné : l'échéance se compare en signé */
     timerDeadline = tickCount + (d > 0x40000000u ? 0x40000000u : d);
 }
-/* ALWAYS_INLINE + cible constante (T) : les fonctions du chemin chaud sont
- * instanciées par cible dans l'interpréteur (step_t), sans aucun test de
- * emuTarget ; les appelants hors cœur passent emuTarget */
-#define ALWAYS_INLINE inline __attribute__((always_inline))
+/* cible constante (T) : les fonctions du chemin chaud sont instanciées par
+ * cible dans l'interpréteur (step_t), sans aucun test de emuTarget ; les
+ * appelants hors cœur passent emuTarget */
 static ALWAYS_INLINE void advance_t(const int T, uint32_t n) {
     tickCount += n;
     if (T == TGT_POKITTO) return; /* timers LPC dans pk_machine_step */
@@ -4075,37 +4077,6 @@ static inline uint32_t addSetCond(uint32_t a, uint32_t b, int carry) {
     fN = (int)(r >> 31);
     fZ = r == 0;
     return r;
-}
-
-/* accès mémoire du cœur : plage SRAM testée en premier (les deux cibles),
- * puis la voie Pokitto (pk_read_/pk_write_ inlinés, second test de cible),
- * puis flash/segments META.  Avant, chaque accès Pokitto traversait ces
- * tests puis les fonctions de bus qui recommençaient : deux sauts
- * hors-ligne de plus par accès.
- *  La SRAM principale est à 0x20000000 sur META mais à 0x10000000 sur
- * Pokitto — où 0x20000000/0x20004000 sont SRAM1 et la SRAM USB, des
- * banques DISTINCTES : la base fixe 0x20000000 y relisait la SRAM
- * principale (les écritures, elles, allaient au bon endroit).  GF y
- * double-bufferise sa musique streamée : l'ISR jouait des octets de
- * variables du jeu — son haché, saturé, dès l'écran de jeu. */
-#define SRAM_BASE(T) ((T) == TGT_POKITTO ? 0x10000000u : 0x20000000u)
-#define NMASK(n)     ((n) == 4 ? ~0u : (1u << (8 * (n))) - 1u)
-/* w : états d'attente de l'instruction (local de step_t, tenu en registre) */
-static ALWAYS_INLINE uint32_t ld_t(const int T, uint32_t a, const int n, uint32_t *w) {
-    uint32_t o = a - SRAM_BASE(T), v = 0;
-    if (o <= SRAM_SIZE - n) { memcpy(&v, sram + o, n); return v; }
-    if (T == TGT_POKITTO) return n == 4 ? pk_read_word(a) : n == 2 ? pk_read_half(a) : pk_read_byte(a);
-    if (a <= FLASH_SIZE - n) { *w += nvm_miss(a); memcpy(&v, flash + a, n); return v; }
-    return bus_read(a, n);
-}
-static ALWAYS_INLINE void st_t(const int T, uint32_t a, uint32_t v, const int n) {
-    if (T == TGT_POKITTO) {
-        if (n == 4) pk_write_word(a, v); else if (n == 2) pk_write_half(a, (uint16_t)v); else pk_write_byte(a, (uint8_t)v);
-        return;
-    }
-    uint32_t o = a - 0x20000000u;
-    if (o <= SRAM_SIZE - n) { memcpy(sram + o, &v, n); return; }
-    bus_write(a, v & NMASK(n), n);
 }
 
 /* nombre de registres d'une liste (SWAR : __builtin_popcount est un appel
@@ -4284,38 +4255,38 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
 
     switch (op >> 8) {
     /* ---- décalages immédiats, add/sub 3 opérandes */
-    case 0x00: case 0x01: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: { /* LSLS imm */
+    case 0x00 ... 0x07: { /* LSLS imm */
         uint32_t v = regs[(op >> 3) & 7], n = (op >> 6) & 31;
         if (n) { fC = (int)(v >> (32 - n)) & 1; v <<= n; }
         regs[op & 7] = v; setNZ(v); break; }
-    case 0x08: case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f: { /* LSRS imm */
+    case 0x08 ... 0x0f: { /* LSRS imm */
         uint32_t v = regs[(op >> 3) & 7], n = (op >> 6) & 31;
         if (!n) n = 32;
         fC = (int)(v >> (n - 1)) & 1;
         v = n == 32 ? 0 : v >> n;
         regs[op & 7] = v; setNZ(v); break; }
-    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0x15: case 0x16: case 0x17: { /* ASRS imm */
+    case 0x10 ... 0x17: { /* ASRS imm */
         int32_t v = (int32_t)regs[(op >> 3) & 7];
         uint32_t n = (op >> 6) & 31;
         if (!n) n = 32;
         fC = (int)((uint32_t)(v >> (n - 1)) & 1);
         uint32_t r = (uint32_t)(n == 32 ? v >> 31 : v >> n);
         regs[op & 7] = r; setNZ(r); break; }
-    case 0x18: case 0x19: regs[op & 7] = addSetCond(regs[(op >> 3) & 7], regs[(op >> 6) & 7], 0); break;  /* ADDS reg */
-    case 0x1a: case 0x1b: regs[op & 7] = addSetCond(regs[(op >> 3) & 7], ~regs[(op >> 6) & 7], 1); break; /* SUBS reg */
-    case 0x1c: case 0x1d: regs[op & 7] = addSetCond(regs[(op >> 3) & 7], (op >> 6) & 7, 0); break;        /* ADDS imm3 */
-    case 0x1e: case 0x1f: regs[op & 7] = addSetCond(regs[(op >> 3) & 7], ~((op >> 6) & 7), 1); break;     /* SUBS imm3 */
+    case 0x18 ... 0x19: regs[op & 7] = addSetCond(regs[(op >> 3) & 7], regs[(op >> 6) & 7], 0); break;  /* ADDS reg */
+    case 0x1a ... 0x1b: regs[op & 7] = addSetCond(regs[(op >> 3) & 7], ~regs[(op >> 6) & 7], 1); break; /* SUBS reg */
+    case 0x1c ... 0x1d: regs[op & 7] = addSetCond(regs[(op >> 3) & 7], (op >> 6) & 7, 0); break;        /* ADDS imm3 */
+    case 0x1e ... 0x1f: regs[op & 7] = addSetCond(regs[(op >> 3) & 7], ~((op >> 6) & 7), 1); break;     /* SUBS imm3 */
     /* ---- immédiats 8 bits */
-    case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:            /* MOVS */
+    case 0x20 ... 0x27: /* MOVS */
         regs[(op >> 8) & 7] = op & 0xff; fN = 0; fZ = (op & 0xff) == 0; break;
-    case 0x28: case 0x29: case 0x2a: case 0x2b: case 0x2c: case 0x2d: case 0x2e: case 0x2f:            /* CMP */
+    case 0x28 ... 0x2f: /* CMP */
         addSetCond(regs[(op >> 8) & 7], ~(op & 0xff), 1); break;
-    case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: case 0x36: case 0x37:            /* ADDS */
+    case 0x30 ... 0x37: /* ADDS */
         regs[(op >> 8) & 7] = addSetCond(regs[(op >> 8) & 7], op & 0xff, 0); break;
-    case 0x38: case 0x39: case 0x3a: case 0x3b: case 0x3c: case 0x3d: case 0x3e: case 0x3f:            /* SUBS */
+    case 0x38 ... 0x3f: /* SUBS */
         regs[(op >> 8) & 7] = addSetCond(regs[(op >> 8) & 7], ~(op & 0xff), 1); break;
     /* ---- ALU registre */
-    case 0x40: case 0x41: case 0x42: case 0x43: {
+    case 0x40 ... 0x43: {
         uint32_t rd = op & 7, a = regs[rd], b = regs[(op >> 3) & 7], r, sh;
         switch ((op >> 6) & 15) {
         case 0x0: r = a & b; break;                                   /* ANDS */
@@ -4368,38 +4339,38 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
         BRANCH(t);
         break; }
     /* ---- LDR littéral */
-    case 0x48: case 0x49: case 0x4a: case 0x4b: case 0x4c: case 0x4d: case 0x4e: case 0x4f:
+    case 0x48 ... 0x4f:
         regs[(op >> 8) & 7] = LD32(((pc + 4u) & ~3u) + ((op & 0xff) << 2)); cyc = 2; break;
     /* ---- load/store registre + registre */
-    case 0x50: case 0x51: ST32(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
-    case 0x52: case 0x53: ST16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
-    case 0x54: case 0x55: ST8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
-    case 0x56: case 0x57: regs[op & 7] = (uint32_t)(int32_t)(int8_t)LD8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
-    case 0x58: case 0x59: regs[op & 7] = LD32(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
-    case 0x5a: case 0x5b: regs[op & 7] = LD16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
-    case 0x5c: case 0x5d: regs[op & 7] = LD8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
-    case 0x5e: case 0x5f: regs[op & 7] = (uint32_t)(int32_t)(int16_t)LD16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x50 ... 0x51: ST32(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
+    case 0x52 ... 0x53: ST16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
+    case 0x54 ... 0x55: ST8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7], regs[op & 7]); cyc = 2; break;
+    case 0x56 ... 0x57: regs[op & 7] = (uint32_t)(int32_t)(int8_t)LD8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x58 ... 0x59: regs[op & 7] = LD32(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x5a ... 0x5b: regs[op & 7] = LD16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x5c ... 0x5d: regs[op & 7] = LD8(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
+    case 0x5e ... 0x5f: regs[op & 7] = (uint32_t)(int32_t)(int16_t)LD16(regs[(op >> 3) & 7] + regs[(op >> 6) & 7]); cyc = 2; break;
     /* ---- load/store immédiat */
-    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
+    case 0x60 ... 0x67:
         ST32(regs[(op >> 3) & 7] + ((op >> 4) & 0x7c), regs[op & 7]); cyc = 2; break;
-    case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d: case 0x6e: case 0x6f:
+    case 0x68 ... 0x6f:
         regs[op & 7] = LD32(regs[(op >> 3) & 7] + ((op >> 4) & 0x7c)); cyc = 2; break;
-    case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
+    case 0x70 ... 0x77:
         ST8(regs[(op >> 3) & 7] + ((op >> 6) & 31), regs[op & 7]); cyc = 2; break;
-    case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f:
+    case 0x78 ... 0x7f:
         regs[op & 7] = LD8(regs[(op >> 3) & 7] + ((op >> 6) & 31)); cyc = 2; break;
-    case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
+    case 0x80 ... 0x87:
         ST16(regs[(op >> 3) & 7] + ((op >> 5) & 0x3e), regs[op & 7]); cyc = 2; break;
-    case 0x88: case 0x89: case 0x8a: case 0x8b: case 0x8c: case 0x8d: case 0x8e: case 0x8f:
+    case 0x88 ... 0x8f:
         regs[op & 7] = LD16(regs[(op >> 3) & 7] + ((op >> 5) & 0x3e)); cyc = 2; break;
-    case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97:
+    case 0x90 ... 0x97:
         ST32(regs[13] + ((op & 0xff) << 2), regs[(op >> 8) & 7]); cyc = 2; break;
-    case 0x98: case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: case 0x9f:
+    case 0x98 ... 0x9f:
         regs[(op >> 8) & 7] = LD32(regs[13] + ((op & 0xff) << 2)); cyc = 2; break;
     /* ---- ADR, ADD Rd, SP, #imm */
-    case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: case 0xa5: case 0xa6: case 0xa7:
+    case 0xa0 ... 0xa7:
         regs[(op >> 8) & 7] = ((pc + 4u) & ~3u) + ((op & 0xff) << 2); break;
-    case 0xa8: case 0xa9: case 0xaa: case 0xab: case 0xac: case 0xad: case 0xae: case 0xaf:
+    case 0xa8 ... 0xaf:
         regs[(op >> 8) & 7] = regs[13] + ((op & 0xff) << 2); break;
     /* ---- divers */
     case 0xb0: { uint32_t v = (op & 0x7f) << 2; regs[13] += (op & 0x80) ? -v : v; break; } /* ADD/SUB SP */
@@ -4411,12 +4382,12 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
         default: v &= 0xff; break;                         /* UXTB */
         }
         regs[op & 7] = v; break; }
-    case 0xb4: case 0xb5: { /* PUSH {rlist[, lr]} : LR en bit 14 de la liste */
+    case 0xb4 ... 0xb5: { /* PUSH {rlist[, lr]} : LR en bit 14 de la liste */
         uint32_t n = popcount16(op & 0x1ff), a = regs[13] - 4u * n;
         regs[13] = a;
         stm_t(T, a, (op & 0xffu) | (op & 0x100u) << 6, n);
         cyc = 1 + n; break; }
-    case 0xbc: case 0xbd: { /* POP {rlist[, pc]} : PC en bit 15 de la liste */
+    case 0xbc ... 0xbd: { /* POP {rlist[, pc]} : PC en bit 15 de la liste */
         uint32_t n = popcount16(op & 0x1ff), a = regs[13];
         ldm_t(T, a, (op & 0xffu) | (op & 0x100u) << 7, n, &w);
         regs[13] = a + 4u * n;
@@ -4438,13 +4409,13 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
         default: break;
         }
         regs[op & 7] = v; break; }
-    case 0xbe: case 0xbf: break; /* BKPT, NOP/YIELD/WFE/WFI/SEV */
+    case 0xbe ... 0xbf: break; /* BKPT, NOP/YIELD/WFE/WFI/SEV */
     /* ---- LDMIA / STMIA */
-    case 0xc0: case 0xc1: case 0xc2: case 0xc3: case 0xc4: case 0xc5: case 0xc6: case 0xc7: {
+    case 0xc0 ... 0xc7: {
         uint32_t rn = (op >> 8) & 7, a = regs[rn], n = popcount16(op & 0xff);
         stm_t(T, a, op & 0xffu, n);
         regs[rn] = a + 4u * n; cyc = 1 + n; break; }
-    case 0xc8: case 0xc9: case 0xca: case 0xcb: case 0xcc: case 0xcd: case 0xce: case 0xcf: {
+    case 0xc8 ... 0xcf: {
         uint32_t rn = (op >> 8) & 7, a = regs[rn], n = popcount16(op & 0xff);
         ldm_t(T, a, op & 0xffu, n, &w);
         if (!(op & (1u << rn))) regs[rn] = a + 4u * n; /* pas d'écriture de base si Rn est chargé */
@@ -4465,11 +4436,11 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
     case 0xdc: if (!fZ && fN == fV) goto bcond; break;
     case 0xdd: if (fZ || fN != fV) goto bcond; break;
     bcond: BRANCH(pc + 4u + (uint32_t)((int32_t)(int8_t)(op & 0xff) * 2)); break;
-    case 0xde: case 0xdf: break; /* UDF, SVC : sans effet */
-    case 0xe0: case 0xe1: case 0xe2: case 0xe3: case 0xe4: case 0xe5: case 0xe6: case 0xe7: /* B */
+    case 0xde ... 0xdf: break; /* UDF, SVC : sans effet */
+    case 0xe0 ... 0xe7: /* B */
         BRANCH(pc + 4u + (uint32_t)(((int32_t)(op << 21)) >> 20)); break;
     /* ---- 32 bits : BL, MRS, MSR, barrières ; le reste est consommé */
-    case 0xf0: case 0xf1: case 0xf2: case 0xf3: case 0xf4: case 0xf5: case 0xf6: case 0xf7: {
+    case 0xf0 ... 0xf7: {
         uint32_t op2 = (pc + 2u < FLASH_SIZE)
                      ? (uint32_t)flash[pc + 2] | (uint32_t)flash[pc + 3] << 8 : fetchHalf(pc + 2u);
         if ((op2 & 0xd000) == 0xd000) { /* BL : S:I1:I2:imm10:imm11:0 */
@@ -4502,8 +4473,8 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
             }
         }
         break; }
-    case 0xe8: case 0xe9: case 0xea: case 0xeb: case 0xec: case 0xed: case 0xee: case 0xef:
-    case 0xf8: case 0xf9: case 0xfa: case 0xfb: case 0xfc: case 0xfd: case 0xfe: case 0xff:
+    case 0xe8 ... 0xef:
+    case 0xf8 ... 0xff:
         regs[15] = pc + 6u; break; /* 32 bits non ARMv6-M : paire consommée */
     default: break; /* 0xb1, 0xb3, 0xb7-0xb9, 0xbb : non alloués */
     }
