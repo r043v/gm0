@@ -265,8 +265,11 @@ static uint32_t emuTicksPerUs = 48u;
 static uint32_t nvmTag[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
 static uint32_t flashWaits; /* états d'attente de l'instruction courante */
 static inline void nvm_access(uint32_t a) {
+    /* sans branchement : succès/défaut alternent au fil du code (un défaut
+     * toutes les ~4 instructions séquentielles), le prédicteur s'y perdait */
     uint32_t line = (a >> 3) & 7u, tag = a >> 6;
-    if (nvmTag[line] != tag) { nvmTag[line] = tag; flashWaits++; }
+    flashWaits += nvmTag[line] != tag;
+    nvmTag[line] = tag;
 }
 
 
