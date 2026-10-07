@@ -125,9 +125,9 @@ static int spiDmaWrite; /* écriture DATA faite par le DMAC (déjà cadencée) *
  * (datasheet 27.8.1-2) : l'Arduino SPI.config() fait un SWRST à chaque
  * changement de vitesse, c'est ce qui purge les octets laissés par l'écran
  * avant la lecture des boutons des jeux lib */
-static void sercom4_ctrl_write(uint32_t r, uint32_t v) {
-    if (r == 0x00 && ((v & 1u) || !(v & 2u))) spiRxN = 0;
-    if (r == 0x04 && !(v & (1u << 17))) spiRxN = 0;
+static void sercom4_ctrl_write(uint32_t r, uint32_t v, uint32_t m) {
+    if (r == 0x00 && ((m & v & 1u) || ((m & 2u) && !(v & 2u)))) spiRxN = 0; /* SWRST, ENABLE=0 */
+    if (r == 0x04 && (m & (1u << 17)) && !(v & (1u << 17))) spiRxN = 0;     /* RXEN=0 */
 }
 static uint8_t  buttonData = 0xff;
 
@@ -158,8 +158,8 @@ static int      tc5Interrupt;
 static uint16_t pix[MAX_SCREEN_W * MAX_SCREEN_H];
 /* ST7735 */
 static int lcd_xStart, lcd_xEnd, lcd_yStart, lcd_yEnd, lcd_x, lcd_y;
-static uint32_t nvmAddr;         /* NVMCTRL ADDR (0x41004008) */
-static uint8_t nvmIntFlag = 1;   /* INTFLAG (0x41004014) : bit0 READY */
+static uint32_t nvmAddr;         /* NVMCTRL ADDR (0x4100401C), en demi-mots */
+static uint32_t nvmCtrlB;        /* NVMCTRL CTRLB (0x41004004), relu tel qu'écrit */
 static int lcd_argIndex, lcd_lastCommand, lcd_tmp;
 
 /* carte SD (PA27) */
@@ -219,6 +219,13 @@ static uint32_t maxFrames;
  * chargement de descripteur (des millions d'appels par seconde) */
 #define ENVFLAG(name) __extension__({ static int envf_ = -1; \
     if (envf_ < 0) { envf_ = getenv(name) ? 1 : 0; } envf_; })
+
+/* voies d'octet d'un accès au bus : n octets à l'adresse a touchent les
+ * octets [a, a+n) du mot aligné.  LANES = leur masque dans le mot ; un
+ * registre ne prend que ses voies (MERGE), une lecture rend le mot décalé */
+#define LANES(n, a)      (((n) == 4 ? ~0u : (1u << (8 * (n))) - 1u) << (8 * ((a) & 3u)))
+#define LANE8(x, k)      (((x) >> (8 * (k))) & 0xffu)
+#define MERGE(old, v, m) (((old) & ~(m)) | ((v) & (m)))
 
 #define TGT_META    0
 #define TGT_POKITTO 1
@@ -287,29 +294,30 @@ static void     incrementPc(void);
 static void     sercom4_write(uint8_t v);
 static uint8_t  st7735_byte(uint8_t v);
 
-/* ports : OUT/OUTSET/OUTCLR/OUTTGL/DIR* (comme port-register.ts) */
-static void port_write(int group, uint32_t off, uint32_t v) {
+/* PORT (un groupe, registre aligné) : DIR/OUT et leurs CLR/SET/TGL ; IN
+ * rend OUT pour les sorties, 1 pour les entrées (pull-ups) */
+static void port_write(int group, uint32_t reg, uint32_t v, uint32_t m) {
     uint32_t *outp = group ? &portB_out : &portA_out;
     uint32_t *dirp = group ? &portB_dir : &portA_dir;
-    switch (off) {
-        case 0x00: *dirp ^= v; break;
+    switch (reg) {
+        case 0x00: *dirp = MERGE(*dirp, v, m); break;
         case 0x04: *dirp &= ~v; break;
         case 0x08: *dirp |= v; break;
         case 0x0c: *dirp ^= v; break;
-        case 0x10: *outp = v; break;
+        case 0x10: *outp = MERGE(*outp, v, m); break;
         case 0x14: *outp &= ~v; break;
         case 0x18: *outp |= v; break;
         case 0x1c: *outp ^= v; break;
     }
 }
 
-static uint32_t port_read(int group, uint32_t off) {
+static uint32_t port_read(int group, uint32_t reg) {
     uint32_t out = group ? portB_out : portA_out;
     uint32_t dir = group ? portB_dir : portA_dir;
-    switch (off) {
+    switch (reg) {
         case 0x00: case 0x04: case 0x08: case 0x0c: return dir;
         case 0x10: case 0x14: case 0x18: case 0x1c: return out;
-        case 0x20: return 0xffffffff; /* IN : entrées hautes */
+        case 0x20: return (out & dir) | ~dir;                  /* IN */
     }
     return 0;
 }
@@ -319,6 +327,7 @@ static uint32_t port_read(int group, uint32_t off) {
  * plus proche ; ×1 au domaine natif 48 MHz, ×5/12 dans le domaine TS) */
 static uint32_t tc_period_ticks(uint32_t ctrlA, uint32_t top) {
     static const uint16_t prescTab[8] = {1, 2, 4, 8, 16, 64, 256, 1024};
+    if (((ctrlA >> 2) & 3u) != 2u) top &= 0xffffu; /* CTRLA.MODE : CC0 16 bits hors COUNT32 */
     uint32_t cycles = (uint32_t)prescTab[(ctrlA >> 8) & 7u] * (top + 1u);
     uint32_t per = (uint32_t)(((uint64_t)cycles * emuTicksPerUs + 24u) / 48u);
     return per < 2 ? 2 : per;
@@ -518,7 +527,9 @@ static void audio_frame(void) {
     __atomic_store(&aqP.now, &t, __ATOMIC_RELEASE);
 }
 
+static uint16_t dacData; /* DAC DATA (écritures partielles fusionnées) */
 static void dac_write(uint16_t v) {
+    dacData = v;
     tc4Writes++;
     v &= 0x3ffu; /* le TS masque sur 10 bits (DAC->DATA & 0x3ff) */
     /* 0..1023 (milieu 512) -> pleine échelle 16 bits, SATURÉ : la lib
@@ -3308,7 +3319,7 @@ static void nvic_return(void) {
     }
 }
 
-/* registres du SCS (0xE000E000-0xE000EFFF), accès mot */
+/* registres du SCS (0xE000E000-0xE000EFFF), par mot aligné */
 static uint32_t scs_read(uint32_t a) {
     switch (a) {
     case 0xe000e010u: { /* SYST_CSR : ENABLE|TICKINT|CLKSOURCE (+ COUNTFLAG) */
@@ -3332,7 +3343,7 @@ static uint32_t scs_read(uint32_t a) {
     }
     return 0;
 }
-static void scs_write(uint32_t a, uint32_t v) {
+static void scs_write(uint32_t a, uint32_t v, uint32_t m) {
     irq_work();
     switch (a) {
     case 0xe000e018u: sysTickTrigger = 0; return;          /* SYST_CVR : toute écriture le remet à 0 */
@@ -3344,11 +3355,12 @@ static void scs_write(uint32_t a, uint32_t v) {
         if (v & (1u << 26)) sysTickPend = 1;
         if (v & (1u << 25)) sysTickPend = 0;
         return;
-    case 0xe000ed20u: shprSysTick = (uint8_t)((v >> 24) & 0xc0u); return;
+    case 0xe000ed20u: if (m >> 24) shprSysTick = (uint8_t)((v >> 24) & 0xc0u); return; /* PRI_15 */
     }
-    if (a >= 0xe000e400u && a < 0xe000e420u) {
+    if (a >= 0xe000e400u && a < 0xe000e420u) {             /* IPR0-7 : une priorité par voie */
         uint32_t i = a - 0xe000e400u;
-        for (int k = 0; k < 4; k++) nvicIpr[i + k] = (uint8_t)((v >> (8 * k)) & 0xc0u);
+        for (int k = 0; k < 4; k++)
+            if (LANE8(m, k)) nvicIpr[i + k] = (uint8_t)(LANE8(v, k) & 0xc0u);
     }
 }
 
@@ -3376,8 +3388,10 @@ static int dbg(void) {
 /* Bus des périphériques META : l'adresse est décodée une fois.  Le numéro
  * du périphérique tient dans un octet — pont APB A/B/C en bits 24-25, bloc
  * de 1 Ko dans le pont en bits 10-15 (SAMD21 §10.2) — puis le registre est
- * l'offset dans son bloc : deux switch denses (tables de saut).  Hors des
- * ponts (bits 16-23 non nuls), rien n'est décodé. */
+ * le mot aligné dans son bloc : deux switch denses (tables de saut).  Les
+ * accès sont vus par voies d'octet (LANES) : chaque registre ne prend que
+ * ses octets, quelle que soit la largeur de l'accès.  Hors des ponts (bits
+ * 16-23 non nuls), rien n'est décodé. */
 #define APB_PERIPH(a) ((((a) >> 18) & 0xc0u) | (((a) >> 10) & 0x3fu))
 #define IS_APB(a)     (((a) & 0xfcff0000u) == 0x40000000u)
 enum {
@@ -3393,16 +3407,37 @@ enum {
     P_ADC     = APB_PERIPH(0x42004000u),
     P_DAC     = APB_PERIPH(0x42004800u),
 };
-/* PORT : groupe A à 0x00, B à 0x80 ; seuls DIR* et OUT* (0x00-0x1f) */
-static int port_reg(uint32_t r) { return r < 0x100u && (r & 0x60u) == 0; }
+/* PORT : groupe A à 0x00, B à 0x80 ; DIR*, OUT*, IN (0x00-0x23) */
+#define PORT_REG(r) ((r) < 0x100u && ((r) & 0x7fu) < 0x24u)
 
 /* Registres de canal du DMAC.  Fenêtre CHID (0x40-0x4f) : le canal choisi
  * par CHID.  La lib officielle adresse aussi les canaux en INDEXÉ — 16
  * octets par canal : Channel[n] = 0x40 + n*16, CHCTRLA@+0, CHCTRLB@+4,
- * CHINTENCLR@+C, CHINTENSET@+D, CHINTFLAG@+E ; le canal 0 y tombe dans la
- * fenêtre (la lib n'écrit jamais CHID), les canaux 1+ à 0x50-0xff. */
+ * CHINTENCLR@+C, CHINTENSET@+D, CHINTFLAG@+E, CHSTATUS@+F ; le canal 0 y
+ * tombe dans la fenêtre (la lib n'écrit jamais CHID), les canaux 1+ à
+ * 0x50-0xff.  Lecture commune aux deux vues (off = mot dans le canal). */
+static uint32_t dmac_chan_read(uint32_t ch, uint32_t off) {
+    if (ch >= DMAC_CHANNELS) return 0;
+    switch (off) {
+    case 0x0: /* CHCTRLA : état réel du canal.
+               * La lib officielle lit ENABLE avant de réarmer (sendBuffer :
+               * start = !(CHCTRLA.bit.ENABLE)) — renvoyer 0 pendant un
+               * transfert la poussait à réarmer en plein vol, tronquant
+               * le bloc en cours (écran cisaillé/frozen des jeux INDEX). */
+        return dmaOn[ch] ? 2 : 0;
+    case 0x4: /* CHCTRLB : TRIGSRC relu — le guest fait
+               * « CHCTRLB.reg |= CMD_RESUME » en RMW ; renvoyer 0
+               * lui faisait écrire une valeur sans TRIGSRC, qui
+               * effaçait le déclencheur du canal (RX SD mort). */
+        return (uint32_t)dmaTrig[ch] << 8;
+    case 0xc: /* CHINTENCLR et CHINTENSET (relisent l'activation), CHINTFLAG,
+               * CHSTATUS (FERR=bit2, BUSY=bit1) */
+        return dmacIntEn[ch] * 0x0101u | (uint32_t)dmacIntFlag[ch] << 16
+             | (uint32_t)((dmaFerr[ch] ? 0x04u : 0u) | (dmaOn[ch] ? 0x02u : 0u)) << 24;
+    }
+    return 0;
+}
 static uint32_t dmac_read(uint32_t r) {
-    uint32_t ch = dmac_chid;
     switch (r) {
     case 0x20: /* INTPEND : premier canal avec un drapeau levé
                 * (datasheet : bit4 TCMPL, bit5 SUSP, bit6 TERR —
@@ -3417,41 +3452,32 @@ static uint32_t dmac_read(uint32_t r) {
             }
         }
         return 0;
-    case 0x40: /* CHCTRLA : état réel du canal.
-                * La lib officielle lit ENABLE avant de réarmer (sendBuffer :
-                * start = !(CHCTRLA.bit.ENABLE)) — renvoyer 0 pendant un
-                * transfert la poussait à réarmer en plein vol, tronquant
-                * le bloc en cours (écran cisaillé/frozen des jeux INDEX). */
-        return ch < DMAC_CHANNELS && dmaOn[ch] ? 2 : 0;
-    case 0x44: /* CHCTRLB : TRIGSRC relu — le guest fait
-                * « CHCTRLB.reg |= CMD_RESUME » en RMW ; renvoyer 0
-                * lui faisait écrire une valeur sans TRIGSRC, qui
-                * effaçait le déclencheur du canal (RX SD mort). */
-        return ch < DMAC_CHANNELS ? (uint32_t)dmaTrig[ch] << 8 : 0;
-    case 0x4e: return ch < DMAC_CHANNELS ? dmacIntFlag[ch] : 0;   /* CHINTFLAG */
-    case 0x4f: /* CHSTATUS : FERR=bit2, BUSY=bit1 */
-        return ch < DMAC_CHANNELS ? (uint32_t)((dmaFerr[ch] ? 0x04u : 0u) | (dmaOn[ch] ? 0x02u : 0u)) : 0u;
+    case 0x34: return dmac_baseAddr;                        /* BASEADDR */
+    case 0x38: return dmac_wrbAddr;                         /* WRBADDR */
+    case 0x3c: return dmac_chid << 24;                      /* CHID (octet 0x3F) */
     }
-    if (r >= 0x50 && r < 0x100) { /* canaux indexés */
-        uint32_t n = (r - 0x40) >> 4;
-        if ((r & 0xfu) == 0xd) return dmacIntEn[n];   /* CHINTENSET */
-        if ((r & 0xfu) == 0xe) return dmacIntFlag[n]; /* CHINTFLAG */
-    }
+    if (r >= 0x40 && r < 0x100)                             /* fenêtre CHID, puis canaux indexés */
+        return dmac_chan_read(r < 0x50 ? dmac_chid : (r - 0x40) >> 4, r & 0xcu);
     return 0;
 }
 
-/* lectures périphériques : registres à état ou à effet, tout le reste lit
- * 0.  size = largeur de l'accès (1, 2, 4) : les rares registres qui en
- * dépendent le disent. */
-static uint32_t periph_read(uint32_t a, int size) {
-    uint32_t r = a & 0x3ffu;
+/* lecture du mot aligné du registre ; m = voies lues (les registres à
+ * effet de lecture n'agissent que si les leurs en font partie) */
+static uint32_t periph_read(uint32_t a, uint32_t m) {
+    uint32_t r = a & 0x3fcu;
     switch (APB_PERIPH(a)) {
     case P_SYSCTRL:
-        return r == 0x0c && size == 4 ? 0b11010010 : 0;     /* PCLKSR : tout prêt (mot) */
+        return r == 0x0c ? 0b11010010 : 0;                  /* PCLKSR : tout prêt */
     case P_NVMCTRL:
-        return r == 0x14 ? nvmIntFlag : 0;                  /* INTFLAG : READY */
+        switch (r) {
+        case 0x04: return nvmCtrlB;                         /* CTRLB */
+        case 0x08: return 3u << 16 | FLASH_SIZE / 64;       /* PARAM : pages de 64 o (PSZ=3), NVMP */
+        case 0x14: return 1;                                /* INTFLAG : READY (commandes instantanées) */
+        case 0x1c: return nvmAddr;                          /* ADDR */
+        }
+        return 0;
     case P_PORT:
-        return port_reg(r) ? port_read((int)(r >> 7), r & 0x1fu) : 0;
+        return PORT_REG(r) ? port_read((int)(r >> 7), r & 0x7cu) : 0;
     case P_DMAC:
         return dmac_read(r);
     case P_SERCOM4:
@@ -3464,6 +3490,7 @@ static uint32_t periph_read(uint32_t a, int size) {
             return v;
         }
         case 0x28: /* DATA : retire l'octet le plus ancien du tampon */
+            if (!(m & 0xffu)) return 0;
             if (spiRxN) {
                 uint8_t d = spiRx[0].d;
                 spiRx[0] = spiRx[1];
@@ -3475,14 +3502,13 @@ static uint32_t periph_read(uint32_t a, int size) {
         return 0;
     case P_SERCOM5:
         return r == 0x18 ? 0x07 : r == 0x28 ? 0x80 : 0;     /* INTFLAG, DATA */
-    case P_TC4:
-        return r == 0x0d ? tc4IntEnMask : r == 0x0e ? tc4IntFlagMask : 0; /* INTENSET, INTFLAG */
-    case P_TC5:
-        return r == 0x0d ? tc5IntEnMask : r == 0x0e ? tc5IntFlagMask : 0;
-    case P_ADC:
-        if (r == 0x18) return size == 1;                    /* INTFLAG.RESRDY (octet) */
-        if (r == 0x1a) return size != 1 ? adc_random() : 0; /* RESULT (mot, demi-mot) */
-        return 0;
+    case P_TC4: case P_TC5: {                               /* INTENCLR/SET, INTFLAG */
+        int is5 = APB_PERIPH(a) == P_TC5;
+        uint32_t en = is5 ? tc5IntEnMask : tc4IntEnMask, fl = is5 ? tc5IntFlagMask : tc4IntFlagMask;
+        return r == 0x0c ? en * 0x0101u | fl << 16 : 0;
+    }
+    case P_ADC: /* INTFLAG.RESRDY (0x18), RESULT (0x1A) */
+        return r == 0x18 ? 1u | ((m >> 16) ? adc_random() << 16 : 0) : 0;
     }
     return 0;
 }
@@ -3502,7 +3528,7 @@ static uint32_t bus_read(uint32_t a, int size) {
         return v;
     }
     if (a < 0x40000000u) return 0;                          /* au-delà de la SRAM */
-    if (IS_APB(a)) return periph_read(a, size);
+    if (IS_APB(a)) return periph_read(a, LANES(size, a)) >> (8 * (a & 3u));
     if (a - 0xe000e000u < 0x1000u) return scs_read(a & ~3u) >> (8 * (a & 3u));
     return 0;
 }
@@ -3530,27 +3556,18 @@ static uint8_t fetchByte(uint32_t a) {
 
 /* montre générique d'écriture (WATCH_ADDR), pour le débogage */
 static uint32_t prevInstPc;  /* PC à l'entrée du pas courant (la boucle le tient à jour) */
-/* programmation flash (auto-patch des loaders) : effet net du NVMCTRL —
- * la valeur écrite est stockée en flash et le code fraîchement écrit est
- * exécuté aux pas suivants.  Le contrôleur (0x41004000+) est modélisé au
- * strict minimum : ADDR retenu, commande EP (effacement de page de 64 o)
- * appliquée, INTFLAG relu avec READY=1 — les installeurs des loaders
- * sondent READY avant de rendre la main (Picomon rend le CPSID sans le
- * CPSIE si le sondage ne passe pas : interruptions mortes, écran noir).
- * L'alias physique 0x00400000 est accepté en écriture aussi.
+/* programmation flash (auto-patch des loaders) : la valeur écrite est
+ * stockée en flash (le tampon de page et sa commande WP sont confondus) et
+ * le code fraîchement écrit est exécuté aux pas suivants.  L'alias
+ * physique 0x00400000 est accepté en écriture aussi.
  *
- * Build wasm : écritures simplement IGNORÉES (comportement d'avant) — la
- * distribution web privilégie le démarrage partout ; les écrans de boot
- * sont identiques, seuls les auto-patchs des loaders restent inertes. */
+ * Build wasm : écritures simplement IGNORÉES — la distribution web
+ * privilégie le démarrage partout ; les écrans de boot sont identiques,
+ * seuls les auto-patchs des loaders restent inertes. */
+static void flash_store(uint32_t a, uint32_t v, int bytes) {
 #ifdef __EMSCRIPTEN__
-static void flash_store(uint32_t a, uint32_t v, int bytes) {
     (void)a; (void)v; (void)bytes;
-}
-static void nvmctrl_write(uint32_t r, uint32_t v) {
-    (void)r; (void)v; /* wasm : pas d'auto-patch, pas de contrôleur */
-}
 #else
-static void flash_store(uint32_t a, uint32_t v, int bytes) {
     if (a >= FLASH_PHYS_BASE) a -= FLASH_PHYS_BASE;
     if (a + (uint32_t)bytes > FLASH_SIZE) return;
     static int nvmDbg = -1;
@@ -3561,34 +3578,33 @@ static void flash_store(uint32_t a, uint32_t v, int bytes) {
                                           v & ((1u << (bytes * 8)) - 1), bytes);
         n++;
     }
-    uint8_t *p = flash + a;
-    if (bytes == 4) {
-        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-        p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
-    } else if (bytes == 2) {
-        p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-    } else p[0] = (uint8_t)v;
+    memcpy(flash + a, &v, (size_t)bytes);
+    nvmAddr = a >> 1; /* le matériel suit l'adresse écrite dans le tampon de page */
+#endif
 }
 
-/* NVMCTRL minimal : ADDR + commande EP (effacement de page de 64 o) ;
- * INTFLAG relu avec READY — les installeurs des loaders sondent ce
- * drapeau avant de réactiver les interruptions */
-static void nvmctrl_write(uint32_t r, uint32_t v) {
+/* NVMCTRL (datasheet 22.8) : CTRLA = CMD | CMDEX 0xA5 en un seul accès,
+ * ADDR en demi-mots.  Seul ER (effacement d'une rangée de 4 pages, 256 o)
+ * a un effet : WP/WAP sont confondus avec l'écriture, PBC et les verrous
+ * sans objet.  Toute commande est instantanée — INTFLAG.READY lit 1, que
+ * les installeurs des loaders sondent avant de réactiver les
+ * interruptions (Picomon). */
+static void nvmctrl_write(uint32_t r, uint32_t v, uint32_t m) {
     switch (r) {
-    case 0x08: nvmAddr = v; return;                            /* ADDR */
-    case 0x04: case 0x05: {                                    /* CTRLB.CMD */
-        uint32_t cmd = r == 0x04 ? (v & 0x7fu) : (v >> 8) & 0x7fu;
-        if (cmd == 0x03u && nvmAddr < FLASH_SIZE) {            /* EP */
-            uint32_t page = nvmAddr & ~63u;
-            if (page + 64 <= FLASH_SIZE) memset(flash + page, 0xff, 64);
+    case 0x00:                                                 /* CTRLA */
+        if ((m & 0xffffu) != 0xffffu || LANE8(v, 1) != 0xa5u) return;
+        if ((v & 0x7fu) == 0x02u) {                            /* ER */
+            uint32_t row = (nvmAddr << 1) & ~255u;
+#ifndef __EMSCRIPTEN__
+            if (row + 256 <= FLASH_SIZE) memset(flash + row, 0xff, 256);
+#endif
+            (void)row;
         }
-        nvmIntFlag = 1; /* commande acceptée : READY */
         return;
-    }
-    case 0x14: nvmIntFlag = 1; return;                         /* INTFLAG clear */
+    case 0x04: nvmCtrlB = MERGE(nvmCtrlB, v, m); return;      /* CTRLB */
+    case 0x1c: nvmAddr = MERGE(nvmAddr, v, m) & 0x3fffffu; return; /* ADDR */
     }
 }
-#endif /* __EMSCRIPTEN__ */
 
 /* ré-armement level-triggered : le NVIC ré-entre tant qu'un AUTRE canal a
  * une fin de transfert (TCMPL) à la fois levée (CHINTFLAG) et activée
@@ -3607,9 +3623,9 @@ static void dmac_rearm_from(uint32_t done_ch) {
  * RESUME=0x2 charge le descripteur en attente (suspend après bloc) ; reçu
  * pendant un bloc, il saute le prochain suspend (20.6.3.3).  SUSPEND=0x1 :
  * le canal s'arrête à la fin du bloc en cours. */
-static void dmac_chid_chctrlb_write(uint32_t ch, uint32_t v) {
+static void dmac_chid_chctrlb_write(uint32_t ch, uint32_t v, uint32_t m) {
     uint32_t cmd = (v >> 24) & 3u;
-    if (cmd == 0x2u) {
+    if ((m >> 24) && cmd == 0x2u) {
         if (dmaOn[ch]) dmaSkipSuspend[ch] = 1;
         else if (dmaResumeAt[ch]) {
             uint32_t at = dmaResumeAt[ch];
@@ -3628,7 +3644,7 @@ static void dmac_chid_chctrlb_write(uint32_t ch, uint32_t v) {
     }
     /* comme le TS : seul TRIGSRC est retenu (le reste du champ est
      * reconstitué par les écritures du guest) */
-    dmaTrig[ch] = (uint8_t)((v >> 8) & 0x3fu);
+    if (m & 0xff00u) dmaTrig[ch] = (uint8_t)((v >> 8) & 0x3fu);
 }
 
 /* CHCTRLA de la fenêtre CHID : SWRST, canal audio (TC4), désactivations,
@@ -3743,99 +3759,100 @@ static void dmac_chid_chctrla_write(uint32_t ch, uint32_t v) {
     dmac_raise(ch, 0x02); /* verrouillé, traité au prochain step (TS) */
 }
 
-/* écritures de registres DMAC (voir dmac_read pour la fenêtre CHID et les
- * canaux indexés) */
-static void dmac_write(uint32_t r, uint32_t v, int size) {
-    uint32_t ch = dmac_chid;
+/* CHINTENCLR, CHINTENSET, CHINTFLAG d'un canal (mot 0x...C).  CHINTFLAG
+ * acquitté : l'interruption DMAC est level-triggered sur le hardware, tant
+ * qu'un autre canal attend une fin de transfert (TCMPL) le NVIC ré-entre —
+ * voir dmac_rearm_from */
+static void dmac_chan_int_write(uint32_t ch, uint32_t v, uint32_t m) {
+    if (m & 0xffu) dmacIntEn[ch] &= (uint8_t)~v;
+    if (m & 0xff00u) dmacIntEn[ch] |= (uint8_t)(v >> 8);
+    if (m & 0xff0000u) { dmacIntFlag[ch] &= (uint8_t)~(v >> 16); dmac_rearm_from(ch); }
+}
+
+/* écritures de registres DMAC (voir dmac_chan_read pour la fenêtre CHID et
+ * les canaux indexés) */
+static void dmac_write(uint32_t r, uint32_t v, uint32_t m) {
     switch (r) {
-    case 0x34: dmac_baseAddr = v; return;                       /* BASEADDR */
-    case 0x38: dmac_wrbAddr = v; return;                        /* WRBADDR */
-    case 0x3f:                                                  /* CHID */
-        dmac_chid = v;
-        if (ENVFLAG("EMU_DESC_DEBUG")) fprintf(stderr, "[chid] t=%u chid=%u\n", tickCount, v);
+    case 0x34: dmac_baseAddr = MERGE(dmac_baseAddr, v, m); return;  /* BASEADDR */
+    case 0x38: dmac_wrbAddr = MERGE(dmac_wrbAddr, v, m); return;    /* WRBADDR */
+    case 0x3c:                                                      /* CHID (octet 0x3F) */
+        if (!(m >> 24)) return;
+        dmac_chid = (v >> 24) & 0xfu;
+        if (ENVFLAG("EMU_DESC_DEBUG")) fprintf(stderr, "[chid] t=%u chid=%u\n", tickCount, dmac_chid);
         return;
     }
-    if (r >= 0x40 && r < 0x50) { /* fenêtre CHID */
-        if (ch >= DMAC_CHANNELS) return;
-        switch (r) {
-        case 0x40: dmac_chid_chctrla_write(ch, v); return;      /* CHCTRLA */
-        case 0x44: dmac_chid_chctrlb_write(ch, v); return;      /* CHCTRLB */
-        case 0x4c: /* CHINTENCLR, et CHINTENSET dans l'octet haut d'un accès large */
-            dmacIntEn[ch] &= (uint8_t)~v;
-            dmacIntEn[ch] |= (uint8_t)(v >> 8);
-            return;
-        case 0x4d: dmacIntEn[ch] |= (uint8_t)v; return;         /* CHINTENSET */
-        case 0x4e: /* CHINTFLAG : acquittement.  L'interruption DMAC est
-                    * level-triggered sur le hardware : tant qu'un autre
-                    * canal attend une fin de transfert (TCMPL), le NVIC
-                    * ré-entre — voir dmac_rearm_from */
-            dmacIntFlag[ch] &= (uint8_t)~v;
-            dmac_rearm_from(ch);
-            return;
-        }
+    if (r < 0x40 || r >= 0x100) return;
+    int window = r < 0x50;
+    uint32_t ch = window ? dmac_chid : (r - 0x40) >> 4;
+    if (ch >= DMAC_CHANNELS) return;
+    switch (r & 0xcu) {
+    case 0x0:                                                       /* CHCTRLA */
+        if (!(m & 0xffu)) return;
+        if (window) dmac_chid_chctrla_write(ch, v & 0xffu);
+        else dmac_chctrla_write(ch, v & 0xffu);
         return;
-    }
-    if (r >= 0x50 && r < 0x100) { /* canaux indexés */
-        uint32_t n = (r - 0x40) >> 4;
-        switch (r & 0xfu) {
-        case 0x0: if (size != 2) dmac_chctrla_write(n, v); return;              /* CHCTRLA (octet, mot) */
-        case 0x4: if (size == 4) dmaTrig[n] = (uint8_t)((v >> 8) & 0x3fu); return; /* CHCTRLB.TRIGSRC (mot) */
-        case 0xc: dmacIntEn[n] &= (uint8_t)~v; return;                          /* CHINTENCLR */
-        case 0xd: dmacIntEn[n] |= (uint8_t)v; return;                           /* CHINTENSET */
-        case 0xe: dmacIntFlag[n] &= (uint8_t)~v; dmac_rearm_from(n); return;    /* CHINTFLAG */
-        }
+    case 0x4:                                                       /* CHCTRLB */
+        if (window) dmac_chid_chctrlb_write(ch, v, m);
+        else if (m & 0xff00u) dmaTrig[ch] = (uint8_t)((v >> 8) & 0x3fu); /* TRIGSRC */
+        return;
+    case 0xc: dmac_chan_int_write(ch, v, m); return;
     }
 }
 
-/* TC4/TC5 : registres communs, état séparé */
-static void tc_write(int is5, uint32_t r, uint32_t v) {
+/* TC4/TC5 (COUNT16) : registres communs, état séparé */
+static void tc_write(int is5, uint32_t r, uint32_t v, uint32_t m) {
     switch (r) {
-    case 0x00:                                                  /* CTRLA */
-        if (is5) { tc5_write_ctrla(v); return; }
+    case 0x00:                                                      /* CTRLA */
+        if (!(m & 0xffffu)) return;
+        if (is5) { tc5_write_ctrla(MERGE(tc5CtrlA, v, m & 0xffffu)); return; }
         if (dbg() && dbgTc4Cfg < 8) { fprintf(stderr, "[dbg] CTRLA <- %x\n", v); dbgTc4Cfg++; }
-        tc4_write_ctrla(v);
+        tc4_write_ctrla(MERGE(tc4CtrlA, v, m & 0xffffu));
         return;
-    case 0x0c: tc_intclr(is5, v); return;                       /* INTENCLR */
-    case 0x0d: tc_inten(is5, v); return;                        /* INTENSET : OVF=0x01 (jeux maison), MC0=0x10 (lib) */
-    case 0x0e: *(is5 ? &tc5IntFlagMask : &tc4IntFlagMask) &= (uint8_t)~v; return; /* INTFLAG : acquittement */
-    case 0x18: if (is5) tc5_write_cc0(v); else tc4_write_cc0(v); return;          /* CC0 */
+    case 0x0c:                                                      /* INTENCLR, INTENSET, INTFLAG */
+        if (m & 0xffu) tc_intclr(is5, v & 0xffu);
+        if (m & 0xff00u) tc_inten(is5, (v >> 8) & 0xffu);           /* OVF=0x01 (jeux maison), MC0=0x10 (lib) */
+        if (m & 0xff0000u) *(is5 ? &tc5IntFlagMask : &tc4IntFlagMask) &= (uint8_t)~(v >> 16); /* acquittement */
+        return;
+    case 0x18:                                                      /* CC0 */
+        if (is5) tc5_write_cc0(MERGE(tc5Top, v, m)); else tc4_write_cc0(MERGE(tc4Top, v, m));
+        return;
     }
 }
 
-static void periph_write(uint32_t a, uint32_t v, int size) {
-    uint32_t r = a & 0x3ffu;
+/* écriture du mot aligné du registre : v déjà placé sur ses voies, m = voies écrites */
+static void periph_write(uint32_t a, uint32_t v, uint32_t m) {
+    uint32_t r = a & 0x3fcu;
     switch (APB_PERIPH(a)) {
     case P_GCLK:
         /* sans effet : la cadence des TC est dérivée de CTRLA/CC0, et le
          * générateur vaut 48 MHz pour les configurations audio rencontrées
          * (lib standard comme jeux maison) */
-        if (dbg() && r == 0x02 && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v); dbgTc4Cfg++; }
-        if (dbg() && (r == 0x04 || r == 0x08)) fprintf(stderr, "[gclk] %s <- %x\n", r == 0x04 ? "GENDIV" : "GENCTRL", v);
+        if (!dbg()) return;
+        if (r == 0x00 && (m >> 16) && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v >> 16); dbgTc4Cfg++; }
+        if (r == 0x04 || r == 0x08) fprintf(stderr, "[gclk] %s <- %x\n", r == 0x04 ? "GENCTRL" : "GENDIV", v);
         return;
     case P_NVMCTRL:
-        nvmctrl_write(r, v);
+        nvmctrl_write(r, v, m);
         return;
     case P_PORT:
-        if (port_reg(r)) port_write((int)(r >> 7), r & 0x1fu, v);
+        if (PORT_REG(r)) port_write((int)(r >> 7), r & 0x7cu, v, m);
         return;
     case P_DMAC:
-        dmac_write(r, v, size);
+        dmac_write(r, v, m);
         return;
     case P_SERCOM4:
         switch (r) {
-        case 0x00: case 0x01: case 0x02: case 0x03:             /* CTRLA, CTRLB (voie d'octet) */
-        case 0x04: case 0x05: case 0x06: case 0x07:
-            sercom4_ctrl_write(r & ~3u, v << (8 * (r & 3u)));
-            return;
-        case 0x0a: case 0x0c: if (size == 1) spiBaud = v; return; /* BAUD (SPI : 0x0C ; 0x0A = compat TS), octet */
-        case 0x28: sercom4_write((uint8_t)v); return;           /* DATA */
+        case 0x00: case 0x04: sercom4_ctrl_write(r, v, m); return; /* CTRLA, CTRLB */
+        case 0x0c: if (m & 0xffu) spiBaud = v & 0xffu; return;     /* BAUD */
+        case 0x28: if (m & 0xffu) sercom4_write((uint8_t)v); return; /* DATA */
         }
         return;
     case P_TC4: case P_TC5:
-        tc_write(APB_PERIPH(a) == P_TC5, r, v);
+        tc_write(APB_PERIPH(a) == P_TC5, r, v, m);
         return;
     case P_DAC:
-        if (r != 0x08) return;                                  /* DATA */
+        if (r != 0x08 || !(m & 0xffffu)) return;                    /* DATA */
+        v = MERGE(dacData, v, m & 0xffffu);
         if (dbg() && dbgDac < 3) { fprintf(stderr, "[dbg] DAC <- %x\n", v); dbgDac++; }
         dac_write((uint16_t)v);
         return;
@@ -3847,8 +3864,9 @@ static void bus_write(uint32_t a, uint32_t v, int size) {
     if (a < 0x20000000u) { flash_store(a, v, size); return; }
     if (a < 0x40000000u) return;                            /* au-delà de la SRAM */
     timers_sync();                                          /* état des timers/DMA modifiable */
-    if (IS_APB(a)) periph_write(a, v, size);
-    else if (a - 0xe000e000u < 0x1000u) scs_write(a, v);    /* SCS : NVIC, SysTick, SCB */
+    uint32_t m = LANES(size, a), wv = v << (8 * (a & 3u));
+    if (IS_APB(a)) periph_write(a, wv, m);
+    else if (a - 0xe000e000u < 0x1000u) scs_write(a & ~3u, wv, m); /* SCS : NVIC, SysTick, SCB */
 }
 
 static void writeWord(uint32_t a, uint32_t v) {
@@ -4832,7 +4850,7 @@ static void reset_core(void) {
     spiRxN = 0; spiLastDone = spiPrevDone = 0;
     tc4Enabled = tc4Armed = 0;
     tc4IntEnMask = tc4IntFlagMask = 0;
-    tc4CtrlA = 0;
+    tc4CtrlA = 0; dacData = 0;
     tc5Enabled = tc5Armed = 0;
     tc5IntEnMask = tc5IntFlagMask = 0;
     tc5CtrlA = tc5Top = tc5Counter = 0;
