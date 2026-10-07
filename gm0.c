@@ -94,6 +94,13 @@ static uint32_t vectorBase;
 static uint32_t sysTickVector, dmacVector, tc4Vector, tc5Vector;
 static int dmacInterrupt, tc4Interrupt;
 static int irqWork = 1; /* le NVIC a peut-être quelque chose à prendre (voir nvic_service) */
+/* échéance machine commune aux deux cibles : step ne fait qu'une
+ * comparaison par instruction ; à l'échéance, machine_events traite
+ * timers LPC + interruptions (Pokitto) ou le NVIC (META).  Tout ce qui
+ * peut changer l'état (irq_work, registres de timers, AIRCR) la ramène à
+ * maintenant. */
+static uint32_t evtAt;
+static inline void irq_work(void) { irqWork = 1; evtAt = tickCount; }
 static long sysTickEntries;
 
 /* périphériques — PA27 (CS carte SD) et PA25 (CS boutons) hauts dès le
@@ -1970,16 +1977,18 @@ static void pk_pout_write(uint32_t p, uint32_t v) {
         if (!(pk_pout[1] & 1) && (v & 1))
             pk_lcd_reset();
         pk_pin[1] = (pk_pin[1] & ~pk_dir[1]) | (v & pk_dir[1]);
+        uint32_t chg = pk_pout[1] ^ v;
         pk_pout[1] = v;
-        /* latch R2R au niveau : GF écrit l'audio par POUT2 direct (mots),
-         * chemin que les déclencheurs SET/CLR/0xA0000057 ne voyaient pas —
-         * sa musique ne sortait jamais.  pk_audio_gpio_write dédoublonne. */
-        pk_audio_gpio_write();
+        /* latch R2R au niveau, quel que soit le chemin d'écriture ; seules
+         * les écritures qui touchent ses bits le recalculent (le bus LCD
+         * strobe P1_12 à chaque pixel) */
+        if ((chg & 0xF0000000u) || !pk_latchCount) pk_audio_gpio_write();
         return;
     }
+    uint32_t chg = pk_pout[2] ^ v;
     pk_pout[2] = v;
     pk_pin[2] = (pk_pin[2] & ~pk_dir[2]) | (v & pk_dir[2]);
-    pk_audio_gpio_write();
+    if ((chg & 0x00F00000u) || !pk_latchCount) pk_audio_gpio_write();
 }
 
 static void pk_audio_gpio_write(void) {
@@ -2240,8 +2249,6 @@ static uint32_t pk_timers_next(void) {
     return next == ~0u ? 1u << 20 : next; /* rien d'actif : re-regarder plus tard */
 }
 
-static uint32_t pkTimerNext;         /* tick de la prochaine échéance */
-static int       pkTimerNextValid;
 
 static void pk_timers_update(void) {
     /* COUNTFLAG posé pendant une section critique (IRQ masquées) : l'IRQ
@@ -2259,18 +2266,15 @@ static void pk_timers_update(void) {
     pk_ct_tick(&pk_ct[1], 1, delta);
 }
 
-/* chaîne d'interruptions + reset AIRCR, appelée au début de chaque pas */
+/* échéance Pokitto : reset AIRCR, timers LPC + GPIO, prochaine échéance */
 static void pk_machine_step(void) {
     if (sys_AIRCR & 4) { /* SYSRESETREQ */
         sys_AIRCR = 0x05FA0000u;
         pk_reset_core();
     }
-    if (!pkTimerNextValid || (int32_t)(tickCount - pkTimerNext) >= 0) {
-        pk_timers_update();
-        pk_gpio_update();
-        pkTimerNext = tickCount + pk_timers_next();
-        pkTimerNextValid = 1;
-    }
+    pk_timers_update();
+    pk_gpio_update();
+    evtAt = tickCount + pk_timers_next();
 }
 
 /* --- mémoire : bancs LPC (mêmes sémantiques que la référence :
@@ -2378,7 +2382,7 @@ static uint32_t pk_reg_peek(uint32_t a) {
     }
     if (a >= 0xE000E000u && a < 0xE0010000u) { /* PPB */
         uint32_t off = a - 0xE000E000u;
-        if (off <= 0x1Cu) pkTimerNextValid = 0; /* SysTick réécrit */
+        if (off <= 0x1Cu) evtAt = tickCount; /* SysTick réécrit */
         switch (off) {
             case 0x010: return pk_systickCSR;
             case 0x014: return pk_systickRVR;
@@ -2405,7 +2409,7 @@ static uint32_t pk_reg_read(uint32_t a) {
         if ((al == 0x40014008u || al == 0x40018008u) ||
             (al == 0x40024008u && pk_rtcEnabled)) {
             pk_timers_update();
-            pkTimerNextValid = 0; /* TC/RTC relus : l'échéance peut changer */
+            evtAt = tickCount; /* TC/RTC relus : l'échéance peut changer */
         }
         if (al == 0x40014008u) return pk_ct[0].r[PK_CT_TC];
         if (al == 0x40018008u) return pk_ct[1].r[PK_CT_TC];
@@ -2461,7 +2465,7 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
                 struct pk_ct *ct = ((a >> 14) & 0x1F) == 5 ? &pk_ct[0] : &pk_ct[1];
                 uint32_t off = a - (((a >> 14) & 0x1F) == 5 ? 0x40014000u : 0x40018000u);
                 uint32_t idx = off >> 2;
-                pkTimerNextValid = 0; /* l'échéance peut changer */
+                evtAt = tickCount; /* l'échéance peut changer */
                 if (idx == 0) { ct->r[0] &= ~v; return; }        /* IR : acquitte */
                 if (idx == 1) {                                   /* TCR */
                     ct->r[1] = v;
@@ -2582,7 +2586,7 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
             case 0x100: case 0x180: case 0x200: case 0x280:
                 pk_syscon[192 + off / 0x80] = v; return;
             case 0xD08: sys_VTOR = v; return;
-            case 0xD0C: sys_AIRCR = 0x05FA0000u | (v & 4); return;
+            case 0xD0C: sys_AIRCR = 0x05FA0000u | (v & 4); evtAt = tickCount; return;
             default: return;
         }
     }
@@ -2716,7 +2720,7 @@ static void pk_reset_core(void) {
     armIrqEnable = 1;
     tickCount = 0;
     pk_lastTick = 0;
-    pkTimerNextValid = 0;
+    evtAt = tickCount;
 
     /* SYSCON / périphériques (valeurs de la référence) */
     memset(pk_syscon, 0, sizeof pk_syscon);
@@ -3063,7 +3067,7 @@ static uint8_t  dmacIntEn[DMAC_CHANNELS];   /* CHINTENSET par canal (lecture) */
  * écran) prenait ça pour la fin d'une bande d'affichage — file LCD
  * désynchronisée, bandes jamais envoyées, lignes périmées ou en double. */
 static void dmac_raise(uint32_t ch, uint8_t bits) {
-    if (ch < DMAC_CHANNELS && (dmacIntEn[ch] & bits)) { dmacInterrupt = 1; irqWork = 1; }
+    if (ch < DMAC_CHANNELS && (dmacIntEn[ch] & bits)) { dmacInterrupt = 1; irq_work(); }
 }
 static uint8_t  dmaFerr[DMAC_CHANNELS];     /* CHSTATUS.FERR : descripteur invalide chargé */
 static uint32_t dmaResumeAt[DMAC_CHANNELS]; /* descripteur à charger au prochain RESUME (suspend après bloc, BLOCKACT 0x2/0x3) */
@@ -3281,7 +3285,7 @@ static void nvic_reset(void) {
     shprSysTick = 0;
     sysTickPend = 0;
     excDepth = 0;
-    irqWork = 1;
+    irq_work();
 }
 
 static int exc_priority(int exc) {
@@ -3346,7 +3350,7 @@ static void nvic_service(void) {
     if (sysTickPend && exc_priority(15) < bestPri) { best = 15; bestPri = exc_priority(15); }
     for (int n = 0; ready; n++, ready >>= 1)
         if ((ready & 1u) && exc_priority(16 + n) < bestPri) { best = 16 + n; bestPri = exc_priority(16 + n); }
-    if (best) { nvic_enter(best); irqWork = 1; /* d'autres peuvent attendre (enchaînement) */ }
+    if (best) { nvic_enter(best); irq_work(); /* d'autres peuvent attendre (enchaînement) */ }
 }
 
 /* retour d'exception (PC sur EXC_RETURN & ~1) */
@@ -3363,7 +3367,7 @@ static void nvic_return(void) {
     fN = (psr >> 31) & 1; fZ = (psr >> 30) & 1; fC = (psr >> 29) & 1; fV = (psr >> 28) & 1;
     if (psr & (1u << 9)) regs[13] += 4u;
     advance(10); /* dépilement de la trame + rechargement */
-    irqWork = 1;
+    irq_work();
     if (excDepth) {
         int exc = excNum[--excDepth];
         if (exc == 16 + IRQ_DMAC && dmac_line()) nvicPend |= 1u << IRQ_DMAC;
@@ -3397,7 +3401,7 @@ static uint32_t scs_read(uint32_t a) {
     return 0;
 }
 static void scs_write(uint32_t a, uint32_t v) {
-    irqWork = 1;
+    irq_work();
     switch (a) {
     case 0xe000e018u: sysTickTrigger = 0; return;          /* SYST_CVR : toute écriture le remet à 0 */
     case 0xe000e100u: nvicIser |= v; return;
@@ -3659,7 +3663,7 @@ static void nvmctrl_write(uint32_t a, uint32_t v) {
  * et le jeu déraillait en pc fou). */
 static void dmac_rearm_from(uint32_t done_ch) {
     for (uint32_t k = 0; k < DMAC_CHANNELS; k++)
-        if (k != done_ch && (dmacIntFlag[k] & 0x02u) && (dmacIntEn[k] & 0x02u)) { dmacInterrupt = 1; irqWork = 1; return; }
+        if (k != done_ch && (dmacIntFlag[k] & 0x02u) && (dmacIntEn[k] & 0x02u)) { dmacInterrupt = 1; irq_work(); return; }
 }
 
 /* registres 8 bits de canal indexé (Channel[n].CHINTENCLR/SET/FLAG),
@@ -4036,7 +4040,7 @@ static void timers_process(uint32_t n) {
             sysTickTrigger -= (int)emuTicksPerMs;
             sysTickPend = 1;
             sysTickCountFlag = 1;
-            irqWork = 1;
+            irq_work();
         }
     }
     if (tc4Enabled && tc4Top > 0) {
@@ -4052,7 +4056,7 @@ static void timers_process(uint32_t n) {
             tc4Fires++;
             if (tc4Armed) {
                 tc4IntFlagMask |= tc4IntEnMask & 0x11u; /* OVF/MC0 posés, lus par le handler */
-                tc4Interrupt = 1; irqWork = 1;
+                tc4Interrupt = 1; irq_work();
             } else {
                 int served = 0;
                 for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
@@ -4072,7 +4076,7 @@ static void timers_process(uint32_t n) {
             tc5Fires++;
             if (tc5Armed) {
                 tc5IntFlagMask |= tc5IntEnMask & 0x11u; /* OVF/MC0 */
-                tc5Interrupt = 1; irqWork = 1;
+                tc5Interrupt = 1; irq_work();
             } else {
                 for (uint32_t ch = 0; ch < DMAC_CHANNELS; ch++)
                     if (dmaTrig[ch] == DMAC_TRIG_TC5_OVF) dma_beat(ch);
@@ -4360,8 +4364,10 @@ static void prof_write(void) {
 
 static void step(void) {
     if (stepTicks) step_flush(0); /* ticks d'une injection hors pas */
-    if (emuTarget == TGT_POKITTO) pk_machine_step();
-    else if (irqWork) nvic_service();
+    if ((int32_t)(tickCount - evtAt) >= 0) { /* échéance machine */
+        if (emuTarget == TGT_POKITTO) pk_machine_step();
+        else { nvic_service(); evtAt = irqWork ? tickCount : tickCount + 0x40000000u; }
+    }
     while (regs[15] >= 0xfffffff2u) exc_return(); /* EXC_RETURN atteint */
 
     uint32_t pc = regs[15] - 2u;
@@ -4527,7 +4533,7 @@ static void step(void) {
         if ((op & 0xffef) == 0xb662) {
             int dis = (op >> 4) & 1;
             if (emuTarget == TGT_POKITTO) armIrqEnable = !dis;
-            else { primask = dis; if (!dis) irqWork = 1; }
+            else { primask = dis; if (!dis) irq_work(); }
         }
         break;
     case 0xba: { uint32_t v = regs[(op >> 3) & 7];                                         /* REV* */
@@ -4598,7 +4604,7 @@ static void step(void) {
             else if (sysm == 8 || sysm == 9) regs[13] = v & ~3u;
             else if (sysm == 16) {
                 if (emuTarget == TGT_POKITTO) armIrqEnable = !(v & 1);
-                else { primask = (int)(v & 1); irqWork = 1; }
+                else { primask = (int)(v & 1); irq_work(); }
             }
         }
         break; }
@@ -4990,6 +4996,7 @@ static void reset_core(void) {
     primask = 0;
     nvic_reset();
     tickCount = 0; sysTickTrigger = 0; sysTickEntries = 0;
+    evtAt = 0; irqWork = 1; /* échéance immédiate au premier pas */
     sysTickVector = dmacVector = tc4Vector = tc5Vector = 0;
     dmacInterrupt = tc4Interrupt = 0;
     dmac_baseAddr = dmac_wrbAddr = dmac_desc = dmac_chid = 0;
