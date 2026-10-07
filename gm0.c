@@ -201,39 +201,11 @@ static void sd_out_append(const uint8_t *p, int n) {
 static int      sd_initialized = 0;
 static uint8_t  sd_writeBuf[515];
 
-/* audio SDL : anneau producteur (ISR) -> consommateur (callback) */
-#define AQ_SIZE 65536
-/* plafond de latence son/image : au-delà, on rattrape doucement (2 éch.
- * par poussée, cf. audio_push) ; une seule reprise franche au-delà de
- * +8192 (stall catastrophe).  La consommation étant calée 250 ppm sous
- * la production, l'anneau se réépaissit seul après toute perte hôte. */
-/* Plafond calé sur le buffer réellement obtenu de SDL (aq_configure) :
- * le callback vide `cb` échantillons d'un coup et l'émulation produit par
- * rafales d'une frame (~370 éch.) — un plafond fixe de 900 sous un callback
- * de 1024 garantissait un trou à chaque appel (~15 % du son en relâches). */
-static int aqLatency = 1500, aqPrebuf = 900;
-#define AQ_LATENCY aqLatency
-static void aq_configure(int cb, double devHz, double guestHz) {
-    if (cb <= 0) cb = 1024;
-    int burst = (int)(guestHz / 59.7275) + 1; /* échantillons produits par frame émulée */
-    aqLatency = cb + 2 * burst + (int)(devHz * 0.012); /* callback + 2 rafales + 12 ms de gigue */
-    if (aqLatency > AQ_SIZE / 2) aqLatency = AQ_SIZE / 2;
-    aqPrebuf = cb + burst;
-}
-static int16_t aq[AQ_SIZE];
-static volatile int aq_head, aq_tail; /* tail = écrit, head = lu */
-static int16_t audioHold = 0;
-static int audioPending; /* device armé en pause : attend le pré-buffer */
-static volatile uint32_t audUnder, audCbSamples, audCbCalls; /* EMU_AUDIO_STATS (hôte) */
-
 static SDL_AudioDeviceID audioDev;
 static int audioOk;
 static int audioDevStandard; /* le device courant lit audio_cb (file aq) ;
                               * pk_audio_reopen (HLE) le met à 0 */
 static int devRate = 48000;      /* taux du périphérique hôte : fixe, ouvert une seule fois */
-static int devCbSamples = 1024;
-static FILE *wavFile;
-static uint32_t wavSamples;
 static char wavPathStr[512];
 static char shotPath[512];
 static uint32_t maxFrames;
@@ -296,7 +268,6 @@ static void     pk_adc_frame(void);
 static void     pk_eeprom_save(void);
 static void     pk_card_export(void);
 static void     pk_btn_gpio(uint8_t mask, int pressed);
-static int      pk_audio_ready(void);
 static void     pk_sd_machine_reset(void);
 static void     pk_screen_reconfig(void);
 
@@ -342,45 +313,6 @@ static uint32_t port_read(int group, uint32_t off) {
     return 0;
 }
 
-/* ------------------------------------------------------------- DAC/audio */
-
-static void audio_push(int16_t s) {
-    int next = (aq_tail + 1) % AQ_SIZE;
-    if (next == aq_head) aq_head = (aq_head + 1) % AQ_SIZE; /* plein : jette le plus ancien */
-    aq[aq_tail] = s;
-    aq_tail = next;
-    int ahead = aq_tail - aq_head;
-    if (ahead < 0) ahead += AQ_SIZE;
-    if (ahead > AQ_LATENCY + 8192) /* stall catastrophe : reprise franche */
-        aq_head = (aq_head + ahead - AQ_LATENCY) % AQ_SIZE;
-    /* le surplus ordinaire est absorbé par la régulation de débit du
-     * callback (audio_cb) : plus de rognage par à-coups */
-}
-
-/* à appeler chaque itération de boucle : ouvre le gate quand le
- * pré-buffer est atteint (aucun appel SDL : tout passe par le callback) */
-static void audio_resume_when_ready(void) {
-    if (!audioPending) return;
-    if (emuTarget == TGT_POKITTO) {
-        if (pk_audio_ready()) audioPending = 0;
-        return;
-    }
-    int ahead = aq_tail - aq_head;
-    if (ahead < 0) ahead += AQ_SIZE;
-    if (ahead >= aqPrebuf) audioPending = 0;
-}
-
-/* fréquence DAC du jeu : cadence TC4 réelle dans le domaine actif
- * (ticks_per_sec / période en ticks), légèrement sous-consommée pour
- * laisser l'anneau se remplir après toute perte hôte (stall, onglet).
- * La sortie SDL est (ré)ouverte à cette fréquence : consommer 22 049
- * fixe contre une production à ~22 004/s dérivait de 45 éch/s en
- * continu — l'anneau se vidait en ~14 s puis tenait en sous-débittest
- * (holds + trims AQ_LATENCY) : LA famine audible de lapinou, alors que
- * le contenu produit est complet (rendu hors-ligne identique). */
-static double emuDacRate = 22049.0;
-static void meta_audio_set_rate(double freq); /* défini avec le bloc SDL */
-
 /* période TC4/TC5 en ticks émulés : prescale × (CC0+1) cycles du GCLK
  * 48 MHz, ramenés au domaine de ticks (× emuTicksPerUs/48, arrondi au
  * plus proche ; ×1 au domaine natif 48 MHz, ×5/12 dans le domaine TS) */
@@ -409,35 +341,18 @@ static uint32_t tc5_period_ticks(void) {
     return cP;
 }
 
-static double tc4_config_rate(void) {
-    return ticks_per_sec() / (double)tc4_period_ticks();
-}
-
-/* écritures CTRLA/CC0/INTEN* des TC4/TC5 : la cadence DAC du jeu est
- * redérivée à chaque changement — un seul jeu d'aides (les blocs étaient
- * dupliqués en huit copies dans writeWord/writeHalf) */
-static void tc4_rate_update(void) {
-    if (!tc4Enabled || tc4Top == 0) return;
-    double r = tc4_config_rate();
-    if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); }
-}
-static void tc5_rate_update(void) {
-    if (!tc5Enabled || tc5Top == 0) return;
-    double r = ticks_per_sec() / (double)tc5_period_ticks();
-    if (r != emuDacRate) { emuDacRate = r; meta_audio_set_rate(r); }
-}
+/* écritures CTRLA/CC0/INTEN* des TC4/TC5 : un seul jeu d'aides (les blocs
+ * étaient dupliqués en huit copies dans writeWord/writeHalf) */
 static void tc4_write_ctrla(uint32_t v) {
     tc4CtrlA = v; tc4Enabled = (v & 0x02) != 0;
     if (!tc4Enabled) tc4Counter = 0;
-    tc4_rate_update();
 }
-static void tc4_write_cc0(uint32_t v) { tc4Top = v; tc4_rate_update(); }
+static void tc4_write_cc0(uint32_t v) { tc4Top = v; }
 static void tc5_write_ctrla(uint32_t v) {
     tc5CtrlA = v; tc5Enabled = (v & 0x02) != 0;
     if (!tc5Enabled) tc5Counter = 0;
-    tc5_rate_update();
 }
-static void tc5_write_cc0(uint32_t v) { tc5Top = v; tc5_rate_update(); }
+static void tc5_write_cc0(uint32_t v) { tc5Top = v; }
 static void tc_inten(int is5, uint32_t v) {
     if (is5) { tc5IntEnMask |= (uint8_t)v; tc5Armed = (tc5IntEnMask & 0x33) != 0; }
     else     { tc4IntEnMask |= (uint8_t)v; tc4Armed = (tc4IntEnMask & 0x33) != 0; }
@@ -447,49 +362,171 @@ static void tc_intclr(int is5, uint32_t v) {
     else     { tc4IntEnMask &= (uint8_t)~v; tc4Armed = (tc4IntEnMask & 0x33) != 0; }
 }
 
-static void wav_put(int16_t s) {
-    if (!wavFile) return;
-    uint8_t b[2] = { (uint8_t)(s & 0xff), (uint8_t)((s >> 8) & 0xff) };
-    fwrite(b, 1, 2, wavFile);
-    wavSamples++;
+/* ------------------------------------------------------------- audio ---
+ * Sortie audio COMMUNE aux deux cibles.  Le jeu pose des niveaux horodatés
+ * au temps émulé absolu — DAC META à chaque écriture (dac_write), octet
+ * R2R Pokitto à chaque changement (pk_audio_write) — et le callback SDL
+ * les rejoue au temps réel : chaque niveau dure exactement sa durée
+ * émulée, quelle que soit la cadence du jeu (DAC 22 kHz META, 8 kHz GF,
+ * 22 kHz lib Pokitto), sans avoir à la connaître.
+ *  File SPSC : producteur = thread d'émulation (aqEnd), consommateur =
+ * callback (aqStart, thread à part en natif) ; chaque index n'est écrit
+ * que d'un côté.  La lecture vise PK_AQ_TARGET d'avance sur le producteur,
+ * corrigée de ±0,5 % (dérive d'horloges), reprise franche au-delà de
+ * AQ_MAXLAG (stall hôte, device rouvert).
+ *  Le WAV (--wav) est rendu côté émulation, à 48 kHz fixe : déterministe,
+ * indépendant de l'hôte, identique pour les deux cibles. */
+#define AQ_SIZE   (1u << 15)
+#define AQ_MASK   (AQ_SIZE - 1)
+#define AQ_TARGET 0.060    /* avance visée du producteur sur la lecture (s) */
+#define AQ_MAXLAG 0.250    /* au-delà : reprise franche */
+#define AQ_MERGE  2e-6     /* rafale bit à bit (SET/CLR, B[n]) : une seule valeur */
+#define AQ_LERP   (1.0 / 6000.0) /* niveaux plus proches : interpolés (META) */
+#define WAV_RATE  48000
+/* couplage AC de l'ampli (les deux consoles) : passe-haut 1er ordre
+ * ~35 Hz — le repos du DAC (0 V META, 63 au loader Pokitto) est du
+ * silence, pas un rail qui mangerait la dynamique et claquerait */
+struct dc_block { float x, y; int init; };
+static int16_t dc_block(struct dc_block *d, float v) {
+    if (!d->init) { d->x = v; d->init = 1; }
+    d->y = 0.995f * d->y + v - d->x;
+    d->x = v;
+    return (int16_t)(d->y > 32767.f ? 32767.f : (d->y < -32768.f ? -32768.f : d->y));
 }
 
+static int16_t aqVal[AQ_SIZE];
+static double aqTime[AQ_SIZE];
+/* état écrit par le callback (autre thread en natif) sur sa propre ligne
+ * de cache : partagée avec l'état chaud de l'émulateur, chaque écriture
+ * la faisait rebondir d'un cœur à l'autre (-10 % sur sml) */
+static struct {
+    volatile uint32_t start;  /* index de lecture */
+    volatile uint32_t under;  /* passages à sec (EMU_AUDIO_STATS) */
+    double play;              /* position de lecture (s, temps émulé) */
+    unsigned long cbCalls, cbSamples;
+    int refill;               /* à sec : attend AQ_TARGET d'avance */
+    int16_t cur;              /* niveau courant et son instant */
+    double curT;
+    struct dc_block dc;
+} __attribute__((aligned(64))) aqC = { .refill = 1 };
+/* état écrit par le producteur (thread d'émulation) */
+static struct {
+    volatile uint32_t end;    /* index d'écriture */
+    double now;               /* horloge émulée publiée (s) */
+    unsigned long levels;     /* niveaux posés (EMU_AUDIO_STATS) */
+} __attribute__((aligned(64))) aqP;
+
+/* horloge émulée absolue (s), monotone : intègre les ticks à la fréquence
+ * courante (Pokitto : IRC 12 MHz puis PLL au boot) ; survit aux resets
+ * (audio_rebase), la file et le WAV restent continus d'un jeu à l'autre */
+static double clkT;
+static uint32_t clkTick;
+static double emu_clock(void) {
+    clkT += (double)(uint32_t)(tickCount - clkTick) / ticks_per_sec();
+    clkTick = tickCount;
+    return clkT;
+}
+/* à appeler juste AVANT de remettre tickCount à 0 (reset machine) */
+static void audio_rebase(void) { emu_clock(); clkTick = 0; }
+
+/* valeur entre deux niveaux voisins (t0,v0) -> (t1,v1) à l'instant t */
+static inline float level_at(double t0, int16_t v0, double t1, int16_t v1, double t) {
+    /* META : interpolation entre échantillons DAC voisins (comme l'ancien
+     * rééchantillonneur) ; le R2R Pokitto reste en marches */
+    if (emuTarget != TGT_META || t1 - t0 > AQ_LERP || t1 <= t0) return v0;
+    return (float)v0 + (float)(v1 - v0) * (float)((t - t0) / (t1 - t0));
+}
+/* --- WAV : rendu au fil des niveaux, côté émulation */
+static FILE *wavFile;
+static uint32_t wavSamples;
+static double wavT0 = -1.0;   /* niveau courant du rendu */
+static int16_t wavV0;
+static struct dc_block wavDc;
+static void wav_render(double t1, int16_t v1, int final) {
+    if (!wavFile) return;
+    if (wavT0 < 0) { wavT0 = t1; wavV0 = v1; return; }
+    for (;;) {
+        double t = (double)wavSamples / WAV_RATE;
+        if (t >= t1) break;
+        int16_t s = dc_block(&wavDc, final ? wavV0 : level_at(wavT0, wavV0, t1, v1, t));
+        uint8_t b[2] = { (uint8_t)s, (uint8_t)(s >> 8) };
+        fwrite(b, 1, 2, wavFile);
+        wavSamples++;
+    }
+    if (!final) { wavT0 = t1; wavV0 = v1; }
+}
+static void wav_open(const char *path) {
+    wavFile = fopen(path, "wb");
+    if (!wavFile) return;
+    uint8_t hdr[44] = {0};
+    memcpy(hdr, "RIFF", 4); memcpy(hdr + 8, "WAVEfmt ", 8);
+    hdr[16] = 16; hdr[20] = 1; hdr[22] = 1;
+    uint32_t rate = WAV_RATE, br = rate * 2;
+    for (int i = 0; i < 4; i++) { hdr[24 + i] = (uint8_t)(rate >> 8 * i); hdr[28 + i] = (uint8_t)(br >> 8 * i); }
+    hdr[32] = 2; hdr[34] = 16;
+    memcpy(hdr + 36, "data", 4);
+    fwrite(hdr, 1, 44, wavFile);
+    wavSamples = 0;
+    wavT0 = -1.0;
+}
 static void wav_finish(void) {
     if (!wavFile) return;
+    wav_render(emu_clock(), 0, 1); /* le dernier niveau tient jusqu'au bout */
     uint32_t bsize = wavSamples * 2, rsize = 36 + bsize;
     uint8_t w4[4];
     fseek(wavFile, 4, SEEK_SET);
-    w4[0] = (uint8_t)rsize; w4[1] = (uint8_t)(rsize >> 8); w4[2] = (uint8_t)(rsize >> 16); w4[3] = (uint8_t)(rsize >> 24);
+    for (int i = 0; i < 4; i++) w4[i] = (uint8_t)(rsize >> 8 * i);
     fwrite(w4, 1, 4, wavFile);
     fseek(wavFile, 40, SEEK_SET);
-    w4[0] = (uint8_t)bsize; w4[1] = (uint8_t)(bsize >> 8); w4[2] = (uint8_t)(bsize >> 16); w4[3] = (uint8_t)(bsize >> 24);
+    for (int i = 0; i < 4; i++) w4[i] = (uint8_t)(bsize >> 8 * i);
     fwrite(w4, 1, 4, wavFile);
     fclose(wavFile);
     wavFile = NULL;
-    double wavRate = emuTarget == TGT_POKITTO ? (double)devRate : emuDacRate;
-    printf(TR("WAV : %u échantillons (%.1f s à %.0f Hz)\n", "WAV: %u samples (%.1f s at %.0f Hz)\n"), wavSamples,
-           (double)wavSamples / wavRate, wavRate);
+    printf(TR("WAV : %u échantillons (%.1f s à %d Hz)\n", "WAV: %u samples (%.1f s at %d Hz)\n"), wavSamples,
+           (double)wavSamples / WAV_RATE, WAV_RATE);
+}
+
+/* --- producteur */
+static int aqPendValid;       /* niveau retenu, pas encore publié */
+static int16_t aqPendVal;
+static double aqPendTime;
+static void audio_flush_pending(void) {
+    if (!aqPendValid) return;
+    aqPendValid = 0;
+    wav_render(aqPendTime, aqPendVal, 0);
+    uint32_t e = aqP.end, n = (e + 1) & AQ_MASK;
+    if (n == __atomic_load_n(&aqC.start, __ATOMIC_ACQUIRE)) return; /* pleine : le consommateur resynchronisera */
+    aqVal[e] = aqPendVal;
+    aqTime[e] = aqPendTime;
+    __atomic_store_n(&aqP.end, n, __ATOMIC_RELEASE);
+}
+/* nouveau niveau de sortie, maintenant (temps émulé) */
+static void audio_level(int16_t v) {
+    double t = emu_clock();
+    aqP.levels++;
+    /* écritures bit à bit d'un même échantillon (~10 cycles d'écart) :
+     * seule la valeur stable part dans la file */
+    if (aqPendValid && t - aqPendTime < AQ_MERGE) { aqPendVal = v; return; }
+    audio_flush_pending();
+    aqPendValid = 1; aqPendVal = v; aqPendTime = t;
+}
+/* fin de frame : publie le niveau retenu (rafale terminée) et l'horloge —
+ * le consommateur avance même sans nouveau niveau (silence, valeur tenue) */
+static void audio_frame(void) {
+    double t = emu_clock();
+    if (aqPendValid && t - aqPendTime >= AQ_MERGE) audio_flush_pending();
+    __atomic_store(&aqP.now, &t, __ATOMIC_RELEASE);
 }
 
 static void dac_write(uint16_t v) {
     tc4Writes++;
     v &= 0x3ffu; /* le TS masque sur 10 bits (DAC->DATA & 0x3ff) */
-    /* v : 256..766 (milieu 512) -> s16, SATURÉ : la lib officielle écrit
-     * DATA=0 au repos (« output 0 when not in use », Sound.cpp) et le
-     * cast int16 wrappait -49056 en +16480 — un rail de DC à 50 % sous
-     * tout jeu lib : LE bruit parasite permanent (Celeste comprise). */
-    int s = (v - 512) * 64; /* plage DAC entière (0..1023) = pleine échelle 16 bits : plus d'écrêtage (×96 saturait au-delà de ±341 pas) */
+    /* 0..1023 (milieu 512) -> pleine échelle 16 bits, SATURÉ : la lib
+     * officielle écrit DATA=0 au repos (« output 0 when not in use »,
+     * Sound.cpp) — le couplage AC du consommateur en fait du silence */
+    int s = (v - 512) * 64;
     if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
-    /* couplage AC de l'ampli META : le 0 V au repos est du silence, pas
-     * un rail ; un passe-haut 1er ordre (~35 Hz) bloque la composante
-     * continue de n'importe quel jeu sans toucher le signal */
-    static float dcX, dcY; static int dcInit;
-    if (!dcInit) { dcX = (float)s; dcInit = 1; } /* pas de plop au boot */
-    dcY = 0.995f * dcY + (float)s - dcX;
-    dcX = (float)s;
-    int16_t out = (int16_t)(dcY > 32767.f ? 32767.f : (dcY < -32768.f ? -32768.f : dcY));
-    audio_push(out);
-    wav_put(out);
+    audio_level((int16_t)s);
 }
 
 /* --------------------------------------------------- carte SD (PA27) */
@@ -1816,38 +1853,12 @@ static void pk_lcd_write(uint32_t cd, uint16_t v) {
 }
 
 /* --- audio R2R GPIO + HLE */
-/* File R2R : (instant émulé ABSOLU, valeur) — une entrée par changement
- * de niveau.  Producteur = thread d'émulation (pk_aqEnd), consommateur =
- * callback SDL (pk_aqStart), thread à part en natif : chaque index n'est
- * écrit que d'un côté (l'ancien pk_aqSize++/-- des deux threads dérivait
- * par mises à jour perdues).  L'horodatage absolu remplace les deltas
- * bornés à 3/22050 s : une valeur tenue plusieurs échantillons (fréquent
- * dans les ziques 8 kHz de GF, dédoublonnées) était tronquée — musique
- * compressée dans le temps, file à sec. */
-#define PK_AQ_SIZE (1u << 15)
-#define PK_AQ_MASK (PK_AQ_SIZE - 1)
-#define PK_AQ_TARGET 0.060  /* avance visée du producteur sur la lecture (s) */
-#define PK_AQ_MAXLAG 0.250  /* au-delà : reprise franche (stall, device rouvert) */
-#define PK_AQ_MERGE  2e-6   /* rafale bit à bit (SET/CLR, B[n]) : une seule valeur */
-static uint8_t pk_aqData[PK_AQ_SIZE];
-static double pk_aqTime[PK_AQ_SIZE];
-static volatile uint32_t pk_aqStart, pk_aqEnd;
-static double pk_aqNow;          /* horloge émulée du producteur (s), publiée */
-static double pk_aqPlay;         /* position de lecture du consommateur (s) */
-static int pk_aqRefill = 1;      /* consommateur à sec : attend PK_AQ_TARGET */
-static uint8_t pk_aqHold = 0x80; /* dernière valeur jouée (le DAC tient) */
+/* octet R2R (POUT1[31:28] | POUT2[23:20]) : chaque changement devient un
+ * niveau de la sortie audio commune (audio_level) */
 static uint8_t pk_prevData = 0xFF;
-static uint32_t pk_prevTicks;
-static double pk_prevTime;       /* instant de pk_prevTicks (s) */
-static int pk_pendValid;         /* changement retenu, pas encore publié */
-static uint8_t pk_pendData;
-static double pk_pendTime;
-static unsigned long pk_latchCount, pk_ctIrqCount, pk_ctCross, pk_irq34, pk_latchMid, pk_latchSound;
+static unsigned long pk_latchCount;
 static FILE *latchDump;
-static int latchDumpTried; /* EMU_LATCH_DUMP lu une seule fois (getenv par
-                            * latch = 22 000 appels/s sur le chemin audio) */
-#define QADDR 0x20000000u /* .bss_ram1 : pokitto_audio_q (tail, head, ring) */
-
+static int latchDumpTried; /* EMU_LATCH_DUMP lu une seule fois */
 
 enum { PK_HLE_DETECT, PK_HLE_DISABLED, PK_HLE_ENABLED };
 static int pk_hleState = PK_HLE_DETECT;
@@ -1896,23 +1907,6 @@ static void pk_audio_check_hle(uint32_t rate) {
 /* valeur écrite sur le R2R : POUT1[31:28] | POUT2[23:20] */
 static void pk_audio_gpio_write(void);
 
-/* horloge émulée absolue (s) : intègre les ticks à la fréquence courante
- * (le cœur passe de 12 MHz IRC à la PLL au boot) */
-static double pk_audio_clock(void) {
-    pk_prevTime += (double)(uint32_t)(tickCount - pk_prevTicks) / pk_core_hz();
-    pk_prevTicks = tickCount;
-    return pk_prevTime;
-}
-static void pk_audio_flush_pending(void) {
-    if (!pk_pendValid) return;
-    pk_pendValid = 0;
-    uint32_t e = pk_aqEnd, n = (e + 1) & PK_AQ_MASK;
-    if (n == __atomic_load_n(&pk_aqStart, __ATOMIC_ACQUIRE)) return; /* pleine : le consommateur resynchronisera */
-    pk_aqData[e] = pk_pendData;
-    pk_aqTime[e] = pk_pendTime;
-    __atomic_store_n(&pk_aqEnd, n, __ATOMIC_RELEASE);
-}
-
 static void pk_audio_write(uint8_t data) {
     if (pk_hleState == PK_HLE_ENABLED) return;
     pk_prevData = data;
@@ -1923,32 +1917,8 @@ static void pk_audio_write(uint8_t data) {
         if (p) latchDump = fopen(p, "w");
     }
     if (latchDump) fprintf(latchDump, "%u %u\n", tickCount, data);
-    if (pk_latchCount > 44000) { /* après le boot : ce qui est réellement joué */
-        if (data == 128) pk_latchMid++;
-        else { pk_latchSound++;
-            if (pk_latchSound == 1 || pk_latchSound == 1000 || pk_latchSound == 100000)
-                fprintf(stderr, "[val] latch#%lu val=%u tick=%u\n", pk_latchSound, data, tickCount);
-        }
-    }
-    double t = pk_audio_clock();
-    /* GF pose ses 8 bits un par un (SET/CLR, ~10 cycles d'écart) : les
-     * valeurs intermédiaires d'une même rafale fusionnent dans le
-     * changement retenu ; seul l'état stable part dans la file */
-    if (pk_pendValid && t - pk_pendTime < PK_AQ_MERGE) { pk_pendData = data; return; }
-    pk_audio_flush_pending();
-    pk_pendValid = 1; pk_pendData = data; pk_pendTime = t;
+    audio_level((int16_t)((data ^ 0x80) << 8));
 }
-
-/* fin de frame : publie le changement retenu (rafale terminée) et
- * l'horloge émulée — le consommateur avance même sans latch (silence,
- * valeur tenue) */
-static void pk_audio_frame(void) {
-    double t = pk_audio_clock();
-    if (pk_pendValid && t - pk_pendTime >= PK_AQ_MERGE) pk_audio_flush_pending();
-    __atomic_store(&pk_aqNow, &t, __ATOMIC_RELEASE);
-}
-
-static int pk_audio_ready(void) { return 1; } /* pré-buffer géré au callback */
 
 /* Fréquence du cœur telle que le firmware l'a configurée : IRC 12 MHz tant
  * que MAINCLKSEL ne pointe pas la sortie PLL, sinon 12 MHz x M (SYSPLLCTRL).
@@ -2208,7 +2178,6 @@ static void pk_ct_tick(struct pk_ct *ct, uint32_t num, uint32_t delta) {
         uint32_t mri = 1u << (m * 3), mrr = 1u << (m * 3 + 1), mrs = 1u << (m * 3 + 2);
         uint32_t mr = ct->r[6 + (uint32_t)m];
         if (oldTC < mr && ct->r[PK_CT_TC] >= mr) {
-            if (num == 0 && m == 1) pk_ctCross++;
             if (ct->r[5] & mri) ct->r[PK_CT_IR] |= 1u << m;
             if (ct->r[5] & mrs) ct->r[PK_CT_TCR] &= ~1u;
             if (ct->r[5] & mrr) ct->r[PK_CT_TC] -= mr;
@@ -2217,7 +2186,6 @@ static void pk_ct_tick(struct pk_ct *ct, uint32_t num, uint32_t delta) {
 
     if (ct->r[PK_CT_IR] && armIrqEnable) {
         if (num == 0) {
-            pk_irq34++;
             /* détection HLE du handler stock (loader) : auto-limitée (le
              * même vecteur ne re-détecte pas), le taux CT32B0 courant sert
              * au taux de lecture du buffer HLE */
@@ -2721,6 +2689,7 @@ static void pk_reset_core(void) {
     memset(regs, 0, sizeof regs);
     fN = fZ = fC = fV = 0;
     armIrqEnable = 1;
+    audio_rebase();
     tickCount = 0;
     pk_lastTick = 0;
     evtAt = tickCount;
@@ -2772,19 +2741,7 @@ static void pk_reset_core(void) {
     pk_hleIrqAddress = 0;
     pk_hleBuffer = NULL;
     pk_hlePlayhead = NULL;
-    /* la file est partagée avec le callback (thread à part en natif) */
-    if (audioDev) SDL_LockAudioDevice(audioDev);
-    pk_aqStart = pk_aqEnd = 0;
-    pk_aqNow = pk_aqPlay = 0.0;
-    pk_aqRefill = 1;
-    pk_aqHold = 0x80;
-    pk_pendValid = 0;
-    pk_prevTime = 0.0;
-    if (audioDev) SDL_UnlockAudioDevice(audioDev);
     pk_prevData = 0xFF;
-    pk_prevTicks = 0;
-    aq_head = aq_tail = 0;
-    audioHold = 0;
 
     /* l'EEPROM survit au reset (mémoire d'état, sauvegardes) */
     pk_ist = pk_rise = pk_fall = 0;
@@ -2866,7 +2823,7 @@ static void pk_eeprom_save(void) {
     if (pk_eepromOwner[0]) pk_eeprom_save_as(pk_eepromOwner);
 }
 
-/* DEBUG temporaire : état IRQ/timers */
+/* EMU_PK_DEBUG : état IRQ/timers en fin de session */
 static void pk_debug_dump(void) {
     if (!getenv("EMU_PK_DEBUG")) return;
     for (int i = 0; i < 64; i++)
@@ -4715,105 +4672,40 @@ static void pk_hle_audio_cb(void *ud, Uint8 *stream, int len) {
     int n = len < 512 ? len : 512;
     memcpy(stream, srcb, (size_t)n);
     memset(stream + n, 128, (size_t)(len - n));
-    for (int i = 0; i < n; i++) wav_put((int16_t)((srcb[i] ^ 0x80) << 8));
 }
 
-/* audio Pokitto non HLE : la lecture parcourt la file au temps émulé.
- * pk_aqPlay avance d'une période device par échantillon de sortie,
- * corrigée de ±0,5 % selon l'avance du producteur sur la cible (dérive
- * d'horloges) ; la valeur sortie est le dernier latch dont l'instant est
- * passé — chaque niveau dure exactement sa durée émulée, quelle que soit
- * la cadence du jeu (8 kHz GF, 22 kHz lib...). */
-static unsigned long pk_cbCalls, pk_cbSamples;
-static Uint32 pk_cbFirstMs;
-static void pk_audio_cb(Uint8 *stream, int len) {
-    /* device S16SYS : len octets = len/2 échantillons */
-    int16_t *out = (int16_t *)stream;
-    int n = len / 2;
-    if (pk_cbFirstMs == 0) pk_cbFirstMs = SDL_GetTicks();
-    pk_cbCalls++; pk_cbSamples += (uint32_t)n;
-    double now;
-    __atomic_load(&pk_aqNow, &now, __ATOMIC_ACQUIRE);
-    double lag = now - pk_aqPlay;
-    if (lag > PK_AQ_MAXLAG) { /* stall hôte, device rouvert : reprise franche */
-        pk_aqPlay = now - PK_AQ_TARGET;
-        lag = PK_AQ_TARGET;
-    }
-    if (pk_aqRefill && lag >= PK_AQ_TARGET) pk_aqRefill = 0;
-    double err = (lag - PK_AQ_TARGET) / PK_AQ_TARGET;
-    if (err > 1.0) err = 1.0; else if (err < -1.0) err = -1.0;
-    double step = (1.0 + 0.005 * err) / (double)devRate;
-    uint32_t st = pk_aqStart, end = __atomic_load_n(&pk_aqEnd, __ATOMIC_ACQUIRE);
-    if (ENVFLAG("EMU_DMA_TRACE") && (pk_cbCalls % 100 == 1))
-        fprintf(stderr, "[cb] calls=%lu samples=%lu (%.1f/s mural) n=%d file=%u avance=%.1f ms\n",
-                pk_cbCalls, pk_cbSamples,
-                (double)pk_cbSamples * 1000.0 / (SDL_GetTicks() - pk_cbFirstMs + 1),
-                n, (end - st) & PK_AQ_MASK, lag * 1000.0);
-    for (int i = 0; i < n; i++) {
-        int16_t s;
-        if (!pk_aqRefill) {
-            pk_aqPlay += step;
-            if (pk_aqPlay > now) { pk_aqPlay = now; pk_aqRefill = 1; audUnder++; } /* à sec */
-        }
-        while (st != end && pk_aqTime[st] <= pk_aqPlay) {
-            pk_aqHold = pk_aqData[st];
-            st = (st + 1) & PK_AQ_MASK;
-        }
-        /* à sec ou en pré-buffer : la dernière valeur se tient, comme le
-         * DAC matériel */
-        int raw = (int16_t)((pk_aqHold ^ 0x80) << 8);
-        /* couplage AC de l'ampli Pokitto, comme sur la META (d936f63) :
-         * le loader tient un repos DC arbitraire (63) — sans blocage, ce
-         * rail mange la moitié de la dynamique et claque à chaque
-         * transition (le « son baisé » au loader) */
-        static float pk_dcX, pk_dcY; static int pk_dcInit;
-        if (!pk_dcInit) { pk_dcX = (float)raw; pk_dcInit = 1; }
-        pk_dcY = 0.995f * pk_dcY + (float)raw - pk_dcX;
-        pk_dcX = (float)raw;
-        s = (int16_t)(pk_dcY > 32767.f ? 32767.f : (pk_dcY < -32768.f ? -32768.f : pk_dcY));
-        out[i] = s;
-        if (wavFile) wav_put(s);
-    }
-    __atomic_store_n(&pk_aqStart, st, __ATOMIC_RELEASE);
-}
-
-/* audio SDL : l'ISR écrit dans aq ; le callbackSDL consomme */
+/* consommateur de la sortie audio commune (voir audio_level) : la lecture
+ * avance d'une période device par échantillon, corrigée de ±0,5 % selon
+ * l'avance du producteur sur AQ_TARGET ; la valeur sortie est le niveau
+ * courant (interpolé vers le suivant sur META, cf. level_at) */
 static void audio_cb(void *ud, Uint8 *stream, int len) {
     (void)ud;
-    if (emuTarget == TGT_POKITTO) { pk_audio_cb(stream, len); return; }
     int16_t *out = (int16_t *)stream;
-    /* régulation dynamique du débit : la lecture avance de `ratio`
-     * échantillons de périphérique par sortie (interpolation linéaire).
-     *  Le périphérique est ouvert UNE fois à taux fixe (48 kHz) : jamais de
-     * renégociation système quand le jeu change sa cadence DAC.  Le ratio
-     * de base = taux DAC du jeu / taux device, corrigé de ±0,5 % selon
-     * l'écart du remplissage à la cible (dérive d'horloges). */
-    static double frac;
-    int ahead = aq_tail - aq_head;
-    if (ahead < 0) ahead += AQ_SIZE;
-    double target = AQ_LATENCY * 0.6;
-    double err = (ahead - target) / target;
+    int n = len / 2;             /* device S16SYS mono */
+    aqC.cbCalls++; aqC.cbSamples += (unsigned long)n;
+    double now, play = aqC.play;
+    __atomic_load(&aqP.now, &now, __ATOMIC_ACQUIRE);
+    double lag = now - play;
+    if (lag > AQ_MAXLAG) { play = now - AQ_TARGET; lag = AQ_TARGET; }
+    if (aqC.refill && lag >= AQ_TARGET) aqC.refill = 0;
+    double err = (lag - AQ_TARGET) / AQ_TARGET;
     if (err > 1.0) err = 1.0; else if (err < -1.0) err = -1.0;
-    double ratio = (emuDacRate / (double)devRate) * (1.0 + 0.005 * err);
-    if (ratio < 0.2) ratio = 0.2; else if (ratio > 5.0) ratio = 5.0;
-    for (int i = 0; i < len / 2; i++) {
-        if (audioPending) { out[i] = 0; continue; } /* pré-buffer : silence */
-        int h = aq_head, t = aq_tail;
-        int avail = t - h; if (avail < 0) avail += AQ_SIZE;
-        if (avail >= 2) {
-            int16_t a = aq[h], b = aq[(h + 1) % AQ_SIZE];
-            audioHold = (int16_t)(a + (b - a) * frac);
-            frac += ratio;
-            while (frac >= 1.0 && avail > 1) { h = (h + 1) % AQ_SIZE; frac -= 1.0; avail--; }
-            if (frac >= 1.0) frac = 0.999;
-            aq_head = h;
-        } else {
-            audioHold /= 2; /* sous-débit : relâche vers le silence */
-            audUnder++;
+    double step = (1.0 + 0.005 * err) / (double)devRate;
+    uint32_t st = aqC.start, end = __atomic_load_n(&aqP.end, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < n; i++) {
+        if (!aqC.refill) {
+            play += step;
+            if (play > now) { play = now; aqC.refill = 1; aqC.under++; }
         }
-        out[i] = audioHold;
+        while (st != end && aqTime[st] <= play) {
+            aqC.cur = aqVal[st]; aqC.curT = aqTime[st];
+            st = (st + 1) & AQ_MASK;
+        }
+        /* à sec ou en pré-buffer : le niveau se tient, comme le DAC */
+        out[i] = dc_block(&aqC.dc, st != end ? level_at(aqC.curT, aqC.cur, aqTime[st], aqVal[st], play) : aqC.cur);
     }
-    audCbSamples += (uint32_t)(len / 2); audCbCalls++;
+    aqC.play = play;
+    __atomic_store_n(&aqC.start, st, __ATOMIC_RELEASE);
 }
 
 /* boutons : même masque pour les deux cibles (voir le bloc Pokitto) ;
@@ -4998,6 +4890,7 @@ static void reset_core(void) {
     fN = fZ = fC = fV = 0;
     primask = 0;
     nvic_reset();
+    audio_rebase();
     tickCount = 0; sysTickTrigger = 0; sysTickEntries = 0;
     evtAt = 0; irqWork = 1; /* échéance immédiate au premier pas */
     sysTickVector = dmacVector = tc4Vector = tc5Vector = 0;
@@ -5034,7 +4927,6 @@ static void reset_core(void) {
     lcdBgrSwapped = 0;
     lcdColmod = 5;
     memset(pix, 0, sizeof pix);
-    aq_head = aq_tail = 0; audioHold = 0;
     emu_nextFrameTick = tickCount + frame_ticks();
     sd_reset_state(); /* pas de transaction SD résiduelle pour le jeu suivant */
     sd_initialized = 0; /* le firmware suivant rejoue toute l'init (CMD0 doit
@@ -5213,7 +5105,6 @@ static void audio_start(void) {
      * sur l'autre cible doit retrouver le canal S16 (sinon la file aq
      * n'est plus consommée — silence ou gargouillis) */
     if (audioOk && audioDev && !audioDevStandard) audio_open_standard();
-    audioPending = 1; /* gate fermé : audio_resume_when_ready l'ouvrira */
 }
 
 /* ------------------------------------------------ SDL/HTML5 ------------ */
@@ -5261,27 +5152,12 @@ static void audio_open_standard(void) {
     audioDev = dev;
     audioOk = 1;
     devRate = got.freq ? got.freq : 48000;
-    devCbSamples = got.samples;
-    aq_configure(got.samples, (double)devRate, emuDacRate);
     audioDevStandard = 1;
     SDL_PauseAudioDevice(dev, 0);
 }
 
 static void pk_r2r_reopen(void) {
     audio_open_standard(); /* retour du HLE au canal standard (S16, file aq) */
-}
-
-/* taux DAC réel du jeu (config TC4/TC5) : le périphérique hôte reste
- * ouvert à taux fixe, seule la consommation s'adapte — plus aucune
- * fermeture/réouverture qui renégocierait le son de toute la machine.
- *  Plage raisonnable seulement : hors plage, on garde l'ancien taux. */
-static void meta_audio_set_rate(double freq) {
-    if (!audioOk || freq <= 0.0) return;
-    if (freq < 8000.0 || freq > 96000.0) return; /* config farfelue : taux inchangé */
-    if (freq == emuDacRate) return;
-    emuDacRate = freq;
-    aq_configure(devCbSamples, (double)devRate, freq);
-    fprintf(stderr, TR("audio : %d Hz (cadence timer du jeu −250 ppm)\n", "audio: %d Hz (game timer clock −250 ppm)\n"), (int)(freq + 0.5));
 }
 
 static int noPad(void) {
@@ -5457,44 +5333,33 @@ static int poll_events(void) {
     return 1;
 }
 
-/* EMU_AUDIO_STATS : bilan audio par seconde émulée */
-static uint32_t diagLastT, diagLastW, diagLastS, diagLastR, diagLastF;
-static uint32_t diagLastU, diagLastC, diagLastN;
-static unsigned long diagLastL;
+/* EMU_AUDIO_STATS : bilan audio par seconde émulée, mêmes sondes pour les
+ * deux cibles (production de niveaux, consommation hôte, avance de la
+ * lecture) plus l'état propre à chacune (DAC/TC4 META, HLE Pokitto) */
+static uint32_t diagLastT, diagLastW, diagLastS, diagLastR, diagLastU;
+static unsigned long diagLastL, diagLastC, diagLastN;
 static void update_diagnostics(Uint32 frame) {
     static int on = -1;
     if (on < 0) on = getenv("EMU_AUDIO_STATS") ? 1 : 0;
     if (!on) return;
     if (tickCount - diagLastT < (uint32_t)ticks_per_sec()) return;
     double sec = (double)(tickCount - diagLastT) / ticks_per_sec();
-    if (emuTarget == TGT_POKITTO) {
-        /* mêmes sondes que la META : production R2R (latches) ou HLE,
-         * consommation hôte (callbacks), remplissage de la file Pokitto.
-         * Les compteurs hôte sont pk_cbCalls/pk_cbSamples — audCb* ne
-         * bouge que sur la voie META et donnait cb=0, trompeur. */
-        uint32_t cbs = pk_cbCalls - diagLastC;
-        double now, lag;
-        __atomic_load(&pk_aqNow, &now, __ATOMIC_ACQUIRE);
-        lag = now - pk_aqPlay;
-        fprintf(stderr, "[audio] f=%u latches=%lu (%.0f/s, muets=%lu son=%lu) hle=%s | hote: cb=%u éch/cb=%u à-sec=%u file=%u avance=%.0f ms\n",
-                frame, pk_latchCount - diagLastL, (double)(pk_latchCount - diagLastL) / sec,
-                pk_latchMid, pk_latchSound,
-                pk_hleState == PK_HLE_ENABLED ? "on" : "off",
-                cbs, cbs ? (unsigned)((pk_cbSamples - diagLastN) / cbs) : 0u, audUnder - diagLastU,
-                (pk_aqEnd - pk_aqStart) & PK_AQ_MASK, lag * 1000.0);
-        diagLastL = pk_latchCount; diagLastC = pk_cbCalls;
-        diagLastN = pk_cbSamples; diagLastU = audUnder;
-    } else {
-        int ahead = aq_tail - aq_head; if (ahead < 0) ahead += AQ_SIZE;
-        fprintf(stderr, "[audio] f=%u dac/s=%.0f famine=%.1f%% relances=%u frames-hote=%u | hote: cb=%u éch/cb=%u sous-débit=%u file=%d\n",
-                frame, (tc4Writes - diagLastW) / sec,
+    unsigned long cbs = aqC.cbCalls - diagLastC;
+    double now;
+    __atomic_load(&aqP.now, &now, __ATOMIC_ACQUIRE);
+    fprintf(stderr, "[audio] f=%u niveaux=%.0f/s | hote: cb=%lu éch/cb=%lu à-sec=%u file=%u avance=%.0f ms",
+            frame, (double)(aqP.levels - diagLastL) / sec,
+            cbs, cbs ? (aqC.cbSamples - diagLastN) / cbs : 0ul, aqC.under - diagLastU,
+            (aqP.end - aqC.start) & AQ_MASK, (now - aqC.play) * 1000.0);
+    if (emuTarget == TGT_POKITTO)
+        fprintf(stderr, " | hle=%s\n", pk_hleState == PK_HLE_ENABLED ? "on" : "off");
+    else
+        fprintf(stderr, " | dac/s=%.0f famine=%.1f%% relances=%u\n",
+                (tc4Writes - diagLastW) / sec,
                 100.0 * (audStarvedTicks - diagLastS) / ((tickCount - diagLastT) / (double)tc4_period_ticks()),
-                audRestarts - diagLastR, frame - diagLastF,
-                audCbCalls - diagLastC, audCbCalls - diagLastC ? (audCbSamples - diagLastN) / (audCbCalls - diagLastC) : 0,
-                audUnder - diagLastU, ahead);
-        diagLastW = tc4Writes; diagLastS = audStarvedTicks; diagLastR = audRestarts; diagLastF = frame;
-        diagLastC = audCbCalls; diagLastN = audCbSamples; diagLastU = audUnder;
-    }
+                audRestarts - diagLastR);
+    diagLastW = tc4Writes; diagLastS = audStarvedTicks; diagLastR = audRestarts;
+    diagLastL = aqP.levels; diagLastC = aqC.cbCalls; diagLastN = aqC.cbSamples; diagLastU = aqC.under;
     diagLastT = tickCount;
 }
 
@@ -5563,7 +5428,7 @@ static void run_emulated_frame(void) {
      * l'émulateur restait ~12 825 frames sans aucune instruction
      * (214 s figées à la 3,6e minute de jeu, interruptions mortes). */
     emu_nextFrameTick = tickCount + frame_ticks();
-    if (emuTarget == TGT_POKITTO) pk_audio_frame();
+    audio_frame();
 }
 
 #if defined(EMU_NODE_HEADLESS)
@@ -5698,22 +5563,7 @@ int main(int argc, char **argv) {
     if (sdl_init_all() != 0) return 1;
     if (audioOk && fwLoaded) audio_start(); /* lancé au boot */
 
-    if (wavPathStr[0]) {
-        wavFile = fopen(wavPathStr, "wb");
-        if (wavFile) {
-            uint8_t hdr[44] = {0};
-            memcpy(hdr, "RIFF", 4); memcpy(hdr + 8, "WAVEfmt ", 8);
-            hdr[16] = 16; hdr[20] = 1; hdr[22] = 1;
-            /* Pokitto : écrit par pk_audio_cb au taux du device */
-            uint32_t rate = emuTarget == TGT_POKITTO ? (uint32_t)devRate : 22049;
-            hdr[24] = rate & 0xff; hdr[25] = (rate >> 8) & 0xff;
-            uint32_t br = rate * 2;
-            hdr[28] = br & 0xff; hdr[29] = (br >> 8) & 0xff;
-            hdr[32] = 2; hdr[34] = 16;
-            memcpy(hdr + 36, "data", 4);
-            fwrite(hdr, 1, 44, wavFile);
-        }
-    }
+    if (wavPathStr[0]) wav_open(wavPathStr);
     while (running) {
         running = poll_events();
         update_diagnostics(frame);
@@ -5774,22 +5624,8 @@ int main(int argc, char **argv) {
             rawEmuMsTotal += benchEmuMs; rawWallMsTotal += benchWallMs;
         }
         frame++;
-        if (emuTarget == TGT_POKITTO && ENVFLAG("EMU_DMA_TRACE") && (frame % 300) == 0) {
-            uint32_t msc = pk_rd32le(sram + (0x10005c64u - 0x10000000u));
-            uint32_t gframe = pk_rd32le(sram + (0x10000508u - 0x10000000u));
-            static Uint32 w0 = 0; if (!w0) w0 = SDL_GetTicks();
-            Uint32 w = SDL_GetTicks() - w0;
-            fprintf(stderr, "[derive] f=%u tick=%u wall=%.2fs ms=%u (%.1f Hz emu | %.1f Hz wall) gbf=%u (%.2f fps emu | %.2f fps wall)\n",
-                    frame, tickCount, w / 1000.0, msc,
-                    (double)msc * pk_core_hz() / (double)tickCount,
-                    (double)msc * 1000.0 / (double)w,
-                    gframe, (double)gframe * pk_core_hz() / (double)tickCount,
-                    (double)gframe * 1000.0 / (double)w);
-        }
-
         if (emuTarget == TGT_POKITTO) pk_adc_frame();
         update_title_pct();
-        audio_resume_when_ready();
 
         blit(emuRen);
         if (trace) { /* empreinte d'écran périodique */
@@ -5834,18 +5670,6 @@ int main(int argc, char **argv) {
 
     }
 
-    if (ENVFLAG("EMU_DMA_TRACE") && emuTarget == TGT_POKITTO)
-        fprintf(stderr, "[audio] FIN irq_block=%lu irq34=%lu crosses=%lu latches=%lu (muets=%lu son=%lu) tick=%u qtail=%u qhead=%u\n",
-                pk_ctIrqCount, pk_irq34, pk_ctCross, pk_latchCount, pk_latchMid, pk_latchSound, tickCount,
-                pk_read_half(QADDR), pk_read_half(QADDR + 2));
-    if (ENVFLAG("EMU_DMA_TRACE") && emuTarget == TGT_POKITTO) {
-        uint32_t msc = pk_rd32le(sram + (0x10005c64u - 0x10000000u));
-        uint32_t gframe = pk_rd32le(sram + (0x10000508u - 0x10000000u));
-        fprintf(stderr, "[timing] ticks=%u (%.2f s emu @ %.0f MHz) ms_count=%u (%.1f Hz) gbl_frame=%u (%.2f fps GB)\n",
-                tickCount, tickCount / pk_core_hz(), pk_core_hz() / 1e6,
-                msc, (double)msc * pk_core_hz() / (double)tickCount,
-                gframe, (double)gframe * pk_core_hz() / (double)tickCount);
-    }
     if (shotPath[0]) {
         FILE *sf = fopen(shotPath, "wb");
         if (sf) {
@@ -6079,7 +5903,6 @@ static void wasm_loop(void) {
     wasmLastFrame += due * frameMs;
     if (now - wasmLastFrame > frameMs) wasmLastFrame = now;
     update_title_pct();
-    audio_resume_when_ready();
     /* % en haut à droite (derrière le canvas, visible dans les bandes) et
      * titre du jeu dans le texte du bas (mise à jour au rythme du %) */
     if (fwLoaded && titleMs != hudMs && titleBuf[0]) {
