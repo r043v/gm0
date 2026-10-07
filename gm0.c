@@ -5358,8 +5358,7 @@ static void update_title_pct(void) {
 
 /* boucle de frame batchée : petite fonction appelée 60 fois par seconde —
  * V8 la promeut vite vers TurboFan, et step y est appelé DIRECTEMENT (pas
- * d'indirection par instruction).  noinline sur step : s'il était inliné
- * ici, la boucle resterait au compilateur de base (pas d'OSR en wasm).
+ * d'indirection par instruction).
  *
  * tickCount est un u32 qui wrappe (2^32 à 48 MHz ≈ 89,5 s de jeu) : la
  * cible calculée par la frame précédente peut se retrouver EN DEÇA du tick
@@ -5367,7 +5366,12 @@ static void update_title_pct(void) {
  * comme sur le compteur (qui wrappe) du Cortex-M0+.  La forme
  * « tick < cible » non signée gelait l'émulateur pour de bon (lapinou,
  * frame ~7000, % du HUD wasm figé à 0). */
-__attribute__((noinline))
+/* « hot » : la boucle d'interprétation va en .text.hot, groupée et à
+ * l'abri des déplacements que provoque toute modification du code froid
+ * (le même cœur variait de ±10 % selon son placement), et GCC y inline
+ * step et ses accès mémoire plus volontiers.  NB : forcer always_inline
+ * sur step coûtait 5-10 % (il perturbe l'inlining de ses appelés). */
+__attribute__((noinline, hot))
 static void step_batch(uint32_t target) {
     while ((int32_t)(tickCount - target) < 0) step();
 }

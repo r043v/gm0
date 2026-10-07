@@ -12,6 +12,12 @@ endif()
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
     if(CMAKE_BUILD_TYPE STREQUAL "Release")
         set(CMAKE_C_FLAGS_RELEASE "-O3 -flto")
+        # GCC : une seule partition LTO — découpé en plusieurs, le
+        # programme pouvait séparer step de sa boucle step_batch et perdre
+        # l'inlining de l'interpréteur (un appel par instruction, -15-20 %)
+        if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+            set(CMAKE_EXE_LINKER_FLAGS_RELEASE "-flto-partition=one")
+        endif()
     endif()
     add_compile_options(-Wall -Wextra)
 endif()
