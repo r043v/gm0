@@ -49,7 +49,7 @@ default; `-DGM0_OSD=OFF` removes them.
 WebAssembly build (requires emsdk with `emcc` on `PATH`):
 
 ```sh
-make wasm                    # produces wasm/gm0-standalone.html
+make wasm                    # produces wasm/gm0.html
 ```
 
 The output is a single file with the wasm module embedded; it can be opened
