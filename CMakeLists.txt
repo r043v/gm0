@@ -43,6 +43,13 @@ if(GM0_FR)
     target_compile_definitions(gm0 PRIVATE GM0_FR)
 endif()
 
+# Messages temporaires à l'écran (OSD) : activés par défaut ; -DGM0_OSD=OFF
+# compile sans (aucun code ni donnée de l'OSD dans le binaire)
+option(GM0_OSD "Messages temporaires à l'écran (OSD)" ON)
+if(NOT GM0_OSD)
+    target_compile_definitions(gm0 PRIVATE GM0_NO_OSD)
+endif()
+
 if(TARGET SDL2::SDL2)
     target_link_libraries(gm0 PRIVATE SDL2::SDL2)
 elseif(TARGET SDL2::SDL2-static)

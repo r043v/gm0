@@ -10,6 +10,10 @@ EMFLAGS := -O3 -flto -sUSE_SDL=2 -sUSE_ZLIB=1 -sALLOW_MEMORY_GROWTH=1 -sENVIRONM
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,stringToUTF8,UTF8ToString -sEXIT_RUNTIME=0 \
      -sEXPORTED_FUNCTIONS=_main,_malloc,_free,_emu_pause,_emu_pause_toggle,_emu_paused,_emu_restart,_emu_card_file,_emu_card_finish,_emu_card_image,_emu_firmware,_emu_games_count,_emu_game_name,_emu_game_icon,_emu_select_game,_emu_zip_load
 
+# options supplémentaires du build wasm, ex. sans OSD :
+#   make wasm EXTRA_EMFLAGS=-DGM0_NO_OSD
+EMFLAGS += $(EXTRA_EMFLAGS)
+
 wasm: gm0.c wasm/index.html wasm/games.js wasm/make_single.py
 	$(EMCC) $(EMFLAGS) -sSINGLE_FILE=1 -o wasm/gm0_single.js gm0.c -lm
 	python3 wasm/make_single.py

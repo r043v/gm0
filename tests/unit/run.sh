@@ -13,4 +13,6 @@ for t in "$here"/test_*.c; do
     "$cc" -O0 -g -o "$out/$name" "$t" $sdl -lz -lm
     "$out/$name"
 done
-
+# le build sans OSD doit compiler sans avertissement
+"$cc" -fsyntax-only -Wall -Wextra -DGM0_NO_OSD $sdl "$here/../../gm0.c"
+echo "gm0.c sans OSD : compilation OK"
