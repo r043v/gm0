@@ -66,7 +66,7 @@ static void old_lcd_scan(const uint16_t *src, uint32_t *lcd, uint32_t *scan) {
 static void check_coverage(int f, unsigned s) {
     const size_t n = (size_t)SCR_W * SCR_H * s * s;
     for (size_t i = 0; i < NTEX; i++) out[i] = SENTINEL;
-    filter_render(frame, out, f, s);
+    filter_render(frame, out, SCR_W * s, f, s);
     size_t holes = 0, spill = 0;
     for (size_t i = 0; i < n; i++) if (out[i] == SENTINEL) holes++;
     for (size_t i = n; i < NTEX; i++) if (out[i] != SENTINEL) spill++;
@@ -81,20 +81,20 @@ int main(void) {
 
     /* 1. régressions à s = 3 : DMG, LCD, scanlines identiques aux anciens */
     old_dmg(frame, ref);
-    filter_render(frame, out, FILT_DMG, 3);
+    filter_render(frame, out, SCR_W * 3, FILT_DMG, 3);
     CHECK(memcmp(out, ref, sizeof(uint32_t) * 3 * SCR_W * 3 * SCR_H) == 0,
           "vert à s=3 différent de l'ancien algorithme");
     static uint32_t lcd_ref[NTEX], scan_ref[NTEX];
     old_lcd_scan(frame, lcd_ref, scan_ref);
-    filter_render(frame, out, FILT_LCD, 3);
+    filter_render(frame, out, SCR_W * 3, FILT_LCD, 3);
     CHECK(memcmp(out, lcd_ref, sizeof(uint32_t) * 3 * SCR_W * 3 * SCR_H) == 0,
           "LCD à s=3 différent de l'ancien algorithme");
-    filter_render(frame, out, FILT_SCAN, 3);
+    filter_render(frame, out, SCR_W * 3, FILT_SCAN, 3);
     CHECK(memcmp(out, scan_ref, sizeof(uint32_t) * 3 * SCR_W * 3 * SCR_H) == 0,
           "scanlines à s=3 différentes de l'ancien algorithme");
 
     /* 2. pixel à s = 4 : centre plein, bords 60 %, coins 40 % */
-    filter_render(frame, out, FILT_PIXEL, 4);
+    filter_render(frame, out, SCR_W * 4, FILT_PIXEL, 4);
     for (unsigned y = 0; y < SCR_H; y++)
         for (unsigned x = 0; x < SCR_W; x++) {
             uint32_t c = rgb565_argb(frame[y * SCR_W + x]);
@@ -106,7 +106,7 @@ int main(void) {
         }
 
     /* 3. grille : dernière ligne et colonne en noir, le reste à pleine luminosité */
-    filter_render(frame, out, FILT_GRID, 4);
+    filter_render(frame, out, SCR_W * 4, FILT_GRID, 4);
     for (unsigned y = 0; y < SCR_H; y++)
         for (unsigned x = 0; x < SCR_W; x++) {
             uint32_t c = rgb565_argb(frame[y * SCR_W + x]);
@@ -119,7 +119,7 @@ int main(void) {
         }
 
     /* 4. scanlines à 2x : lignes alternées sombre / pleine */
-    filter_render(frame, out, FILT_SCAN, 2);
+    filter_render(frame, out, SCR_W * 2, FILT_SCAN, 2);
     for (unsigned x = 0; x < SCR_W; x++) {
         uint32_t c = rgb565_argb(frame[x]);
         CHECK(out[0 * 2 * SCR_W + 2 * x] == argb_scale(c, 55), "scan 2x : ligne 0");
@@ -130,6 +130,23 @@ int main(void) {
     for (int f = FILT_PIXEL; f < FILT_RAW; f++)
         for (unsigned s = 2; s <= FILT_SCALE_MAX; s++)
             check_coverage(f, s);
+
+    /* 5b. pitch plus large que la ligne (texture verrouillée à lignes
+     * rembourrées) : mêmes texels ligne à ligne, rembourrage jamais écrit */
+    for (int f = FILT_PIXEL; f < FILT_RAW; f++)
+        for (unsigned s = 2; s <= FILT_SCALE_MAX; s++) {
+            const unsigned w = SCR_W * s, pitch = w + 7;
+            filter_render(frame, ref, w, f, s);
+            for (size_t i = 0; i < NTEX; i++) out[i] = SENTINEL;
+            filter_render(frame, out, pitch, f, s);
+            size_t diff = 0, pad = 0;
+            for (unsigned y = 0; y < SCR_H * s; y++) {
+                if (memcmp(out + (size_t)y * pitch, ref + (size_t)y * w, w * sizeof *out)) diff++;
+                for (unsigned x = w; x < pitch; x++) if (out[(size_t)y * pitch + x] != SENTINEL) pad++;
+            }
+            CHECK(diff == 0, "%s s=%u pitch %u : %zu lignes différentes", filter_name(f), s, pitch, diff);
+            CHECK(pad == 0, "%s s=%u pitch %u : %zu texels de rembourrage écrits", filter_name(f), s, pitch, pad);
+        }
 
     /* 6. SDL : la texture est à l'échelle de la fenêtre, et la sortie est recopiée
      * à l'identique (aucun rééchantillonnage). Renderer logiciel, fenêtre cachée. */
@@ -154,7 +171,11 @@ int main(void) {
                   "%dx%d %s : texture %dx%d au lieu de %ux%u", (int)winSizes[w][0], (int)winSizes[w][1],
                   filter_name(f), tw, th, SCR_W * s, SCR_H * s);
             /* relecture : la sortie (texture copiée sans mise à l'échelle) doit être
-             * exactement l'image calculée dans px32 */
+             * exactement l'image du filtre, rendue ici hors écran */
+            if (f == FILT_RAW || s == 1)
+                for (unsigned i = 0; i < SCR_W * SCR_H; i++) ref[i] = rgb565_argb(pix[i]);
+            else
+                filter_render(pix, ref, SCR_W * s, f, s);
             if (s >= 1 && tw == (int)(SCR_W * s)) {
                 SDL_SetRenderDrawColor(emuRen, 0, 0, 0, 255);
                 SDL_RenderClear(emuRen);
@@ -166,7 +187,7 @@ int main(void) {
                 if (ow == tw && oh == th) {
                     size_t diff = 0;
                     for (int i = 0; i < tw * th; i++)
-                        if ((readback[i] | 0xff000000u) != (px32[i] | 0xff000000u)) diff++;
+                        if ((readback[i] | 0xff000000u) != (ref[i] | 0xff000000u)) diff++;
                     CHECK(diff == 0, "%dx%d %s : %zu texels modifiés par la sortie",
                           (int)winSizes[w][0], (int)winSizes[w][1], filter_name(f), diff);
                 }

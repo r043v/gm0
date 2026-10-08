@@ -36,6 +36,13 @@ gardées avec le chiffre qui a tranché.
   image : LCD 8× 4,9 → 0,31 ms, 3× 0,76 → 0,18 ms ; DMG 8× 1,6 → 0,28 ms ;
   pixel 8× 0,64 → 0,30 ms ; à 2× inchangé (≈ 0,1 ms), sauf LCD (+0,05 ms).
   Sortie identique bit à bit à toutes les échelles 2 à 8.
+  Le rendu se fait ensuite directement dans la texture (`SDL_LockTexture`),
+  sans le tampon `px32` (9,9 Mo de BSS en moins, natif et wasm).  Mesuré sur
+  `blit()` complet à 8× (1280×1024) : renderer logiciel −20 à −25 % ;
+  OpenGL +2 à +5 % (≈ +0,03 ms) — ce renderer copie de toute façon dans un
+  tampon de verrouillage, il n'y a donc pas de copie gagnée.  Générer chaque
+  ligne directement dans la texture, sans tampon de ligne local, est plus
+  lent (+15 % en OpenGL) : écarté.
 - **Échéances des timers Pokitto** — mesuré, rien à gagner.
   `pk_timers_next` rend 0 tant qu'un IR de CT est levé (reste du modèle
   d'avant le NVIC commun), mais `pk_machine_step` n'est appelé que 1 000 à

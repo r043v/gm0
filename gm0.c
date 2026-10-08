@@ -4523,7 +4523,6 @@ static int step_debug_on(void) {
 
 static SDL_Texture *tex;
 static unsigned texScale; /* échelle de la texture courante (0 = à recréer) */
-static uint32_t px32[64 * MAX_SCREEN_W * MAX_SCREEN_H]; /* image à l'échelle s <= 8 (64 texels par pixel émulé) */
 
 /* Mise à l'échelle de la fenêtre : 0 = échelle entière (pixels carrés,
  * défaut), 1 = adaptée (au plus grand multiple non entier qui garde le
@@ -4636,42 +4635,40 @@ static ALWAYS_INLINE void filter_row(uint32_t *line, const uint32_t (*pal)[2][3]
         for (unsigned i = 0; i < s; i++) line[i] = pal[x][r][cc[i]];
 }
 /* rendu filtré de src (SCR_W x SCR_H, RGB565) dans dst, à l'échelle s : chaque
- * pixel émulé donne un bloc s x s de texels, lignes de SCR_W * s texels.  Par
- * ligne émulée, les palettes de ses pixels sont calculées une fois ; une
- * seule ligne de sortie est écrite par classe de ligne, les autres en sont
- * des copies.  Hors écran pour pouvoir être testé (tests/unit/test_filter.c). */
-static ALWAYS_INLINE void filter_render_f(const uint16_t *src, uint32_t *dst, const int f, unsigned s) {
-    const unsigned stride = SCR_W * s;
+ * pixel émulé donne un bloc s x s de texels ; pitch = texels d'une ligne de
+ * dst à la suivante (>= SCR_W * s).  Par ligne émulée, les palettes de ses
+ * pixels sont calculées une fois, une ligne par classe de ligne est rendue
+ * dans un tampon local, puis copiée sur les s lignes du bloc.  dst n'est
+ * jamais relu : c'est la mémoire de la texture verrouillée (SDL_LockTexture,
+ * prévue pour l'écriture).  Testé hors écran (tests/unit/test_filter.c). */
+static ALWAYS_INLINE void filter_render_f(const uint16_t *src, uint32_t *dst, unsigned pitch,
+                                          const int f, unsigned s) {
+    const size_t bytes = (size_t)SCR_W * s * sizeof *dst;
     uint8_t cc[FILT_SCALE_MAX], rc[FILT_SCALE_MAX];
-    uint32_t pal[MAX_SCREEN_W][2][3];
+    uint32_t pal[MAX_SCREEN_W][2][3], row[2][MAX_SCREEN_W * FILT_SCALE_MAX];
     filter_classes(f, s, cc, rc);
     for (unsigned y = 0; y < SCR_H; y++) {
         for (unsigned x = 0; x < SCR_W; x++) filter_palette(f, s, src[y * SCR_W + x], pal[x]);
-        uint32_t *blk = dst + y * s * stride;
-        int first[2] = { -1, -1 }; /* première ligne du bloc de chaque classe */
-        for (unsigned j = 0; j < s; j++) {
-            uint32_t *line = blk + j * stride;
-            const unsigned r = rc[j];
-            if (first[r] >= 0) { memcpy(line, blk + (unsigned)first[r] * stride, stride * sizeof *line); continue; }
-            first[r] = (int)j;
+        for (unsigned r = 0; r < 2; r++)
             switch (s) { /* largeur de bloc constante : boucle déroulée */
-            case 2: filter_row(line, pal, r, cc, 2); break;
-            case 3: filter_row(line, pal, r, cc, 3); break;
-            case 4: filter_row(line, pal, r, cc, 4); break;
-            default: filter_row(line, pal, r, cc, s); break;
+            case 2: filter_row(row[r], pal, r, cc, 2); break;
+            case 3: filter_row(row[r], pal, r, cc, 3); break;
+            case 4: filter_row(row[r], pal, r, cc, 4); break;
+            default: filter_row(row[r], pal, r, cc, s); break;
             }
-        }
+        for (unsigned j = 0; j < s; j++)
+            memcpy(dst + (size_t)(y * s + j) * pitch, row[rc[j]], bytes);
     }
 }
 /* une instance par filtre : f constant, la palette se réduit à son cas */
-static void filter_render(const uint16_t *src, uint32_t *dst, int f, unsigned s) {
+static void filter_render(const uint16_t *src, uint32_t *dst, unsigned pitch, int f, unsigned s) {
     if (s < 2 || s > FILT_SCALE_MAX) return; /* 1 : brute, traitée par blit */
     switch (f) {
-    case FILT_PIXEL: filter_render_f(src, dst, FILT_PIXEL, s); break;
-    case FILT_DMG:   filter_render_f(src, dst, FILT_DMG, s); break;
-    case FILT_LCD:   filter_render_f(src, dst, FILT_LCD, s); break;
-    case FILT_SCAN:  filter_render_f(src, dst, FILT_SCAN, s); break;
-    case FILT_GRID:  filter_render_f(src, dst, FILT_GRID, s); break;
+    case FILT_PIXEL: filter_render_f(src, dst, pitch, FILT_PIXEL, s); break;
+    case FILT_DMG:   filter_render_f(src, dst, pitch, FILT_DMG, s); break;
+    case FILT_LCD:   filter_render_f(src, dst, pitch, FILT_LCD, s); break;
+    case FILT_SCAN:  filter_render_f(src, dst, pitch, FILT_SCAN, s); break;
+    case FILT_GRID:  filter_render_f(src, dst, pitch, FILT_GRID, s); break;
     default: break;
     }
 }
@@ -4784,11 +4781,13 @@ static void osd_push_at(uint32_t now, const char *fmt, ...) {
 }
 #define osd_push(...) osd_push_at(SDL_GetTicks(), __VA_ARGS__)
 
-/* dessine la pile dans buf (SCR_W * cell texels de large), cellule = cell
- * texels par pixel émulé : fond assombri à 35 %, texte blanc */
-static void osd_draw(uint32_t *buf, unsigned cell, uint32_t now) {
+/* dessine la pile dans buf (stride texels d'une ligne à la suivante),
+ * cellule = cell texels par pixel émulé : fond assombri à 35 %, texte blanc.
+ * Le fond relit les texels de la boîte, écrits par le filtre dans le même
+ * verrouillage de la texture (seule relecture de cette mémoire, bornée à la
+ * boîte et seulement pendant qu'un message est affiché). */
+static void osd_draw(uint32_t *buf, unsigned stride, unsigned cell, uint32_t now) {
     osd_expire(now);
-    const unsigned stride = SCR_W * cell;
     for (unsigned k = 0; k < osdCount; k++) {
         const struct osd_line *l = &osdLines[osdCount - 1 - k]; /* k = 0 : la plus récente */
         int top = (int)SCR_H - OSD_MARGIN - OSD_BOX - (int)k * OSD_STEP;
@@ -4847,16 +4846,23 @@ static void blit(SDL_Renderer *ren) {
     if (s < 2) s = 1;
     const int f = s == 1 ? FILT_RAW : dispFilter;
     tex_ensure(ren, s);
-    if (f == FILT_RAW) {
-        for (unsigned i = 0; i < SCR_W * SCR_H; i++)
-            px32[i] = rgb565_argb(pix[i]); /* même expansion que st7735.ts */
-    } else {
-        filter_render(pix, px32, f, s);
-    }
+    /* rendu directement dans la texture : pas de tampon intermédiaire */
+    void *mem; int pitchBytes;
+    if (tex && SDL_LockTexture(tex, NULL, &mem, &pitchBytes) == 0) {
+        uint32_t *dst = mem;
+        const unsigned pitch = (unsigned)pitchBytes / sizeof *dst;
+        if (f == FILT_RAW) {
+            for (unsigned y = 0; y < SCR_H; y++)
+                for (unsigned x = 0; x < SCR_W; x++) /* même expansion que st7735.ts */
+                    dst[y * pitch + x] = rgb565_argb(pix[y * SCR_W + x]);
+        } else {
+            filter_render(pix, dst, pitch, f, s);
+        }
 #ifndef GM0_NO_OSD
-    if (osdCount) osd_draw(px32, s, SDL_GetTicks());
+        if (osdCount) osd_draw(dst, pitch, s, SDL_GetTicks());
 #endif
-    SDL_UpdateTexture(tex, NULL, px32, SCR_W * s * sizeof(uint32_t));
+        SDL_UnlockTexture(tex);
+    }
     SDL_RenderClear(ren);
     if (dispScale) {
         int ow, oh;
