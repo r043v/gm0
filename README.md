@@ -1,7 +1,7 @@
 # gm0
 
 **A cycle-counted emulator for the Gamebuino META (SAMD21, Cortex-M0+) and
-the Pokitto (LPC11U6x, Cortex-M0), written in C with an SDL2 frontend and a
+the Pokitto (LPC11U6x, Cortex-M0+), written in C with an SDL2 frontend and a
 WebAssembly build.**
 
 > Version française : [README.fr.md](README.fr.md)
@@ -136,9 +136,13 @@ original TypeScript emulator was dropped deliberately in October 2026.
 - Instructions are charged their Cortex-M0+ cycle cost (ALU 1, load/store 2,
   taken branch 2, BL 3, LDM/STM/PUSH/POP 1+N, POP {pc} 3+N), plus a wait
   state on each miss of the 8-line NVM cache (instruction and data).
-- The NVIC implements PRIMASK, strict-priority preemption, the 8-word
-  exception frame with STKALIGN, and level-triggered lines that are
-  re-evaluated on exception return.
+- The NVIC is the same ARMv6-M model on both targets: ISER/ICER enables,
+  PRIMASK, strict-priority preemption over the four priority levels (IPR),
+  the 8-word exception frame with STKALIGN, and the 15-cycle entry latency.
+  Lines still asserted on exception return are pended again (TC and DMAC on
+  the META, CT32B0/1 on the Pokitto).
+- On the Pokitto (LPC11U68, Cortex-M0+ r0p1), pin edges are latched in the
+  NVIC when they happen, and SysTick fires on COUNTFLAG with TICKINT set.
 - Peripheral registers are accessed by byte lane: an access of any width
   updates exactly the bytes it covers.
 - TC4/TC5 run at the rate derived from their CTRLA prescaler and CC0; the
@@ -199,6 +203,13 @@ references (`-u`) only after a change that is meant to alter the output.
 - In WebAssembly, flash writes are ignored and saves do not survive the
   session.
 - Cards are built as FAT16 (superfloppy or MBR depending on the target).
+- Pokitto: the I/O port is not single-cycle (loads and stores are charged
+  as ordinary bus accesses), pin interrupts are edge-only (the level mode
+  and the pattern match engine are not modelled), and the USART, ADC and SCT
+  interrupts are not connected.
+- Pokitto: the IRQ numbers (pins 0-7, CT32B0/1 as IRQ 18/19) come from the
+  PokittoEmu port. The LPC11U6x datasheet (rev. 1.5) does not list them;
+  the user manual (UM10732) does and has not been checked against them.
 
 Planned and investigated work is tracked in [TODO.md](TODO.md).
 
@@ -224,7 +235,7 @@ Logic was ported from two MIT-licensed emulators:
 - **gamebuino-emulator** by Andy O'Neill (TypeScript) — the first C port
   reproduced it tick for tick:
   [aoneill01/gamebuino-emulator](https://github.com/aoneill01/gamebuino-emulator);
-- **PokittoEmu** by Felipe Manga — the LPC11U6x/Cortex-M0 side is a C port
+- **PokittoEmu** by Felipe Manga — the LPC11U6x/Cortex-M0+ side is a C port
   of it: [felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu).
 
 Everything else follows the vendor documentation:

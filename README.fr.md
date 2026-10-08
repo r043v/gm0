@@ -1,7 +1,7 @@
 # gm0
 
 **Émulateur compté en cycles de la Gamebuino META (SAMD21, Cortex-M0+) et de
-la Pokitto (LPC11U6x, Cortex-M0), écrit en C, avec un frontal SDL2 et un
+la Pokitto (LPC11U6x, Cortex-M0+), écrit en C, avec un frontal SDL2 et un
 build WebAssembly.**
 
 > English version: [README.md](README.md)
@@ -140,9 +140,14 @@ l'émulateur TypeScript d'origine a été abandonnée volontairement en octobre
   load/store 2, branchement pris 2, BL 3, LDM/STM/PUSH/POP 1+N, POP {pc}
   3+N), plus un état d'attente à chaque défaut du cache NVM à 8 lignes
   (instructions et données).
-- Le NVIC modélise PRIMASK, la préemption à priorité strictement
-  supérieure, la trame d'exception de 8 mots avec STKALIGN, et des lignes
-  sensibles au niveau, réévaluées au retour d'exception.
+- Le NVIC est le même modèle ARMv6-M sur les deux cibles : activations
+  ISER/ICER, PRIMASK, préemption à priorité strictement supérieure sur les
+  quatre niveaux (IPR), trame d'exception de 8 mots avec STKALIGN, et latence
+  d'entrée de 15 cycles. Une ligne encore levée au retour d'exception est
+  remise en attente (TC et DMAC sur la META, CT32B0/1 sur la Pokitto).
+- Sur la Pokitto (LPC11U68, Cortex-M0+ r0p1), un front de broche est latché
+  dans le NVIC au moment où il survient, et le SysTick part sur COUNTFLAG
+  quand TICKINT est posé.
 - Les registres périphériques sont accédés par voies d'octet : un accès de
   toute largeur met à jour exactement les octets qu'il couvre.
 - TC4/TC5 tournent à la cadence dérivée de leur prescaler CTRLA et de CC0 ;
@@ -204,6 +209,13 @@ modifier la sortie.
 - En WebAssembly, les écritures flash sont ignorées et les sauvegardes ne
   survivent pas à la session.
 - Les cartes sont construites en FAT16 (superfloppy ou MBR selon la cible).
+- Pokitto : le port I/O n'est pas à un cycle (les lectures et écritures sont
+  comptées comme des accès bus ordinaires), les interruptions de broche ne
+  sont que sur front (le mode niveau et le moteur de pattern match ne sont
+  pas modélisés), et les interruptions USART, ADC et SCT ne sont pas câblées.
+- Pokitto : les numéros d'IRQ (broches 0-7, CT32B0/1 en IRQ 18/19) viennent
+  du port PokittoEmu. La datasheet LPC11U6x (rév. 1.5) ne les liste pas ; le
+  manuel utilisateur (UM10732) les liste, et n'a pas été vérifié contre eux.
 
 Les travaux prévus et les pistes étudiées sont suivis dans [TODO.md](TODO.md).
 
@@ -231,7 +243,7 @@ Logique portée depuis deux émulateurs sous licence MIT :
 - **gamebuino-emulator** d'Andy O'Neill (TypeScript) — le premier port C
   en reproduisait le comportement tick à tick :
   [aoneill01/gamebuino-emulator](https://github.com/aoneill01/gamebuino-emulator) ;
-- **PokittoEmu** de Felipe Manga — la partie LPC11U6x/Cortex-M0 en est un
+- **PokittoEmu** de Felipe Manga — la partie LPC11U6x/Cortex-M0+ en est un
   port C : [felipemanga/PokittoEmu](https://github.com/felipemanga/PokittoEmu).
 
 Tout le reste suit la documentation des constructeurs :
