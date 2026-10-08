@@ -4633,6 +4633,151 @@ static void filter_render(const uint16_t *src, uint32_t *dst, int f) {
     }
 }
 
+#ifndef GM0_NO_OSD
+/* OSD : messages temporaires, pile en bas à gauche de l'image.  La ligne la
+ * plus récente est en bas, les anciennes remontent.  Chaque entrée a sa
+ * propre échéance et disparaît seule ; la pile se resserre.  Le texte est
+ * dessiné dans le tampon d'image, après le filtre : pix, --shot et les
+ * traces n'en voient rien.  Désactivable à la compilation : -DGM0_NO_OSD
+ * (CMake : -DGM0_OSD=OFF). */
+#define OSD_SLOTS 6
+#define OSD_TEXT 40
+#define OSD_MS 3000   /* durée d'affichage d'une entrée */
+#define OSD_BOX 9     /* boîte d'une ligne, en pixels émulés : 7 de police + 1 de marge haut et bas */
+#define OSD_STEP 10   /* pas vertical entre deux boîtes : une ligne d'écart */
+#define OSD_MARGIN 2  /* marge à gauche et en bas, en pixels émulés */
+struct osd_line { char text[OSD_TEXT]; uint32_t until; };
+static struct osd_line osdLines[OSD_SLOTS]; /* du plus ancien au plus récent */
+static unsigned osdCount;
+
+/* police 5x7 : majuscules, chiffres, ponctuation courante ; les minuscules
+ * sont ramenées en majuscules, un caractère inconnu s'affiche '?' */
+struct osd_glyph { char c; char rows[7][6]; };
+static const struct osd_glyph osdFont[] = {
+    { ' ', { ".....", ".....", ".....", ".....", ".....", ".....", "....." } },
+    { 'A', { ".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#" } },
+    { 'B', { "####.", "#...#", "#...#", "####.", "#...#", "#...#", "####." } },
+    { 'C', { ".###.", "#...#", "#....", "#....", "#....", "#...#", ".###." } },
+    { 'D', { "####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####." } },
+    { 'E', { "#####", "#....", "#....", "####.", "#....", "#....", "#####" } },
+    { 'F', { "#####", "#....", "#....", "####.", "#....", "#....", "#...." } },
+    { 'G', { ".###.", "#...#", "#....", "#.###", "#...#", "#...#", ".####" } },
+    { 'H', { "#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#" } },
+    { 'I', { ".###.", "..#..", "..#..", "..#..", "..#..", "..#..", ".###." } },
+    { 'J', { "..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.." } },
+    { 'K', { "#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#" } },
+    { 'L', { "#....", "#....", "#....", "#....", "#....", "#....", "#####" } },
+    { 'M', { "#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#" } },
+    { 'N', { "#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#" } },
+    { 'O', { ".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###." } },
+    { 'P', { "####.", "#...#", "#...#", "####.", "#....", "#....", "#...." } },
+    { 'Q', { ".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#" } },
+    { 'R', { "####.", "#...#", "#...#", "####.", "#.#..", "#..#.", "#...#" } },
+    { 'S', { ".####", "#....", "#....", ".###.", "....#", "....#", "####." } },
+    { 'T', { "#####", "..#..", "..#..", "..#..", "..#..", "..#..", "..#.." } },
+    { 'U', { "#...#", "#...#", "#...#", "#...#", "#...#", "#...#", ".###." } },
+    { 'V', { "#...#", "#...#", "#...#", "#...#", "#...#", ".#.#.", "..#.." } },
+    { 'W', { "#...#", "#...#", "#...#", "#.#.#", "#.#.#", "#.#.#", ".#.#." } },
+    { 'X', { "#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#" } },
+    { 'Y', { "#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.." } },
+    { 'Z', { "#####", "....#", "...#.", "..#..", ".#...", "#....", "#####" } },
+    { '0', { ".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###." } },
+    { '1', { "..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###." } },
+    { '2', { ".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####" } },
+    { '3', { "#####", "...#.", "..#..", "...#.", "....#", "#...#", ".###." } },
+    { '4', { "...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#." } },
+    { '5', { "#####", "#....", "####.", "....#", "....#", "#...#", ".###." } },
+    { '6', { "..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###." } },
+    { '7', { "#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..." } },
+    { '8', { ".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###." } },
+    { '9', { ".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.." } },
+    { ':', { ".....", "..#..", ".....", ".....", ".....", "..#..", "....." } },
+    { '.', { ".....", ".....", ".....", ".....", ".....", ".##..", ".##.." } },
+    { ',', { ".....", ".....", ".....", ".....", ".##..", "..#..", ".#..." } },
+    { '-', { ".....", ".....", ".....", ".###.", ".....", ".....", "....." } },
+    { '+', { ".....", "..#..", "..#..", "#####", "..#..", "..#..", "....." } },
+    { '=', { ".....", ".....", "#####", ".....", "#####", ".....", "....." } },
+    { '/', { "....#", "....#", "...#.", "..#..", ".#...", "#....", "#...." } },
+    { '\\', { "#....", "#....", ".#...", "..#..", "...#.", "....#", "....#" } },
+    { '(', { "..#..", ".#...", "#....", "#....", "#....", ".#...", "..#.." } },
+    { ')', { "..#..", "...#.", "....#", "....#", "....#", "...#.", "..#.." } },
+    { '!', { "..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.." } },
+    { '?', { ".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.." } },
+    { '%', { "#...#", "#..#.", "...#.", "..#..", ".#...", ".#..#", "#...#" } },
+    { '#', { ".#.#.", "#####", ".#.#.", ".#.#.", ".#.#.", "#####", ".#.#." } },
+    { '\'', { "..#..", "..#..", ".#...", ".....", ".....", ".....", "....." } },
+    { '"', { ".#.#.", ".#.#.", ".....", ".....", ".....", ".....", "....." } },
+    { '_', { ".....", ".....", ".....", ".....", ".....", ".....", "#####" } },
+    { '*', { ".....", "#.#.#", ".###.", "#####", ".###.", "#.#.#", "....." } },
+};
+
+static const struct osd_glyph *osd_glyph(int c) {
+    if (c >= 'a' && c <= 'z') c -= 'a' - 'A';
+    for (unsigned i = 0; i < sizeof osdFont / sizeof osdFont[0]; i++)
+        if (osdFont[i].c == c) return &osdFont[i];
+    return osd_glyph('?'); /* '?' est dans la table : pas de récursion sans fin */
+}
+
+/* retire les entrées échues, chacune selon sa propre échéance */
+static void osd_expire(uint32_t now) {
+    unsigned k = 0;
+    for (unsigned i = 0; i < osdCount; i++)
+        if ((int32_t)(osdLines[i].until - now) > 0) osdLines[k++] = osdLines[i];
+    osdCount = k;
+}
+/* ajoute une entrée ; à pile pleine, la plus ancienne cède la place */
+static void osd_push_at(uint32_t now, const char *fmt, ...) {
+    osd_expire(now);
+    if (osdCount == OSD_SLOTS) {
+        memmove(osdLines, osdLines + 1, (OSD_SLOTS - 1) * sizeof osdLines[0]);
+        osdCount--;
+    }
+    struct osd_line *l = &osdLines[osdCount++];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(l->text, sizeof l->text, fmt, ap);
+    va_end(ap);
+    l->until = now + OSD_MS;
+}
+#define osd_push(...) osd_push_at(SDL_GetTicks(), __VA_ARGS__)
+
+/* dessine la pile dans buf (SCR_W * cell texels de large), cellule = cell
+ * texels par pixel émulé : fond assombri à 35 %, texte blanc */
+static void osd_draw(uint32_t *buf, unsigned cell, uint32_t now) {
+    osd_expire(now);
+    const unsigned stride = SCR_W * cell;
+    for (unsigned k = 0; k < osdCount; k++) {
+        const struct osd_line *l = &osdLines[osdCount - 1 - k]; /* k = 0 : la plus récente */
+        int top = (int)SCR_H - OSD_MARGIN - OSD_BOX - (int)k * OSD_STEP;
+        if (top < 0) break;
+        int n = (int)strlen(l->text);
+        int right = OSD_MARGIN + n * 6 + 1;
+        if (right > (int)SCR_W) right = (int)SCR_W;
+        for (int y = top; y < top + OSD_BOX; y++)
+            for (int x = OSD_MARGIN; x < right; x++)
+                for (unsigned dy = 0; dy < cell; dy++)
+                    for (unsigned dx = 0; dx < cell; dx++) {
+                        uint32_t *t = buf + ((unsigned)y * cell + dy) * stride + (unsigned)x * cell + dx;
+                        *t = argb_scale(*t, 35);
+                    }
+        for (int i = 0; i < n; i++) {
+            const struct osd_glyph *g = osd_glyph(l->text[i]);
+            for (int r = 0; r < 7; r++)
+                for (int c = 0; c < 5; c++) {
+                    if (g->rows[r][c] != '#') continue;
+                    int x = OSD_MARGIN + 1 + i * 6 + c, y = top + 1 + r;
+                    if (x >= (int)SCR_W) continue;
+                    for (unsigned dy = 0; dy < cell; dy++)
+                        for (unsigned dx = 0; dx < cell; dx++)
+                            buf[((unsigned)y * cell + dy) * stride + (unsigned)x * cell + dx] = 0xffffffffu;
+                }
+        }
+    }
+}
+#else
+#define osd_push(...) ((void)0)
+#endif
+
 static void scale_apply(void);
 
 static void blit(SDL_Renderer *ren) {
@@ -4643,6 +4788,9 @@ static void blit(SDL_Renderer *ren) {
     } else {
         filter_render(pix, px32, dispFilter);
     }
+#ifndef GM0_NO_OSD
+    if (osdCount) osd_draw(px32, cell, SDL_GetTicks());
+#endif
     SDL_UpdateTexture(tex, NULL, px32, SCR_W * cell * sizeof(uint32_t));
     SDL_RenderClear(ren);
     if (dispScale) {
@@ -4981,6 +5129,7 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
         pk_eeprom_load();
     }
     printf(TR("firmware %s : %s (%zu Ko)\n", "%s firmware: %s (%zu KB)\n"), pk ? "Pokitto" : "META", display, len / 1024);
+    osd_push("%s : %s", TR("CHARGE", "LOADED"), fwName);
 }
 
 /* F5 : redémarre le firmware courant (la Pokitto garde sa carte et son
@@ -5223,12 +5372,13 @@ static int poll_events(void) {
         }
 #endif
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F5) {
-            if (fwLoaded) { fw_restart(); printf(TR("redémarrage\n", "restart\n")); }
+            if (fwLoaded) { fw_restart(); printf(TR("redémarrage\n", "restart\n")); osd_push(TR("REDEMARRAGE", "RESTART")); }
         }
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F8) {
             dispFilter = (dispFilter + 1) % FILT_COUNT;
             scale_apply();
             printf(TR("filtre : %s (F8)\n", "filter: %s (F8)\n"), filter_name(dispFilter));
+            osd_push("%s : %s", TR("FILTRE", "FILTER"), filter_name(dispFilter));
         }
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F10) {
             dispScale = (dispScale + 1) % 3;
@@ -5236,11 +5386,15 @@ static int poll_events(void) {
             printf(TR("échelle : %s\n", "scale: %s\n"), dispScale == 0 ? TR("entière (F10/F11)", "integer (F10/F11)")
                                    : dispScale == 1 ? TR("adaptée (F10/F11)", "fitted (F10/F11)")
                                                     : TR("étirée (F10/F11)", "stretched (F10/F11)"));
+            osd_push("%s : %s", TR("ECHELLE", "SCALE"), dispScale == 0 ? TR("ENTIERE", "INTEGER")
+                                                     : dispScale == 1 ? TR("ADAPTEE", "FITTED")
+                                                                      : TR("ETIREE", "STRETCHED"));
         }
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F11) {
             dispFull = !dispFull;
             if (SDL_SetWindowFullscreen(emuWin, dispFull ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0)
                 fprintf(stderr, "plein écran : %s\n", SDL_GetError());
+            osd_push("%s", dispFull ? TR("PLEIN ECRAN", "FULLSCREEN") : TR("FENETRE", "WINDOWED"));
         }
         else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
             uint8_t m = key_bit(ev.key.keysym.sym);

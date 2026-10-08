@@ -43,7 +43,8 @@ cmake --build build          # produit build/bin/gm0
 ```
 
 L'interface est en anglais par défaut ; configurer avec `-DGM0_FR=ON` pour
-le français.
+le français.  Les messages brefs à l'écran (redémarrage, filtre, échelle,
+chargement) sont activés par défaut ; `-DGM0_OSD=OFF` les retire.
 
 Build WebAssembly (emsdk requis, `emcc` dans le `PATH`) :
 
