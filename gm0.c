@@ -133,7 +133,16 @@ static void sercom4_ctrl_write(uint32_t r, uint32_t v, uint32_t m) {
 }
 static uint8_t  buttonData = 0xff;
 
-static int      primask; /* CPSID/CPSIE : masque les injections d'interruptions */
+static int      primask; /* PRIMASK (CPSID/CPSIE, MSR) : masque les prises d'exception configurables */
+/* NVIC ARMv6-M, commun aux deux cibles : IRQ activées / en attente (bit n =
+ * IRQ n = exception 16+n), priorités, SysTick, pile des exceptions actives */
+static uint32_t nvicIser, nvicPend;
+static uint8_t  nvicIpr[32];            /* priorité par IRQ (bits 7:6) */
+static uint8_t  shprSysTick;            /* SHPR3[31:24] */
+static int      sysTickPend;            /* ICSR.PENDSTSET */
+static uint8_t  excNum[16];
+static int8_t   excPri[16];             /* -1 : HardFault */
+static int      excDepth;
 static int      sysTickCountFlag; /* SysTick CSR.COUNTFLAG : wrap CVR depuis la dernière lecture */
 static uint32_t dacWrites; /* écritures DAC DATA (EMU_AUDIO_STATS) */
 static uint32_t audStarvedTicks, audRestarts; /* EMU_AUDIO_STATS */
@@ -236,7 +245,6 @@ static uint32_t maxFrames;
 #define TGT_POKITTO 1
 static int emuTarget = TGT_META;   /* fixé par --target ou détection */
 static int targetForced;           /* --target explicite */
-static int armIrqEnable = 1;       /* PRIMASK inversé (CPSIE/CPSID, Pokitto) */
 
 static unsigned SCR_W = 160, SCR_H = 128;
 
@@ -282,7 +290,11 @@ static void     pk_write_byte(uint32_t a, uint8_t v);
 static void     pk_reset_core(void);
 static void     pk_machine_step(void);
 static void     pk_blx(uint32_t opcode);
-static void     pk_interrupt(uint32_t id);
+static void     nvic_enter(int exc);
+static void     nvic_service(void);
+static void     nvic_reset(void);
+static uint32_t scs_read(uint32_t a);
+static void     scs_write(uint32_t a, uint32_t v, uint32_t m);
 static void     pk_adc_frame(void);
 static void     pk_eeprom_save(void);
 static void     pk_btn_gpio(uint8_t mask, int pressed);
@@ -1419,7 +1431,7 @@ static int zip_load_card(const uint8_t *data, size_t len) {
 }
 
 /* ===================================================== POKITTO =========
- * LPC11U68 (Cortex-M0) — port C fidèle du PokittoEmu de felipemanga.
+ * LPC11U68 (Cortex-M0+ r0p1) — port C fidèle du PokittoEmu de felipemanga.
  * Même cœur d'exécution que la META ; l'environnement change :
  *  - flash chargée à 0 (vecteurs), SRAM 0x10000000 (32 Kio) + 2 x 2 Kio
  *    (0x20000000, 0x20004000), EEPROM 4 Ko persistée (<jeu>.eeprom) ;
@@ -1985,16 +1997,10 @@ static void pk_gpio_input(uint32_t pinId, uint32_t bit, uint32_t val) {
         if (pk_syscon[PK_SYSCON_PINTSEL(f)] != id) continue;
         if (val ? (pk_ienr & (1u << f)) : (pk_ienf & (1u << f))) {
             pk_ist |= 1u << f;
+            nvicPend |= 1u << f; /* IRQ f = broche f : front latché au NVIC */
+            irq_work();
             if (val) pk_rise |= 1u << f;
             else pk_fall |= 1u << f;
-        }
-    }
-}
-
-static void pk_gpio_update(void) {
-    if (pk_ist && armIrqEnable) {
-        for (uint32_t f = 0; f < 8; f++) {
-            if (pk_ist & (1u << f)) { pk_interrupt(16 + f); return; }
         }
     }
 }
@@ -2109,26 +2115,19 @@ static void pk_blx(uint32_t opcode) {
 }
 
 /* --- interruption (xPSR aux positions ARM réelles) */
-static long pk_irqCount[64];
-static void pk_interrupt(uint32_t id) {
-    if (id < 64) pk_irqCount[id]++;
-    uint32_t psr = (uint32_t)(fN ? 1u << 31 : 0) | (fZ ? 1u << 30 : 0) |
-                   (fC ? 1u << 29 : 0) | (fV ? 1u << 28 : 0) | (1u << 24);
-    pushStack(psr);
-    pushStack(regs[15] - 2u); /* adresse de reprise réelle (exc_return la relit) */
-    pushStack(regs[14]);
-    pushStack(regs[12]);
-    pushStack(regs[3]);
-    pushStack(regs[2]);
-    pushStack(regs[1]);
-    pushStack(regs[0]);
-    regs[14] = 0xfffffff9u;
-    regs[15] = pk_read_word(sys_VTOR + (id << 2)) & ~1u;
-    armIrqEnable = 0;
-    incrementPc();
-}
+static long pk_irqCount[64]; /* tirs par exception (EMU_PK_DEBUG) */
 
 /* --- timers : SysTick + CT32B0/1 (delta en ticks CPU) */
+/* COUNTFLAG -> SysTick en attente (ENABLE et TICKINT) : le drapeau reste levé
+ * tant que TICKINT n'est pas posé, et l'attente survit au masquage PRIMASK */
+static void pk_systick_pend(void) {
+    if ((pk_systickCSR & 3u) == 3u && (pk_systickCSR & (1u << 16))) {
+        pk_systickCSR &= ~(1u << 16);
+        sysTickPend = 1;
+        irq_work();
+    }
+}
+
 static uint32_t pk_systick_tick(uint32_t delta) {
     if (!(pk_systickCSR & 1)) return ~0u;
     pk_systickCVR -= delta;
@@ -2136,10 +2135,7 @@ static uint32_t pk_systick_tick(uint32_t delta) {
         pk_systickCVR += pk_systickRVR & 0xFFFFFF;
         pk_systickCSR |= 1u << 16;
     }
-    if (armIrqEnable && (pk_systickCSR & (1u << 16))) {
-        pk_systickCSR &= ~(1u << 16);
-        pk_interrupt(15);
-    }
+    pk_systick_pend();
     return pk_systickCVR;
 }
 
@@ -2159,21 +2155,10 @@ static void pk_ct_tick(struct pk_ct *ct, uint32_t num, uint32_t delta) {
         uint32_t mri = 1u << (m * 3), mrr = 1u << (m * 3 + 1), mrs = 1u << (m * 3 + 2);
         uint32_t mr = ct->r[6 + (uint32_t)m];
         if (oldTC < mr && ct->r[PK_CT_TC] >= mr) {
-            if (ct->r[5] & mri) ct->r[PK_CT_IR] |= 1u << m;
+            if (ct->r[5] & mri) { ct->r[PK_CT_IR] |= 1u << m; nvicPend |= 1u << (18 + num); irq_work(); }
             if (ct->r[5] & mrs) ct->r[PK_CT_TCR] &= ~1u;
             if (ct->r[5] & mrr) ct->r[PK_CT_TC] -= mr;
         }
-    }
-
-    if (ct->r[PK_CT_IR] && armIrqEnable) {
-        if (num == 0) {
-            /* détection HLE du handler stock (loader) : auto-limitée (le
-             * même vecteur ne re-détecte pas), le taux CT32B0 courant sert
-             * au taux de lecture du buffer HLE */
-            uint32_t mr0 = ct->r[6];
-            if (mr0 > 0) pk_audio_check_hle((uint32_t)(pk_core_hz() / ((uint64_t)(mr0 + 1) * pr)));
-        }
-        pk_interrupt(34 + num);
     }
 }
 
@@ -2190,7 +2175,7 @@ static uint32_t pk_timers_next(void) {
         struct pk_ct *ct = &pk_ct[n];
         if (!(ct->r[PK_CT_TCR] & 1u)) continue;
         uint32_t pr = ct->r[PK_CT_PR] + 1u;
-        if (ct->r[PK_CT_IR]) return 0; /* IRQ en attente : maintenant */
+        if (ct->r[PK_CT_IR] && ((nvicIser >> (18 + n)) & 1u)) return 0; /* IRQ CT activée et levée : maintenant */
         for (uint32_t m = 0; m < 4; m++) {
             if (!((ct->r[5] >> (m * 3)) & 1u)) continue; /* match sans IRQ */
             uint32_t mr = ct->r[6 + m], tc = ct->r[PK_CT_TC];
@@ -2206,10 +2191,7 @@ static void pk_timers_update(void) {
     /* COUNTFLAG posé pendant une section critique (IRQ masquées) : l'IRQ
      * SysTick part dès le ré-enable — sinon le drapeau restait posé pour
      * toujours (le handler ne lit pas CSR) et l'échéance restait à 0. */
-    if ((pk_systickCSR & 3u) == 3u && (pk_systickCSR & (1u << 16)) && armIrqEnable) {
-        pk_systickCSR &= ~(1u << 16);
-        pk_interrupt(15);
-    }
+    pk_systick_pend();
     uint32_t delta = tickCount - pk_lastTick;
     if (!delta) return;
     pk_lastTick = tickCount;
@@ -2225,8 +2207,9 @@ static void pk_machine_step(void) {
         pk_reset_core();
     }
     pk_timers_update();
-    pk_gpio_update();
-    evtAt = tickCount + pk_timers_next();
+    irq_work(); /* broches, CT, SysTick : le NVIC examine toutes les sources */
+    nvic_service();
+    evtAt = irqWork ? tickCount : tickCount + pk_timers_next();
 }
 
 /* --- mémoire : bancs LPC (mêmes sémantiques que la référence :
@@ -2340,13 +2323,10 @@ static uint32_t pk_reg_peek(uint32_t a) {
             case 0x014: return pk_systickRVR;
             case 0x018: return pk_systickCVR;
             case 0x01C: return 4; /* CALIB */
-            case 0x100: case 0x180: case 0x200: case 0x280:
-                return pk_syscon[192 + off / 0x80]; /* ISER/ICER/ISPR/ICPR */
-            case 0xD00: return 0x410CC200u; /* CPUID Cortex-M0 */
-            case 0xD04: return 0;
             case 0xD08: return sys_VTOR;
             case 0xD0C: return 0x05FA0000u;
-            default: return 0;
+            /* NVIC, ICSR, SHPR3, CPUID : les mêmes registres que le META */
+            default: return scs_read(a & ~3u);
         }
     }
     return 0;
@@ -2379,7 +2359,7 @@ __attribute__((noinline))
 static void pk_reg_write(uint32_t a, uint32_t v) {
     if (a < 0x10000000u) { /* flash en lecture seule */
         if (pk_ignoreBadWrites) { pk_ignoreBadWrites--; return; }
-        pk_interrupt(3);
+        nvic_enter(3); /* HardFault : non masquable, priorité -1 */
         return;
     }
     if (a < 0x20000000u) {
@@ -2535,11 +2515,10 @@ static void pk_reg_write(uint32_t a, uint32_t v) {
             case 0x010: pk_systickCSR = v; return;
             case 0x014: pk_systickRVR = v; return;
             case 0x018: pk_systickCSR &= ~(1u << 16); pk_systickCVR = pk_systickRVR; return;
-            case 0x100: case 0x180: case 0x200: case 0x280:
-                pk_syscon[192 + off / 0x80] = v; return;
             case 0xD08: sys_VTOR = v; return;
             case 0xD0C: sys_AIRCR = 0x05FA0000u | (v & 4); evtAt = tickCount; return;
-            default: return;
+            /* NVIC, ICSR, SHPR3 : les mêmes registres que le META */
+            default: scs_write(a & ~3u, v, 0xffffffffu); return;
         }
     }
 }
@@ -2669,7 +2648,8 @@ static void pk_reset_core(void) {
 
     memset(regs, 0, sizeof regs);
     fN = fZ = fC = fV = 0;
-    armIrqEnable = 1;
+    primask = 0;
+    nvic_reset();
     audio_rebase();
     tickCount = 0;
     pk_lastTick = 0;
@@ -2813,10 +2793,10 @@ static void pk_debug_dump(void) {
             pk_hleState == PK_HLE_ENABLED ? TR("actif (firmware stock)", "active (stock firmware)")
                                           : TR("inactif (R2R)", "inactive (R2R)"));
     for (int n = 0; n < 2; n++)
-        fprintf(stderr, "CT32B%d : TCR=%x TC=%u PR=%u MCR=%x MR=[%u %u %u %u] IR=%x armIrq=%d\n",
+        fprintf(stderr, "CT32B%d : TCR=%x TC=%u PR=%u MCR=%x MR=[%u %u %u %u] IR=%x primask=%d\n",
                 n, pk_ct[n].r[1], pk_ct[n].r[2], pk_ct[n].r[3], pk_ct[n].r[5],
                 pk_ct[n].r[6], pk_ct[n].r[7], pk_ct[n].r[8], pk_ct[n].r[9],
-                pk_ct[n].r[0], armIrqEnable);
+                pk_ct[n].r[0], primask);
     fprintf(stderr, "SysTick CSR=%x RVR=%u CVR=%u\n", pk_systickCSR, pk_systickRVR, pk_systickCVR);
 }
 
@@ -3194,12 +3174,6 @@ static void timers_sync(void);
 #define IRQ_DMAC 6
 #define IRQ_TC4 19
 #define IRQ_TC5 20
-static uint32_t nvicIser, nvicPend;     /* IRQ activées / en attente (bit n = IRQ n) */
-static uint8_t  nvicIpr[32];            /* priorité par IRQ (bits 7:6) */
-static uint8_t  shprSysTick;            /* SHPR3[31:24] */
-static int      sysTickPend;            /* ICSR.PENDSTSET */
-static uint8_t  excNum[16], excPri[16]; /* pile des exceptions actives */
-static int      excDepth;
 
 static void nvic_reset(void) {
     nvicIser = nvicPend = 0;
@@ -3211,6 +3185,7 @@ static void nvic_reset(void) {
 }
 
 static int exc_priority(int exc) {
+    if (exc == 3) return -1; /* HardFault : au-dessus de toutes les IRQ */
     if (exc == 15) return shprSysTick >> 6;
     return nvicIpr[(exc - 16) & 31] >> 6;
 }
@@ -3218,13 +3193,26 @@ static int exc_current_priority(void) { return excDepth ? excPri[excDepth - 1] :
 static int exc_active(void) { return excDepth ? excNum[excDepth - 1] : 0; }
 
 static uint32_t exc_vector(int exc) {
+    if (emuTarget == TGT_POKITTO) return pk_read_word(sys_VTOR + 4u * (uint32_t)exc) & ~1u;
     if (exc == 15) return sysTickVector;
     if (exc == 16 + IRQ_DMAC) return dmacVector;
     if ((unsigned)(exc - 16 - IRQ_TC4) < 2u) return tcs[exc - 16 - IRQ_TC4].vector;
     return fetchWord(vectorBase + 4u * (uint32_t)exc) & ~1u;
 }
 
+/* détection HLE du handler stock (loader) : auto-limitée (le même vecteur ne
+ * re-détecte pas), le taux CT32B0 courant sert au taux de lecture du buffer HLE */
+static void pk_hle_ct0(void) {
+    uint32_t mr0 = pk_ct[0].r[6];
+    uint32_t pr = pk_ct[0].r[PK_CT_PR] + 1u;
+    if (mr0 > 0) pk_audio_check_hle((uint32_t)(pk_core_hz() / ((uint64_t)(mr0 + 1) * pr)));
+}
+
 static void nvic_enter(int exc) {
+    if (emuTarget == TGT_POKITTO) {
+        if (exc < 64) pk_irqCount[exc]++;
+        if (exc == 34) pk_hle_ct0(); /* CT32B0 : détection HLE à l'entrée */
+    }
     uint32_t psr = (fN ? 1u << 31 : 0) | (fZ ? 1u << 30 : 0) | (fC ? 1u << 29 : 0) |
                    (fV ? 1u << 28 : 0) | (1u << 24) | (uint32_t)exc_active();
     if (regs[13] & 4u) { regs[13] -= 4u; psr |= 1u << 9; } /* alignement 8 (STKALIGN) */
@@ -3237,9 +3225,9 @@ static void nvic_enter(int exc) {
     pushStack(regs[1]);
     pushStack(regs[0]);
     regs[14] = excDepth ? 0xfffffff1u : 0xfffffff9u;
-    if (excDepth < 16) { excNum[excDepth] = (uint8_t)exc; excPri[excDepth] = (uint8_t)exc_priority(exc); excDepth++; }
+    if (excDepth < 16) { excNum[excDepth] = (uint8_t)exc; excPri[excDepth] = (int8_t)exc_priority(exc); excDepth++; }
     if (exc == 15) { sysTickPend = 0; sysTickEntries++; }
-    else nvicPend &= ~(1u << (exc - 16));
+    else if (exc >= 16) nvicPend &= ~(1u << (exc - 16));
     regs[15] = exc_vector(exc);
     incrementPc(); /* même convention de PC que le reste du cœur */
     advance(14); /* latence d'entrée du M0+ : 15 cycles */
@@ -3291,9 +3279,13 @@ static void nvic_return(void) {
     irq_work();
     if (excDepth) {
         int exc = excNum[--excDepth];
-        if (exc == 16 + IRQ_DMAC && dmac_line()) nvicPend |= 1u << IRQ_DMAC;
-        int i = exc - 16 - IRQ_TC4; /* TC : drapeau encore levé et activé */
-        if ((unsigned)i < 2u && (tcs[i].intFlag & tcs[i].intEn)) nvicPend |= 1u << TC_IRQ(i);
+        if (emuTarget == TGT_POKITTO) { /* CT : IR encore levé et activé -> à nouveau en attente */
+            if (exc >= 34 && exc < 36 && pk_ct[exc - 34].r[PK_CT_IR]) nvicPend |= 1u << (exc - 16);
+        } else {
+            if (exc == 16 + IRQ_DMAC && dmac_line()) nvicPend |= 1u << IRQ_DMAC;
+            int i = exc - 16 - IRQ_TC4; /* TC : drapeau encore levé et activé */
+            if ((unsigned)i < 2u && (tcs[i].intFlag & tcs[i].intEn)) nvicPend |= 1u << TC_IRQ(i);
+        }
     }
 }
 
@@ -4187,16 +4179,7 @@ static void trace_tail_dump(void) {
 }
 
 /* retour d'exception : PC sur EXC_RETURN (0xFFFFFFF1/9) & ~1 */
-static void exc_return(void) {
-    if (emuTarget == TGT_META) { nvic_return(); return; }
-    regs[0] = popStack(); regs[1] = popStack(); regs[2] = popStack(); regs[3] = popStack();
-    regs[12] = popStack(); regs[14] = popStack();
-    uint32_t pc = popStack(), psr = popStack();
-    regs[15] = (pc & ~1u) + 2u;
-    fN = (int)(psr >> 31) & 1; fZ = (int)(psr >> 30) & 1; fC = (int)(psr >> 29) & 1; fV = (int)(psr >> 28) & 1;
-    if (psr & (1u << 9)) regs[13] += 4u;
-    armIrqEnable = 1;
-}
+static void exc_return(void) { nvic_return(); }
 
 /* PC hors de la mémoire exécutable : journal, puis reset (META) */
 static int step_wild_pc(uint32_t pc) {
@@ -4434,8 +4417,7 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
     case 0xb6: /* CPSID i (B672) / CPSIE i (B662) */
         if ((op & 0xffef) == 0xb662) {
             int dis = (op >> 4) & 1;
-            if (T == TGT_POKITTO) armIrqEnable = !dis;
-            else { primask = dis; if (!dis) irq_work(); }
+            primask = dis; if (!dis) irq_work();
         }
         break;
     case 0xba: { uint32_t v = regs[(op >> 3) & 7];                                         /* REV* */
@@ -4498,15 +4480,14 @@ static ALWAYS_INLINE void step_t(const int T, const int D) {
             if (sysm <= 3) v = apsr | ((sysm & 1) ? ipsr : 0);       /* APSR, IAPSR, EAPSR, xPSR */
             else if (sysm >= 5 && sysm <= 7) v = (sysm & 1) ? ipsr | (sysm == 7 ? apsr : 0) : 0;
             else if (sysm == 8 || sysm == 9) v = regs[13];          /* MSP (PSP non modélisé) */
-            else if (sysm == 16) v = T == TGT_META ? (uint32_t)primask : (uint32_t)!armIrqEnable;
+            else if (sysm == 16) v = (uint32_t)primask;
             regs[(op2 >> 8) & 15] = v;
         } else if ((op & 0xfff0) == 0xf380 && (op2 & 0xff00) == 0x8800) { /* MSR spec, Rn */
             uint32_t sysm = op2 & 0xff, v = regs[op & 15];
             if (sysm <= 3) { fN = (int)(v >> 31); fZ = (int)(v >> 30) & 1; fC = (int)(v >> 29) & 1; fV = (int)(v >> 28) & 1; }
             else if (sysm == 8 || sysm == 9) regs[13] = v & ~3u;
             else if (sysm == 16) {
-                if (T == TGT_POKITTO) armIrqEnable = !(v & 1);
-                else { primask = (int)(v & 1); irq_work(); }
+                primask = (int)(v & 1); irq_work();
             }
         }
         break; }
