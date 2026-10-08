@@ -96,7 +96,7 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
 | Key | Action |
 |---|---|
 | F5 | reset |
-| F8 | Game Boy display filter (4-shade palette, dot-matrix grid) |
+| F8 | display filter, cycled: none, pixel grid, Game Boy green (DMG), LCD RGB, scanlines |
 | F10 | scaling mode: integer, fitted, stretched |
 | F11 | fullscreen |
 
