@@ -4539,7 +4539,7 @@ static int step_debug_on(void) {
 /* --------------------------------------------------------- SDL + main */
 
 static SDL_Texture *tex;
-static uint32_t px32[3 * MAX_SCREEN_W * 3 * MAX_SCREEN_H];
+static uint32_t px32[16 * MAX_SCREEN_W * MAX_SCREEN_H]; /* cellule 4x4 au plus (filtre pixel) */
 
 /* Mise à l'échelle de la fenêtre : 0 = échelle entière (pixels carrés,
  * défaut), 1 = adaptée (au plus grand multiple non entier qui garde le
@@ -4547,54 +4547,103 @@ static uint32_t px32[3 * MAX_SCREEN_W * 3 * MAX_SCREEN_H];
  * cycle les modes, F11 bascule le plein écran. */
 static int dispScale, dispFull;
 
-/* F8 : filtre Game Boy DMG — la luminance de chaque pixel est quantifiée
- * sur les 4 nuances de la dalle réflexe, puis chaque pixel émulé devient
- * une cellule 3x3 à bord sombre (la maille point-matrice de la photo).
- * La texture est alors 3x plus grande ; la taille logique de rendu ne
- * change pas, le tracé et les modes d'échelle restent identiques. */
+/* F8 : cycle des filtres d'affichage.  Chaque pixel émulé devient une
+ * cellule de filter_cell(f) x filter_cell(f) texels ; la taille logique de
+ * rendu ne change pas, le tracé et les modes d'échelle restent identiques.
+ * Ordre du cycle : brute, pixel (maille, couleurs réelles), vert Game Boy
+ * DMG (quatre nuances, maille point-matrice), LCD RGB (sous-pixels),
+ * scanlines, puis de nouveau brute. */
+enum { FILT_RAW, FILT_PIXEL, FILT_DMG, FILT_LCD, FILT_SCAN, FILT_COUNT };
 static int dispFilter;
 static const uint32_t dmgShade[4] = { /* ARGB, de la plus sombre à la plus claire */
     0xff0f380fu, 0xff306230u, 0xff8bac0fu, 0xff9bbc0fu };
-#define DMG_SHADE(c, num) (0xff000000u | \
-    ((((c) >> 16) & 0xff) * (num) / 100) << 16 | \
-    ((((c) >> 8) & 0xff) * (num) / 100) << 8 | \
-    (((c) & 0xff) * (num) / 100))
+
+static unsigned filter_cell(int f) {
+    return f == FILT_RAW ? 1u : f == FILT_PIXEL ? 4u : 3u;
+}
+static const char *filter_name(int f) {
+    static const char *const names[FILT_COUNT] = {
+        TR("aucun", "none"), "pixel", "Game Boy DMG", "LCD RGB", TR("scanlines", "scanlines") };
+    return names[f];
+}
+
+/* RVB565 → ARGB8888 : même correspondance que la sortie brute (R et B
+ * permutés, expansion par décalage, sans mise à l'échelle) */
+static inline uint32_t rgb565_argb(uint16_t p) {
+    uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+    return 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
+}
+/* la même couleur à k % d'intensité, canal par canal */
+static inline uint32_t argb_scale(uint32_t c, unsigned k) {
+    return 0xff000000u | ((((c >> 16) & 0xff) * k / 100) << 16)
+                       | ((((c >> 8) & 0xff) * k / 100) << 8)
+                       | ((c & 0xff) * k / 100);
+}
+
+/* rendu filtré de src (SCR_W x SCR_H, RGB565) dans dst : lignes de
+ * SCR_W * filter_cell(f) texels, cellules carrées.  Hors écran pour pouvoir
+ * être testé (tests/unit/test_filter.c). */
+static void filter_render(const uint16_t *src, uint32_t *dst, int f) {
+    const unsigned cell = filter_cell(f), stride = SCR_W * cell;
+    for (unsigned y = 0; y < SCR_H; y++) {
+        for (unsigned x = 0; x < SCR_W; x++) {
+            uint16_t p = src[y * SCR_W + x];
+            uint32_t c = rgb565_argb(p);
+            uint32_t *out = dst + y * cell * stride + x * cell;
+            switch (f) {
+            case FILT_PIXEL: { /* maille de 4x4 : centre plein, bords 60 %, coins 40 % */
+                uint32_t edge = argb_scale(c, 60), corner = argb_scale(c, 40);
+                for (unsigned j = 0; j < 4; j++)
+                    for (unsigned i = 0; i < 4; i++) {
+                        int ey = j == 0 || j == 3, ex = i == 0 || i == 3;
+                        out[j * stride + i] = ey && ex ? corner : ey || ex ? edge : c;
+                    }
+                break; }
+            case FILT_DMG: { /* luminance quantifiée sur les 4 nuances de la dalle, trame 3x3 */
+                uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+                uint32_t lum = (r * 616 + g * 604 + b * 224) >> 8; /* 0..250 */
+                uint32_t s = dmgShade[lum >= 176 ? 3 : lum >= 120 ? 2 : lum >= 64 ? 1 : 0];
+                uint32_t e = argb_scale(s, 52), m = argb_scale(s, 74);
+                for (unsigned j = 0; j < 3; j++)
+                    for (unsigned i = 0; i < 3; i++)
+                        out[j * stride + i] = j == 1 ? (i == 1 ? s : m) : (i == 1 ? m : e);
+                break; }
+            case FILT_LCD: { /* sous-pixels R G B : colonne i = canal i plein, les autres à 25 % ;
+                              * la dernière ligne de la cellule est assombrie (interstice) */
+                for (unsigned j = 0; j < 3; j++)
+                    for (unsigned i = 0; i < 3; i++) {
+                        uint32_t t = 0xff000000u;
+                        for (unsigned ch = 0; ch < 3; ch++) {
+                            uint32_t v = (c >> (16 - 8 * ch)) & 0xff;
+                            v = v * (ch == i ? 100u : 25u) * (j == 2 ? 45u : 100u) / 10000u;
+                            t |= v << (16 - 8 * ch);
+                        }
+                        out[j * stride + i] = t;
+                    }
+                break; }
+            case FILT_SCAN: /* une ligne sur trois pleine, les deux autres à 55 % */
+                for (unsigned j = 0; j < 3; j++)
+                    for (unsigned i = 0; i < 3; i++)
+                        out[j * stride + i] = argb_scale(c, j == 1 ? 100 : 55);
+                break;
+            default: /* FILT_RAW : traité directement par blit */
+                break;
+            }
+        }
+    }
+}
 
 static void scale_apply(void);
 
 static void blit(SDL_Renderer *ren) {
-    const uint16_t *src = pix;
-    if (!dispFilter) {
-        for (unsigned i = 0; i < SCR_W * SCR_H; i++) {
-            uint16_t p = src[i];
-            uint8_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
-            /* même expansion que st7735.ts : décalages, pas de mise à l'échelle */
-            px32[i] = 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
-        }
-        SDL_UpdateTexture(tex, NULL, px32, SCR_W * sizeof(uint32_t));
+    const unsigned cell = filter_cell(dispFilter);
+    if (dispFilter == FILT_RAW) {
+        for (unsigned i = 0; i < SCR_W * SCR_H; i++)
+            px32[i] = rgb565_argb(pix[i]); /* même expansion que st7735.ts */
     } else {
-        /* quantifie la luminance sur les 4 nuances DMG, puis trame 3x3 :
-         * centre de cellule à pleine teinte, bords assombris (la maille
-         * point-matrice de la dalle) */
-        for (unsigned ty = 0; ty < 3 * SCR_H; ty++) {
-            uint32_t *out = px32 + ty * 3 * SCR_W;
-            const uint16_t *line = src + (ty / 3) * SCR_W;
-            unsigned j = ty % 3;
-            for (unsigned x = 0; x < SCR_W; x++) {
-                uint16_t p = line[x];
-                uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
-                /* luminance 8 bits depuis du 5/6/5 : sommes pré-multipliées */
-                uint32_t lum = (r * 616 + g * 604 + b * 224) >> 8; /* 0..250 */
-                uint32_t c = dmgShade[lum >= 176 ? 3 : lum >= 120 ? 2 : lum >= 64 ? 1 : 0];
-                uint32_t e = DMG_SHADE(c, 52), m = DMG_SHADE(c, 74);
-                out[0] = j == 1 ? m : e;
-                out[1] = j == 1 ? c : m;
-                out[2] = j == 1 ? m : e;
-                out += 3;
-            }
-        }
-        SDL_UpdateTexture(tex, NULL, px32, SCR_W * 3 * sizeof(uint32_t));
+        filter_render(pix, px32, dispFilter);
     }
+    SDL_UpdateTexture(tex, NULL, px32, SCR_W * cell * sizeof(uint32_t));
     SDL_RenderClear(ren);
     if (dispScale) {
         int ow, oh;
@@ -4775,9 +4824,9 @@ static void scale_apply(void) {
      * recrée (le contenu est de toute façon réécrit à chaque frame). */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, dispScale ? "linear" : "nearest");
     if (tex) SDL_DestroyTexture(tex);
-    unsigned tw = dispFilter ? 3 * SCR_W : SCR_W, th = dispFilter ? 3 * SCR_H : SCR_H;
+    unsigned cell = filter_cell(dispFilter);
     tex = SDL_CreateTexture(emuRen, SDL_PIXELFORMAT_ARGB8888,
-                            SDL_TEXTUREACCESS_STREAMING, (int)tw, (int)th);
+                            SDL_TEXTUREACCESS_STREAMING, (int)(SCR_W * cell), (int)(SCR_H * cell));
     if (dispScale) {
         SDL_RenderSetLogicalSize(emuRen, 0, 0);
         SDL_RenderSetIntegerScale(emuRen, SDL_FALSE);
@@ -5177,10 +5226,9 @@ static int poll_events(void) {
             if (fwLoaded) { fw_restart(); printf(TR("redémarrage\n", "restart\n")); }
         }
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F8) {
-            dispFilter = !dispFilter;
+            dispFilter = (dispFilter + 1) % FILT_COUNT;
             scale_apply();
-            printf(TR("filtre : %s (F8)\n", "filter: %s (F8)\n"),
-                   dispFilter ? "Game Boy DMG" : TR("aucun", "none"));
+            printf(TR("filtre : %s (F8)\n", "filter: %s (F8)\n"), filter_name(dispFilter));
         }
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F10) {
             dispScale = (dispScale + 1) % 3;
