@@ -50,7 +50,20 @@ if(NOT GM0_OSD)
     target_compile_definitions(gm0 PRIVATE GM0_NO_OSD)
 endif()
 
-if(TARGET SDL2::SDL2)
+# Windows : un seul gm0.exe, SDL2 liée statiquement et exécutable en -static.
+# -DGM0_WIN_STATIC=OFF garde SDL2.dll à côté de l'exécutable.
+set(GM0_SDL_STATIC OFF)
+if(WIN32)
+    option(GM0_WIN_STATIC "Windows : SDL2 liée statiquement, un seul gm0.exe" ON)
+    if(GM0_WIN_STATIC AND TARGET SDL2::SDL2-static)
+        set(GM0_SDL_STATIC ON)
+    endif()
+endif()
+
+if(GM0_SDL_STATIC)
+    target_link_libraries(gm0 PRIVATE SDL2::SDL2-static)
+    target_link_options(gm0 PRIVATE -static)
+elseif(TARGET SDL2::SDL2)
     target_link_libraries(gm0 PRIVATE SDL2::SDL2)
 elseif(TARGET SDL2::SDL2-static)
     target_link_libraries(gm0 PRIVATE SDL2::SDL2-static)
@@ -71,6 +84,20 @@ endif()
 
 if(NOT WIN32)
     target_link_libraries(gm0 PRIVATE m)
+endif()
+
+# Windows Release : symboles et débogage retirés (SDL2 statique en embarque ~5 Mo)
+if(WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Release")
+    target_link_options(gm0 PRIVATE -s)
+endif()
+
+# Windows, build croisé (cmake/mingw-w64.cmake) : DLL de dépendance à côté de gm0.exe,
+# seulement si SDL2 n'est pas liée statiquement
+if(NOT GM0_SDL_STATIC)
+    foreach(dll IN LISTS GM0_WIN_DLLS)
+        add_custom_command(TARGET gm0 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${dll}" "$<TARGET_FILE_DIR:gm0>")
+    endforeach()
 endif()
 
 install(TARGETS gm0

@@ -56,6 +56,19 @@ The output is a single file with the wasm module embedded; it can be opened
 directly from `file://`.  A hosted build is available at
 <https://r043v.github.io/gm0/> (emulator only — load your own games).
 
+Windows, cross-compiled from Linux with MinGW-w64, as a single `gm0.exe` (SDL2
+linked in).  With the native packages installed (`mingw-w64-gcc`,
+`mingw-w64-binutils`, `mingw-w64-crt`, `mingw-w64-headers`,
+`mingw-w64-winpthreads`, `mingw-w64-sdl2` and `mingw-w64-zlib` from the AUR):
+
+```sh
+make win                     # build-win/bin/gm0.exe
+```
+
+Without them, `make win-setup` installs the same toolchain under
+`~/.local/mingw-w64` (about 440 MB, no root), then `make win` works the same
+way.  `make win WIN_STATIC=OFF` keeps SDL2 in a separate `SDL2.dll`.
+
 ## Usage
 
 ```sh

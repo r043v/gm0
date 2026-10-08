@@ -19,6 +19,31 @@ wasm: gm0.c wasm/index.html wasm/games.js wasm/make_single.py
 	python3 wasm/make_single.py
 	@echo "wasm : ouvrir wasm/gm0-standalone.html (file:// ou http)"
 
+# Windows, build croisé depuis Linux (MinGW-w64), un seul gm0.exe (SDL2 statique).
+#   paquets natifs (pacman, mingw-w64-gcc + mingw-w64-sdl2 + mingw-w64-zlib) : `make win`
+#   sinon, sans root : `make win-setup` installe la chaîne dans $(MINGW_DIR)
+# WIN_STATIC=OFF : SDL2.dll séparée à côté de gm0.exe.
+MINGW_DIR ?= $(HOME)/.local/mingw-w64
+WIN_BUILD ?= build-win
+WIN_STATIC ?= ON
+MINGW_SYSTEM ?= $(shell test -x /usr/bin/x86_64-w64-mingw32-gcc && echo ON || echo OFF)
+ifeq ($(MINGW_SYSTEM),ON)
+MINGW_ROOT ?= /
+MINGW_GCC := $(MINGW_ROOT)/usr/bin/x86_64-w64-mingw32-gcc
+else
+MINGW_ROOT ?= $(MINGW_DIR)
+MINGW_GCC := $(MINGW_DIR)/usr/bin/x86_64-w64-mingw32-gcc
+endif
+
+win-setup:
+	GM0_MINGW_DIR=$(MINGW_DIR) sh tools/mingw-w64-setup.sh
+
+win:
+	@test -x "$(MINGW_GCC)" || { echo "chaîne MinGW introuvable ($(MINGW_GCC)) : installer les paquets natifs ou lancer make win-setup" >&2; exit 1; }
+	cmake -S . -B $(WIN_BUILD) -DCMAKE_TOOLCHAIN_FILE=$(CURDIR)/cmake/mingw-w64.cmake -DGM0_MINGW_SYSTEM=$(MINGW_SYSTEM) -DGM0_MINGW_ROOT=$(MINGW_ROOT) -DGM0_WIN_STATIC=$(WIN_STATIC) -DCMAKE_BUILD_TYPE=Release
+	cmake --build $(WIN_BUILD) -j
+	@echo "gm0.exe : $(WIN_BUILD)/bin/gm0.exe$(if $(filter OFF,$(WIN_STATIC)), (SDL2.dll copiée à côté),)"
+
 clean:
 	rm -f wasm/gm0_single.js wasm/gm0-standalone.html
-.PHONY: clean wasm
+.PHONY: clean wasm win win-setup
