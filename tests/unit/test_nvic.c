@@ -121,6 +121,12 @@ int main(void) {
     CHECK(nvicPend & 1u, "front de broche non latché au NVIC");
     nvic_service();
     CHECK(excDepth == 1 && excNum[0] == 16, "broche 0 non prise");
+    exc_return(); /* le handler n'a pas effacé IST : la ligne reste levée */
+    CHECK(nvicPend & 1u, "IST toujours levé : pas de nouvelle prise au retour");
+    nvic_service();
+    pk_reg_write(0xA0004024u, 1u); /* IST : écriture de 1 = effacement */
+    exc_return();
+    CHECK((nvicPend & 1u) == 0, "IST effacé par le handler mais toujours en attente");
 
     /* 8. SysTick : COUNTFLAG -> PENDSTSET seulement avec TICKINT */
     pokitto_reset();

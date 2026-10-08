@@ -140,7 +140,7 @@ original TypeScript emulator was dropped deliberately in October 2026.
   PRIMASK, strict-priority preemption over the four priority levels (IPR),
   the 8-word exception frame with STKALIGN, and the 15-cycle entry latency.
   Lines still asserted on exception return are pended again (TC and DMAC on
-  the META, CT32B0/1 on the Pokitto).
+  the META, CT32B0/1 and pin interrupts on the Pokitto).
 - On the Pokitto (LPC11U68, Cortex-M0+ r0p1), pin edges are latched in the
   NVIC when they happen, and SysTick fires on COUNTFLAG with TICKINT set.
 - Peripheral registers are accessed by byte lane: an access of any width

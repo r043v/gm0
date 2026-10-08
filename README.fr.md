@@ -144,7 +144,8 @@ l'émulateur TypeScript d'origine a été abandonnée volontairement en octobre
   ISER/ICER, PRIMASK, préemption à priorité strictement supérieure sur les
   quatre niveaux (IPR), trame d'exception de 8 mots avec STKALIGN, et latence
   d'entrée de 15 cycles. Une ligne encore levée au retour d'exception est
-  remise en attente (TC et DMAC sur la META, CT32B0/1 sur la Pokitto).
+  remise en attente (TC et DMAC sur la META, CT32B0/1 et broches sur la
+  Pokitto).
 - Sur la Pokitto (LPC11U68, Cortex-M0+ r0p1), un front de broche est latché
   dans le NVIC au moment où il survient, et le SysTick part sur COUNTFLAG
   quand TICKINT est posé.
