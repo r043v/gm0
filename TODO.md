@@ -29,6 +29,18 @@ gardées avec le chiffre qui a tranché.
   Mesuré sur 1500 images : lapinou −2,3 % d'instructions, −3 à −4 % de
   cycles ; sml −0,6 % et ≈ −2 % (bruit entre tours de 2 à 4 %).  Parité bit à bit sur 7
   jeux.  Gain modeste, de l'ordre de quelques pour cent.
+- **Rendu des filtres d'affichage** — fait.  Les cinq filtres sont séparables
+  (classe de ligne × classe de colonne) : la palette est calculée une fois
+  par pixel émulé, une seule ligne de sortie est écrite par classe de ligne
+  et les autres en sont des copies.  Mesuré sur 160×128 (natif, -O3), par
+  image : LCD 8× 4,9 → 0,31 ms, 3× 0,76 → 0,18 ms ; DMG 8× 1,6 → 0,28 ms ;
+  pixel 8× 0,64 → 0,30 ms ; à 2× inchangé (≈ 0,1 ms), sauf LCD (+0,05 ms).
+  Sortie identique bit à bit à toutes les échelles 2 à 8.
+- **Échéances des timers Pokitto** — mesuré, rien à gagner.
+  `pk_timers_next` rend 0 tant qu'un IR de CT est levé (reste du modèle
+  d'avant le NVIC commun), mais `pk_machine_step` n'est appelé que 1 000 à
+  2 600 fois par image (file_gb, GalaxyFighters, Pandemic), soit environ
+  0,3 % du temps ; l'interpréteur en prend 84 %.
 
 ## Fidélité matérielle (META)
 

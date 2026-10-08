@@ -3279,8 +3279,9 @@ static void nvic_return(void) {
     irq_work();
     if (excDepth) {
         int exc = excNum[--excDepth];
-        if (emuTarget == TGT_POKITTO) { /* CT : IR encore levé et activé -> à nouveau en attente */
+        if (emuTarget == TGT_POKITTO) { /* CT (IR) ou broche (IST) encore levés -> à nouveau en attente */
             if (exc >= 34 && exc < 36 && pk_ct[exc - 34].r[PK_CT_IR]) nvicPend |= 1u << (exc - 16);
+            if (exc >= 16 && exc < 24 && ((pk_ist >> (exc - 16)) & 1u)) nvicPend |= 1u << (exc - 16);
         } else {
             if (exc == 16 + IRQ_DMAC && dmac_line()) nvicPend |= 1u << IRQ_DMAC;
             int i = exc - 16 - IRQ_TC4; /* TC : drapeau encore levé et activé */
@@ -3573,6 +3574,15 @@ static void dmac_rearm_from(uint32_t done_ch) {
  * RESUME=0x2 charge le descripteur en attente (suspend après bloc) ; reçu
  * pendant un bloc, il saute le prochain suspend (20.6.3.3).  SUSPEND=0x1 :
  * le canal s'arrête à la fin du bloc en cours. */
+/* canal ch : DMA écran sur SERCOM4, beats cadencés par le baud SPI —
+ * 8 bits @ f/2(BAUD+1), en tiers de tick (3 Mo/s à BAUD=0) ;
+ * EMU_SPI_INSTANT : un octet par tick */
+static void spi_arm(uint32_t ch) {
+    spiBeatTicks = ((spiBaud & 0xFFu) + 1) * emuTicksPerUs;
+    if (spiBeatTicks < 3 || ENVFLAG("EMU_SPI_INSTANT")) spiBeatTicks = 3;
+    spiBeatAcc = 0;
+    spiDmaCh = (int)ch; spiOnly = 0;
+}
 static void dmac_chid_chctrlb_write(uint32_t ch, uint32_t v, uint32_t m) {
     uint32_t cmd = (v >> 24) & 3u;
     if ((m >> 24) && cmd == 0x2u) {
@@ -3584,11 +3594,7 @@ static void dmac_chid_chctrlb_write(uint32_t ch, uint32_t v, uint32_t m) {
             /* bloc SPI : ré-armer le cadencement des beats (le RESUME
              * sort le canal de sa suspension après bloc) */
             if (dmaOn[ch] && (dmaDst[ch] == 0x42001828u || dmaTrig[ch] == DMAC_TRIG_SERCOM4_TX)) {
-                uint32_t b = (spiBaud & 0xFFu) + 1;
-                spiBeatTicks = b * emuTicksPerUs; /* en tiers de tick */
-                if (spiBeatTicks < 3 || ENVFLAG("EMU_SPI_INSTANT")) spiBeatTicks = 3;
-                spiBeatAcc = 0;
-                spiDmaCh = (int)ch; spiOnly = 0;
+                spi_arm(ch);
             }
         }
     }
@@ -3646,11 +3652,7 @@ static void dmac_chid_chctrla_write(uint32_t ch, uint32_t v) {
         /* écran : beats cadencés par le baud SPI, le CPU vit pendant */
         dma_load(ch, dmac_desc);
         if (dmaOn[ch]) {
-            uint32_t b = (spiBaud & 0xFFu) + 1;
-            spiBeatTicks = b * emuTicksPerUs; /* tiers de tick : 8 bits @ f/2(1+b), 3 Mo/s à BAUD=0 */
-            if (spiBeatTicks < 3 || ENVFLAG("EMU_SPI_INSTANT")) spiBeatTicks = 3; /* option : 1 octet/tick */
-            spiBeatAcc = 0;
-            spiDmaCh = (int)ch; spiOnly = 0;
+            spi_arm(ch);
             { static int n; if (n++ < 6)
                 fprintf(stderr, "[dma spi] ch=%u ctrl=%04x src=%x dst=%x n=%u beats=%u t\n",
                         (unsigned)ch, dmaCtrl[ch], dmaSrc[ch], dmaDst[ch], dmaCnt[ch], spiBeatTicks); }
@@ -4569,71 +4571,108 @@ static inline unsigned filter_sub3(unsigned i, unsigned s) {
     return s == 2 ? i : ((2 * i + 1) * 3) / (2 * s);
 }
 
+/* Les filtres sont séparables : le texel (i, j) d'un bloc s x s appartient à
+ * la classe de colonne cc[i] (au plus trois) et à la classe de ligne rc[j]
+ * (deux), et sa couleur ne dépend que du pixel émulé et de (rc[j], cc[i]).
+ * filter_classes remplit cc et rc pour (f, s) ; filter_palette donne, pour
+ * un pixel, la couleur de chaque couple (classe de ligne, classe de colonne). */
+static void filter_classes(int f, unsigned s, uint8_t *cc, uint8_t *rc) {
+    const unsigned t = s / 4; /* pixel, s >= 4 : épaisseur du bord */
+    for (unsigned i = 0; i < s; i++) {
+        const unsigned k = filter_sub3(i, s), last = i == s - 1;
+        switch (f) {
+        case FILT_PIXEL: cc[i] = rc[i] = s < 4 ? last : i < t || i >= s - t; break; /* 0 centre, 1 bord */
+        case FILT_DMG:   cc[i] = rc[i] = k != 1; break;                            /* 0 centre, 1 côté */
+        case FILT_LCD:   cc[i] = (uint8_t)k; rc[i] = k == 2; break;                /* colonne R G B ; interstice */
+        case FILT_SCAN:  cc[i] = 0; rc[i] = k != 1; break;                         /* ligne pleine ou atténuée */
+        default:         cc[i] = rc[i] = last; break;                              /* grille : 1 noir */
+        }
+    }
+}
+
+static inline void filter_palette(int f, unsigned s, uint16_t p, uint32_t pal[2][3]) {
+    const uint32_t c = rgb565_argb(p);
+    switch (f) {
+    case FILT_PIXEL: { /* maille : bords 60 %, coins 40 % (2x et 3x : bords 60 % seulement) */
+        const uint32_t edge = argb_scale(c, 60);
+        pal[0][0] = c;    pal[0][1] = edge;
+        pal[1][0] = edge; pal[1][1] = s >= 4 ? argb_scale(c, 40) : edge;
+        break; }
+    case FILT_DMG: { /* quatre nuances de la dalle, point-matrice 3x3 */
+        uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+        uint32_t lum = (r * 616 + g * 604 + b * 224) >> 8; /* 0..250 */
+        uint32_t shade = dmgShade[lum >= 176 ? 3 : lum >= 120 ? 2 : lum >= 64 ? 1 : 0];
+        uint32_t m = argb_scale(shade, 74);
+        pal[0][0] = shade; pal[0][1] = m;
+        pal[1][0] = m;     pal[1][1] = argb_scale(shade, 52);
+        break; }
+    case FILT_LCD: { /* sous-pixel : son canal plein, les autres à 25 % ; interstice à 45 %
+                      * (v × 25 % = v/4, × 45 % = 9v/20, × 25 % × 45 % = 9v/80, arrondis par défaut) */
+        uint32_t full[2] = { c & 0xffffffu, 0 }, dim[2] = { 0, 0 };
+        for (unsigned sh = 0; sh < 24; sh += 8) {
+            uint32_t v = (c >> sh) & 0xff;
+            full[1] |= v * 9 / 20 << sh;
+            dim[0] |= v / 4 << sh;
+            dim[1] |= v * 9 / 80 << sh;
+        }
+        for (unsigned r = 0; r < 2; r++) /* colonne ci : canal R (bits 16-23), G, puis B */
+            for (unsigned ci = 0; ci < 3; ci++) {
+                uint32_t m = 0xffu << (16 - 8 * ci);
+                pal[r][ci] = 0xff000000u | (full[r] & m) | (dim[r] & ~m);
+            }
+        break; }
+    case FILT_SCAN: /* une ligne sur trois pleine, les deux autres à 55 % */
+        pal[0][0] = c; pal[1][0] = argb_scale(c, 55);
+        break;
+    default: /* grille : dernière ligne et colonne du bloc en noir */
+        pal[0][0] = c; pal[0][1] = pal[1][0] = pal[1][1] = 0xff000000u;
+        break;
+    }
+}
+
+static ALWAYS_INLINE void filter_row(uint32_t *line, const uint32_t (*pal)[2][3], unsigned r,
+                                     const uint8_t *cc, const unsigned s) {
+    for (unsigned x = 0; x < SCR_W; x++, line += s)
+        for (unsigned i = 0; i < s; i++) line[i] = pal[x][r][cc[i]];
+}
 /* rendu filtré de src (SCR_W x SCR_H, RGB565) dans dst, à l'échelle s : chaque
- * pixel émulé donne un bloc s x s de texels, lignes de SCR_W * s texels.  Hors
- * écran pour pouvoir être testé (tests/unit/test_filter.c). */
-static void filter_render(const uint16_t *src, uint32_t *dst, int f, unsigned s) {
+ * pixel émulé donne un bloc s x s de texels, lignes de SCR_W * s texels.  Par
+ * ligne émulée, les palettes de ses pixels sont calculées une fois ; une
+ * seule ligne de sortie est écrite par classe de ligne, les autres en sont
+ * des copies.  Hors écran pour pouvoir être testé (tests/unit/test_filter.c). */
+static ALWAYS_INLINE void filter_render_f(const uint16_t *src, uint32_t *dst, const int f, unsigned s) {
     const unsigned stride = SCR_W * s;
+    uint8_t cc[FILT_SCALE_MAX], rc[FILT_SCALE_MAX];
+    uint32_t pal[MAX_SCREEN_W][2][3];
+    filter_classes(f, s, cc, rc);
     for (unsigned y = 0; y < SCR_H; y++) {
-        for (unsigned x = 0; x < SCR_W; x++) {
-            uint16_t p = src[y * SCR_W + x];
-            uint32_t c = rgb565_argb(p);
-            uint32_t *out = dst + (y * s) * stride + x * s;
-            switch (f) {
-            case FILT_GRID: /* dernière ligne et colonne du bloc en noir, le reste intact */
-                for (unsigned j = 0; j < s; j++)
-                    for (unsigned i = 0; i < s; i++)
-                        out[j * stride + i] = (i == s - 1 || j == s - 1) ? 0xff000000u : c;
-                break;
-            case FILT_PIXEL: /* maille : bords 60 %, coins 40 %, centre plein (t = s/4) */
-                if (s < 4) { /* 2x et 3x : seule la dernière ligne et colonne s'assombrit */
-                    for (unsigned j = 0; j < s; j++)
-                        for (unsigned i = 0; i < s; i++)
-                            out[j * stride + i] = (i == s - 1 || j == s - 1) ? argb_scale(c, 60) : c;
-                    break;
-                } else {
-                    const unsigned t = s / 4;
-                    const uint32_t edge = argb_scale(c, 60), corner = argb_scale(c, 40);
-                    for (unsigned j = 0; j < s; j++)
-                        for (unsigned i = 0; i < s; i++) {
-                            int ey = j < t || j >= s - t, ex = i < t || i >= s - t;
-                            out[j * stride + i] = ey && ex ? corner : ey || ex ? edge : c;
-                        }
-                }
-                break;
-            case FILT_DMG: { /* quatre nuances de la dalle, grille 3x3 point-matrice */
-                uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
-                uint32_t lum = (r * 616 + g * 604 + b * 224) >> 8; /* 0..250 */
-                uint32_t shade = dmgShade[lum >= 176 ? 3 : lum >= 120 ? 2 : lum >= 64 ? 1 : 0];
-                uint32_t e = argb_scale(shade, 52), m = argb_scale(shade, 74);
-                for (unsigned j = 0; j < s; j++)
-                    for (unsigned i = 0; i < s; i++) {
-                        unsigned ci = filter_sub3(i, s), cj = filter_sub3(j, s);
-                        out[j * stride + i] = cj == 1 ? (ci == 1 ? shade : m) : (ci == 1 ? m : e);
-                    }
-                break; }
-            case FILT_LCD: /* sous-pixels R G B en colonnes, la dernière ligne s'assombrit */
-                for (unsigned j = 0; j < s; j++)
-                    for (unsigned i = 0; i < s; i++) {
-                        unsigned ci = filter_sub3(i, s), cj = filter_sub3(j, s);
-                        uint32_t t = 0xff000000u;
-                        for (unsigned ch = 0; ch < 3; ch++) {
-                            uint32_t v = (c >> (16 - 8 * ch)) & 0xff;
-                            v = v * (ch == ci ? 100u : 25u) * (cj == 2 ? 45u : 100u) / 10000u;
-                            t |= v << (16 - 8 * ch);
-                        }
-                        out[j * stride + i] = t;
-                    }
-                break;
-            case FILT_SCAN: /* une ligne sur trois pleine, les deux autres à 55 % */
-                for (unsigned j = 0; j < s; j++)
-                    for (unsigned i = 0; i < s; i++)
-                        out[j * stride + i] = argb_scale(c, filter_sub3(j, s) == 1 ? 100 : 55);
-                break;
-            default: /* FILT_RAW : traité directement par blit */
-                break;
+        for (unsigned x = 0; x < SCR_W; x++) filter_palette(f, s, src[y * SCR_W + x], pal[x]);
+        uint32_t *blk = dst + y * s * stride;
+        int first[2] = { -1, -1 }; /* première ligne du bloc de chaque classe */
+        for (unsigned j = 0; j < s; j++) {
+            uint32_t *line = blk + j * stride;
+            const unsigned r = rc[j];
+            if (first[r] >= 0) { memcpy(line, blk + (unsigned)first[r] * stride, stride * sizeof *line); continue; }
+            first[r] = (int)j;
+            switch (s) { /* largeur de bloc constante : boucle déroulée */
+            case 2: filter_row(line, pal, r, cc, 2); break;
+            case 3: filter_row(line, pal, r, cc, 3); break;
+            case 4: filter_row(line, pal, r, cc, 4); break;
+            default: filter_row(line, pal, r, cc, s); break;
             }
         }
+    }
+}
+/* une instance par filtre : f constant, la palette se réduit à son cas */
+static void filter_render(const uint16_t *src, uint32_t *dst, int f, unsigned s) {
+    if (s < 2 || s > FILT_SCALE_MAX) return; /* 1 : brute, traitée par blit */
+    switch (f) {
+    case FILT_PIXEL: filter_render_f(src, dst, FILT_PIXEL, s); break;
+    case FILT_DMG:   filter_render_f(src, dst, FILT_DMG, s); break;
+    case FILT_LCD:   filter_render_f(src, dst, FILT_LCD, s); break;
+    case FILT_SCAN:  filter_render_f(src, dst, FILT_SCAN, s); break;
+    case FILT_GRID:  filter_render_f(src, dst, FILT_GRID, s); break;
+    default: break;
     }
 }
 
