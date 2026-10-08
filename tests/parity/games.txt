@@ -1,0 +1,10 @@
+# Jeux du banc de parité : nom, fichier (dans GM0_GAMES), script EMU_INPUT.
+# Les jeux ne sont pas versionnés ; seules les empreintes le sont (refs.txt).
+# Script : frame:touches:durée, touches parmi U D L R A B M H (voir gm0.c).
+lapinou         lapinou.zip        120:A:3,200:R:20,300:A:3,400:D:30,500:B:3,600:L:20,700:A:3,800:U:20,900:M:3,1000:A:3
+sml             sml.bin            120:A:3,200:R:20,300:A:3,400:D:30,500:B:3,600:L:20,700:A:3,800:U:20,900:M:3,1000:A:3
+celeste         celeste.zip        120:A:3,200:R:20,300:A:3,400:D:30,500:B:3,600:L:20,700:A:3,800:U:20,900:M:3,1000:A:3
+cats-and-coins  cats-and-coins.zip 120:A:3,200:R:20,300:A:3,400:D:30,500:B:3,600:L:20,700:A:3,800:U:20,900:M:3,1000:A:3
+file_gb         file_gb.bin        120:A:3,200:R:20,300:A:3,400:D:30,500:B:3,600:L:20,700:A:3,800:U:20,900:M:3,1000:A:3
+galaxyfighters  galaxyfighters.zip 120:A:3,200:R:20,300:A:3,400:D:30,500:B:3,600:L:20,700:A:3,800:U:20,900:M:3,1000:A:3
+pandemic        Pandemic.bin       120:A:3,200:R:20,300:A:3,400:D:30,500:B:3,600:L:20,700:A:3,800:U:20,900:M:3,1000:A:3

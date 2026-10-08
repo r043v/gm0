@@ -1,68 +1,75 @@
 # TODO
 
 Travaux identifiés et non faits, par thème.  Chaque point dit ce qui est
-su et ce qui reste à établir.
+su et ce qui reste à établir.  Les pistes mesurées puis écartées sont
+gardées avec le chiffre qui a tranché.
 
 ## Performance
 
-- **Dispatch de l'interpréteur** — 14 % (META) à 25 % (Pokitto) des
-  échantillons tombent sur le saut indirect du `switch (op >> 8)`.  Pistes :
-  dispatch « threaded » (`goto *table[op >> 8]` répliqué en fin de chaque
-  handler, éventuellement via `--param max-goto-duplication-insns`) ;
-  garder `tickCount` et le PC en registres sur toute la boucle
-  (`step_batch_*`), aujourd'hui relus en mémoire à la sortie de chaque
-  handler.  À trancher d'abord avec `perf stat -e branch-misses` : si le
-  saut indirect est bien prédit, le gain du threading sera faible.
-- **Profil réel** — les profils de la session ont été faits par
-  échantillonnage SIGPROF maison (sans `perf`) ; refaire avec
-  `perf record` / `perf annotate` pour confirmer les attributions (celle
-  du cache NVM était un artefact : 15 % affichés, ≤ 5 % réels).
-- **Ordonnanceur des timers pendant le DMA écran** — un beat SPI tous les
-  16 ticks (~8 instructions) repasse par `advance_slow`, `timers_process`
-  et `timers_next_event` complets (≈ 10 % du temps sur lapinou).  Une voie
-  rapide quand seul le beat SPI est dû éviterait le recalcul des autres
-  échéances.
+- **Dispatch de l'interpréteur** — écarté après mesure.  Sur lapinou (600
+  images), 6,0 M sauts indirects sont mal prédits sur 287 M
+  (`ex_ret_brn_ind_misp` / `ex_ret_ind_brch_instr`, soit 2,1 %).  À ~15
+  cycles par faute, c'est au plus environ 2 % du temps.  Un threading
+  (`goto *table[op >> 8]` répliqué) ne peut gagner que cela : le reste du
+  coût (chargement de l'opcode, lecture de la table, saut) est inchangé.
+- **Profil réel** — refait avec `perf record` (cycles:u, lapinou 600 images) :
+  `step_batch_meta` 62 %, `periph_write` 11 %, `timers` 8 %, `advance_slow`
+  6 %, `dma_beat` 5 %.  Le pic sur l'écriture de tag du cache NVM (22 % des
+  échantillons de `step_batch_meta`) se reproduit : c'est un décalage
+  d'échantillonnage (pas de sampling précis sur ce CPU), le même artefact que
+  la première fois.  L'expérience (≤ 5 %) reste la référence ; les
+  attributions par adresse ne suffisent pas.
+- **Ordonnanceur des timers pendant le DMA écran** — fait.  Les beats SPI ont
+  leur propre horodatage, et une voie rapide (`spiOnly`) saute TC et SysTick
+  tant que leur échéance absolue (`tcDeadline`) n'est pas atteinte.  Elle est
+  invalidée par les écritures qui changent TC, SysTick, le DMAC ou le canal
+  SPI ; une écriture APB du DMA SPI ne la retire pas (première version :
+  chaque beat la retirait via `timers_sync`, et la version était plus lente,
+  +8 % d'instructions mesurés).
+  Mesuré sur 1500 images : lapinou −2,3 % d'instructions, −3 à −4 % de
+  cycles ; sml −0,6 % et ≈ −2 % (bruit entre tours de 2 à 4 %).  Parité bit à bit sur 7
+  jeux.  Gain modeste, de l'ordre de quelques pour cent.
 
 ## Fidélité matérielle (META)
 
-- **DMAC INTPEND** — encodé TCMPL bit 4, SUSP bit 5, TERR bit 6, réglé
-  empiriquement sur les jeux ; la datasheet SAMD21 (§20.8.12) donne a
-  priori TERR 8, TCMPL 9, SUSP 10, FERR 13, BUSY 14, PEND 15.  Vérifier sur
-  `DMAC_INTPEND_*_Pos` des en-têtes CMSIS SAMD21 et sur la lib officielle
-  avant de toucher : le guest qui a motivé l'encodage actuel doit
-  continuer de marcher.
-- **Programmation flash** — les écritures sont stockées telles quelles ; le
-  matériel ne fait que passer des bits de 1 à 0 (ET avec le contenu) et
-  attend un effacement de rangée (ER, désormais décodé).  À faire avec un
-  loader qui auto-patche réellement la flash comme cas de test.
-- **CTRLB.RWS** — relu tel qu'écrit mais non relié au modèle du cache NVM
-  (état d'attente fixé à 1) ; le brancher décalerait le minutage de tous
-  les jeux pendant le boot (RWS=0 avant SystemInit) : à valider contre du
-  vrai matériel.
-- **Canaux DMAC « indexés »** (0x50-0xFF) — modèle empirique hérité (la
-  lib adresserait les canaux comme sur un SAMD51) ; sur SAMD21 cette zone
-  est réservée.  Identifier précisément quel code y écrit.
+- **DMAC INTPEND** — encodage ramené à la datasheet, d'après l'en-tête CMSIS
+  du SAMD21 (`dmac.h`) : TERR bit 8, TCMPL 9, SUSP 10 ; FERR, BUSY et PEND
+  (13-15) ne sont pas modélisés.  Parité identique sur les 7 jeux : le
+  changement n'altère aucune sortie observée.  Reste ouvert : le guest qui
+  motivait l'ancien encodage (bits 4-6) n'est pas dans le corpus local ; à
+  identifier avant de considérer le point clos.
+- **Programmation flash** — le ET avec le contenu est implémenté : une
+  écriture ne retire que des bits, seul un effacement de rangée (ER) en remet
+  (`tests/unit/test_flash.c`).  Parité identique sur les 7 jeux.  Reste : un
+  loader qui auto-patche réellement la flash, à tester de bout en bout
+  (aucun dans le corpus local).
+- **CTRLB.RWS** — inchangé : relu tel qu'écrit mais non relié au modèle du
+  cache NVM (état d'attente fixé à 1).  Le brancher décalerait le minutage
+  de tous les jeux pendant le boot (RWS=0 avant SystemInit) : à valider
+  contre du matériel réel, ce qui n'est pas possible ici.
+- **Canaux DMAC « indexés »** (0x50-0xFF) — mesuré : aucun accès à cette zone
+  dans les 7 jeux sur 1500 images, donc le modèle n'est exercé par aucun jeu
+  local.  Il est conservé faute de preuve pour le retirer ; la zone est
+  réservée sur SAMD21.  Reste : identifier le guest qui l'a motivé, ou
+  retirer le modèle.
 
 ## Outillage et tests
 
-- **Banc de parité dans le dépôt** — la parité bit à bit (traces d'écran
-  toutes les 60 frames, WAV, capture finale, entrées scriptées par
-  `EMU_INPUT`, dossiers jetables pour ne pas toucher aux `.eeprom`) n'existe
-  que dans des scripts de session.  L'intégrer (`tests/`), avec les
-  références, en ne versionnant que des empreintes (les jeux restent hors
-  dépôt).
-- **Valgrind / sanitizers** — passer les jeux de référence sous
-  `valgrind --tool=memcheck` et en `-fsanitize=address,undefined` : la
-  session a trouvé trois accès hors bornes à la main (CHID 12-15, IPR à
-  0x41F) ; il en reste sans doute.
-- **EEPROM Pokitto en lecture seule pour les tests** — chaque exécution
-  réécrit `<jeu>.eeprom` à côté du firmware (ou dans le répertoire
-  courant), et la suivante en hérite : deux runs identiques divergent.
-  Une option (`--no-persist` ou variable d'environnement) rendrait les
-  exécutions reproductibles sans copier les fichiers dans un dossier
-  jetable.
+- **Banc de parité** — intégré dans `tests/parity/` : `run.sh`, `games.txt`,
+  `refs.txt` (SHA-256 de l'écran `EMU_TRACE`, du `--wav` et du `--shot`).  Les
+  jeux restent hors dépôt (`GM0_GAMES`).  Les références sont celles de
+  l'état d'avant cette série : chacun des changements ci-dessus leur est bit
+  à bit identique.
+- **Valgrind / sanitizers** — passés.  ASan + UBSan sur les 7 jeux, 600
+  images : aucune erreur.  Valgrind memcheck (fuites et origines) sur lapinou
+  et Pandemic, 200 images : aucune erreur.  Les trois accès hors bornes trouvés
+  à la main (CHID 12-15, IPR à 0x41F) ne sont plus exposés par ce corpus ; un
+  corpus plus large (autres jeux, cartes SD mal formées) reste à passer.
+- **EEPROM Pokitto en lecture seule** — fait : `--eeprom-ro` charge le
+  `.eeprom` sans jamais le réécrire (voir le README).  Le banc de parité
+  s'en sert.
 - **CI multiplateforme** (Linux, macOS, Windows MSYS2) et releases de
-  binaires.
+  binaires — non fait : rien ne permet de vérifier macOS et Windows ici.
 
 ## Fonctionnalités
 

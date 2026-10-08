@@ -1476,6 +1476,7 @@ static uint32_t pk_prng(void) {
 
 static uint8_t pk_sram1[0x800], pk_usbsram[0x800], pk_eeprom[0x1000];
 static int pk_eepromDirty;
+static int pk_eepromRO; /* --eeprom-ro : chargée, jamais réécrite (tests) */
 
 /* --- SYSCON (0x40048000) : stockage générique + PINTSEL pour les boutons */
 static uint32_t pk_syscon[256];
@@ -2788,7 +2789,7 @@ static void pk_eeprom_load(void) {
 
 static void pk_eeprom_save_as(const char *fw) {
 #ifndef __EMSCRIPTEN__
-    if (!pk_eepromDirty) return;
+    if (!pk_eepromDirty || pk_eepromRO) return;
     char path[1100];
     pk_eeprom_path(path, sizeof path, fw);
     FILE *f = fopen(path, "wb");
@@ -2971,6 +2972,11 @@ static uint32_t dmac_baseAddr, dmac_wrbAddr, dmac_desc, dmac_chid;
  * continue de tourner pendant le transfert — sur hardware le DMA écran
  * prend ~6,8 ms par demi-frame à 24 MHz, d'où les 40-55 fps réels) */
 static int      spiDmaCh = -1;   /* canal SERCOM4-TX en cours, -1 = aucun */
+/* voie rapide du scheduler (advance_slow) : seul un beat SPI est dû avant
+ * tcDeadline (tick absolu du prochain événement TC/SysTick, valide tant que
+ * spiOnly ; toute écriture qui change TC, SysTick ou le canal SPI le retire) */
+static int      spiOnly;
+static uint32_t tcDeadline;
 /* durée d'un octet SPI = 8 bits × 2(BAUD+1) / 48 MHz = (BAUD+1)/3 µs, soit
  * (BAUD+1) × ticks/µs / 3 ticks — non entier (6,67 ticks à 24 MHz dans le
  * domaine 20 M) : l'arrondi entier à 7 ralentissait l'écran de 5 %, assez
@@ -3008,7 +3014,7 @@ static uint32_t dmaSrc[DMAC_CHANNELS], dmaDst[DMAC_CHANNELS], dmaNext[DMAC_CHANN
 static void dmac_chan_swrst(uint32_t ch) {
     if (ch >= DMAC_CHANNELS) return;
     dmaOn[ch] = 0;
-    if (spiDmaCh == (int)ch) spiDmaCh = -1;
+    if (spiDmaCh == (int)ch) { spiDmaCh = -1; spiOnly = 0; }
     dmacIntFlag[ch] = 0;
     dmacIntEn[ch] = 0;
     dmaFerr[ch] = 0;
@@ -3316,6 +3322,7 @@ static uint32_t scs_read(uint32_t a) {
     return 0;
 }
 static void scs_write(uint32_t a, uint32_t v, uint32_t m) {
+    spiOnly = 0; /* SysTick : l'échéance absolue tcDeadline n'est plus valable */
     irq_work();
     switch (a) {
     case 0xe000e018u: sysTickBase = tickCount; return;          /* SYST_CVR : toute écriture le remet à 0 */
@@ -3411,17 +3418,14 @@ static uint32_t dmac_chan_read(uint32_t ch, uint32_t off) {
 }
 static uint32_t dmac_read(uint32_t r) {
     switch (r) {
-    case 0x20: /* INTPEND : premier canal avec un drapeau levé
-                * (datasheet : bit4 TCMPL, bit5 SUSP, bit6 TERR —
-                * l'ancien encodage mettait TCMPL en bit6, le guest
-                * y lisait TERR et partait dans son chemin d'erreur) */
+    case 0x20: /* INTPEND : premier canal avec un drapeau levé.  Champs du
+                * SAMD21 (CMSIS dmac.h, datasheet 20.8.12) : ID bits 0-3,
+                * TERR 8, TCMPL 9, SUSP 10, puis FERR 13, BUSY 14, PEND 15
+                * (non modélisés).  Les bits 8-10 sont les drapeaux
+                * CHINTFLAG (TERR=0x01, TCMPL=0x02, SUSP=0x04) décalés de 8. */
         for (uint32_t n = 0; n < DMAC_CHANNELS; n++) {
-            if (dmacIntFlag[n]) {
-                return (n & 0xfu)
-                     | (((dmacIntFlag[n] >> 1) & 1u) << 4)  /* TCMPL */
-                     | (((dmacIntFlag[n] >> 2) & 1u) << 5)  /* SUSP */
-                     | ((dmacIntFlag[n] & 1u) << 6);        /* TERR */
-            }
+            if (dmacIntFlag[n])
+                return (n & 0xfu) | ((uint32_t)(dmacIntFlag[n] & 0x7u) << 8);
         }
         return 0;
     case 0x34: return dmac_baseAddr;                        /* BASEADDR */
@@ -3508,9 +3512,11 @@ static uint32_t bus_read(uint32_t a, int size) {
 
 /* montre générique d'écriture (WATCH_ADDR), pour le débogage */
 static uint32_t lastExecPc;  /* PC de l'instruction en cours (du pas précédent, entre deux pas) */
-/* programmation flash (auto-patch des loaders) : la valeur écrite est
- * stockée en flash (le tampon de page et sa commande WP sont confondus) et
- * le code fraîchement écrit est exécuté aux pas suivants.  L'alias
+/* programmation flash (auto-patch des loaders) : le tampon de page et sa
+ * commande WP sont confondus avec l'écriture, et le code fraîchement écrit
+ * est exécuté aux pas suivants.  La cellule ne peut que passer de 1 à 0 :
+ * le résultat est le ET de l'ancien contenu et de la valeur écrite, seul
+ * un effacement de rangée (ER) remet des 1 (datasheet NVMCTRL).  L'alias
  * physique 0x00400000 est accepté en écriture aussi.
  *
  * Build wasm : écritures simplement IGNORÉES — la distribution web
@@ -3530,7 +3536,7 @@ static void flash_store(uint32_t a, uint32_t v, int bytes) {
                                           v & ((1u << (bytes * 8)) - 1), bytes);
         n++;
     }
-    memcpy(flash + a, &v, (size_t)bytes);
+    for (int i = 0; i < bytes; i++) flash[a + i] &= (uint8_t)(v >> (8 * i));
     nvmAddr = a >> 1; /* le matériel suit l'adresse écrite dans le tampon de page */
 #endif
 }
@@ -3590,7 +3596,7 @@ static void dmac_chid_chctrlb_write(uint32_t ch, uint32_t v, uint32_t m) {
                 spiBeatTicks = b * emuTicksPerUs; /* en tiers de tick */
                 if (spiBeatTicks < 3 || ENVFLAG("EMU_SPI_INSTANT")) spiBeatTicks = 3;
                 spiBeatAcc = 0;
-                spiDmaCh = (int)ch;
+                spiDmaCh = (int)ch; spiOnly = 0;
             }
         }
     }
@@ -3609,7 +3615,7 @@ static void dmac_chid_chctrla_write(uint32_t ch, uint32_t v) {
         return;
     }
     if ((v & 0x03u) != 0x02u && spiDmaCh == (int)ch) {
-        spiDmaCh = -1; dmaOn[ch] = 0; /* désactivation du canal SPI */
+        spiDmaCh = -1; spiOnly = 0; dmaOn[ch] = 0; /* désactivation du canal SPI */
         return;
     }
     if ((v & 0x03u) != 0x02u && dmaTrig[ch] == DMAC_TRIG_SERCOM4_RX) {
@@ -3652,7 +3658,7 @@ static void dmac_chid_chctrla_write(uint32_t ch, uint32_t v) {
             spiBeatTicks = b * emuTicksPerUs; /* tiers de tick : 8 bits @ f/2(1+b), 3 Mo/s à BAUD=0 */
             if (spiBeatTicks < 3 || ENVFLAG("EMU_SPI_INSTANT")) spiBeatTicks = 3; /* option : 1 octet/tick */
             spiBeatAcc = 0;
-            spiDmaCh = (int)ch;
+            spiDmaCh = (int)ch; spiOnly = 0;
             { static int n; if (n++ < 6)
                 fprintf(stderr, "[dma spi] ch=%u ctrl=%04x src=%x dst=%x n=%u beats=%u t\n",
                         (unsigned)ch, dmaCtrl[ch], dmaSrc[ch], dmaDst[ch], dmaCnt[ch], spiBeatTicks); }
@@ -3720,6 +3726,7 @@ static void dmac_chan_int_write(uint32_t ch, uint32_t v, uint32_t m) {
 /* écritures de registres DMAC (voir dmac_chan_read pour la fenêtre CHID et
  * les canaux indexés) */
 static void dmac_write(uint32_t r, uint32_t v, uint32_t m) {
+    spiOnly = 0; /* canal SPI, DMAC arrêté ou armé : échéances SPI à recalculer */
     switch (r) {
     case 0x34: dmac_baseAddr = MERGE(dmac_baseAddr, v, m); return;  /* BASEADDR */
     case 0x38: dmac_wrbAddr = MERGE(dmac_wrbAddr, v, m); return;    /* WRBADDR */
@@ -3749,6 +3756,7 @@ static void dmac_write(uint32_t r, uint32_t v, uint32_t m) {
 
 /* TC4/TC5 (COUNT16) */
 static void tc_write(int i, uint32_t r, uint32_t v, uint32_t m) {
+    spiOnly = 0; /* période, activation ou compteur d'un TC modifiés */
     struct tc *t = &tcs[i];
     switch (r) {
     case 0x00:                                                      /* CTRLA */
@@ -3925,13 +3933,17 @@ static void sercom4_write(uint8_t v) {
 /* Avance le temps émulé de n ticks (cycles CPU dans le modèle par
  * défaut) : SysTick, TC4/TC5 (DMA ou interruption) et beats SPI, par lots —
  * les débordements gardent leur phase (compteur -= période). */
-static uint32_t timerFrom;     /* tick jusqu'auquel les timers sont appliqués */
+static uint32_t timerFrom;     /* tick jusqu'auquel les TC et SysTick sont appliqués */
+static uint32_t spiFrom;       /* tick jusqu'auquel les beats SPI sont appliqués */
 static uint32_t timerDeadline; /* tick de leur prochain événement (= maintenant : à recalculer) */
 
 /* un TC compte dès qu'il est activé, CC0 posé */
 static int tc_live(int i) { return tcs[i].enabled && tcs[i].top > 0; }
 
-static void timers_process(uint32_t n) {
+/* SysTick (META) et débordements TC4/TC5 sur n ticks.  Les écritures
+ * APB du DMA (beats SPI) peuvent rappeler timers_sync : d'où l'horodatage
+ * remis à jour AVANT l'appel, par l'appelant. */
+static void tc_process(uint32_t n) {
     if (emuTarget == TGT_META) {
         while (systick_elapsed() >= (int)emuTicksPerMs) { /* enroulement de CVR : SysTick en attente */
             sysTickBase += emuTicksPerMs;
@@ -3963,19 +3975,22 @@ static void timers_process(uint32_t n) {
             }
         }
     }
-    if (spiDmaCh >= 0) { /* beats SPI : un octet tous les spiBeatTicks/3 ticks */
-        spiBeatAcc += 3u * n;
-        while (spiDmaCh >= 0 && spiBeatAcc >= spiBeatTicks) {
-            spiBeatAcc -= spiBeatTicks;
-            if (!dmaOn[spiDmaCh]) { spiDmaCh = -1; break; }
-            dma_beat(spiDmaCh);
-            if (!dmaOn[spiDmaCh]) spiDmaCh = -1; /* bloc terminé : TCMPL (levé par dma_beat) */
-        }
+}
+
+/* beats SPI : un octet tous les spiBeatTicks/3 ticks */
+static void spi_process(uint32_t n) {
+    if (spiDmaCh < 0) return;
+    spiBeatAcc += 3u * n;
+    while (spiDmaCh >= 0 && spiBeatAcc >= spiBeatTicks) {
+        spiBeatAcc -= spiBeatTicks;
+        if (!dmaOn[spiDmaCh]) { spiDmaCh = -1; break; }
+        dma_beat(spiDmaCh);
+        if (!dmaOn[spiDmaCh]) spiDmaCh = -1; /* bloc terminé : TCMPL (levé par dma_beat) */
     }
 }
 
-/* distance (ticks) au prochain événement des timers ; UINT32_MAX si aucun */
-static uint32_t timers_next_event(void) {
+/* distance (ticks) au prochain événement SysTick/TC ; UINT32_MAX si aucun */
+static uint32_t tc_next_event(void) {
     uint32_t d = 0xffffffffu;
     if (emuTarget == TGT_META)
         d = systick_elapsed() < (int)emuTicksPerMs ? emuTicksPerMs - (uint32_t)systick_elapsed() : 1u;
@@ -3985,33 +4000,55 @@ static uint32_t timers_next_event(void) {
         uint32_t r = tcs[i].counter < per ? per - tcs[i].counter : 1u;
         if (r < d) d = r;
     }
-    if (spiDmaCh >= 0) {
-        uint32_t need = spiBeatAcc < spiBeatTicks ? spiBeatTicks - spiBeatAcc : 0u;
-        uint32_t r = (need + 2u) / 3u; /* ticks pour atteindre le beat */
-        if (r < 1u) r = 1u;
-        if (r < d) d = r;
-    }
     return d;
+}
+
+/* distance (ticks) au prochain beat SPI ; UINT32_MAX si aucun */
+static uint32_t spi_next_event(void) {
+    if (spiDmaCh < 0) return 0xffffffffu;
+    uint32_t need = spiBeatAcc < spiBeatTicks ? spiBeatTicks - spiBeatAcc : 0u;
+    uint32_t r = (need + 2u) / 3u; /* ticks pour atteindre le beat */
+    return r < 1u ? 1u : r;
 }
 
 /* applique les ticks différés (avant toute écriture périphérique qui
  * pourrait changer l'état des timers, et à chaque échéance) */
 static void timers_sync(void) {
-    uint32_t n = tickCount - timerFrom;
-    timerFrom = tickCount;
-    if (n) timers_process(n);
+    uint32_t n = tickCount - timerFrom, ns = tickCount - spiFrom;
+    timerFrom = spiFrom = tickCount;
+    if (n) tc_process(n);
+    if (ns) spi_process(ns);
     timerDeadline = tickCount;
 }
 
 /* Avance le temps émulé de n ticks.  Les timers ne sont traités qu'à
  * l'échéance de leur prochain événement (débordement TC4/TC5, beat SPI) :
  * entre deux, seuls les compteurs avancent — même résultat, beaucoup moins
- * de travail par instruction. */
+ * de travail par instruction.  Voie rapide : quand seul un beat SPI est
+ * dû, le chemin complet (TC et SysTick) n'est pas revisité ; leur échéance
+ * absolue tcDeadline reste valable tant qu'aucune écriture ne change TC,
+ * SysTick ou le canal SPI.  Ces écritures retirent spiOnly (tc_write,
+ * scs_write, dmac_write, armements SPI) ; timers_sync ne le retire pas,
+ * sinon chaque beat DMA (écriture APB) désactiverait la voie. */
 static void advance_slow(void) {
-    uint32_t n = tickCount - timerFrom;
-    timerFrom = tickCount;
-    timers_process(n);
-    uint32_t d = timers_next_event(); /* borné : l'échéance se compare en signé */
+    if (spiOnly && (int32_t)(tickCount - tcDeadline) < 0) {
+        uint32_t ns = tickCount - spiFrom;
+        spiFrom = tickCount;
+        spi_process(ns); /* peut appeler timers_sync : spiOnly tombe alors */
+        if (!spiOnly) return; /* recalcul complet demandé */
+        uint32_t d = spi_next_event();
+        if (d != 0xffffffffu && (int32_t)(tickCount + d - tcDeadline) < 0) timerDeadline = tickCount + d;
+        else { spiOnly = 0; timerDeadline = tcDeadline; }
+        return;
+    }
+    uint32_t n = tickCount - timerFrom, ns = tickCount - spiFrom;
+    timerFrom = spiFrom = tickCount;
+    tc_process(n);
+    spi_process(ns);
+    uint32_t dTc = tc_next_event(), dSpi = spi_next_event(); /* borné : l'échéance se compare en signé */
+    uint32_t d = dTc < dSpi ? dTc : dSpi;
+    spiOnly = dSpi < dTc;
+    tcDeadline = tickCount + (dTc > 0x40000000u ? 0x40000000u : dTc);
     timerDeadline = tickCount + (d > 0x40000000u ? 0x40000000u : d);
 }
 /* cible constante (T) : les fonctions du chemin chaud sont instanciées par
@@ -4813,7 +4850,7 @@ static void reset_core(void) {
     dacData = 0;
     spiDmaCh = -1; spiBeatAcc = 0; spiBeatTicks = 20; spiBaud = 0;
     memset(dmacIntFlag, 0, sizeof dmacIntFlag);
-    timerFrom = timerDeadline = tickCount;
+    timerFrom = spiFrom = timerDeadline = tickCount; spiOnly = 0;
     dacWrites = 0;
     lcd_xStart = lcd_xEnd = lcd_yStart = lcd_yEnd = lcd_x = lcd_y = 0;
     lcd_argIndex = lcd_lastCommand = lcd_tmp = 0;
@@ -5480,6 +5517,8 @@ int main(int argc, char **argv) {
             targetForced = 1;
         } else if (strcmp(argv[i], "--out-img") == 0 && i + 1 < argc) {
             snprintf(outImgPath, sizeof(outImgPath), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--eeprom-ro") == 0) {
+            pk_eepromRO = 1;
         } else if (strcmp(argv[i], "-W") == 0) {
             pk_ignoreBadWrites = ~0u;
         } else if (strcmp(argv[i], "-w") == 0) {

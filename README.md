@@ -70,6 +70,7 @@ gm0 [firmware] [card] [options]
 | `--shot file.ppm` | write a screenshot at exit |
 | `--wav file.wav` | record the session audio (48 kHz, rendered from emulated time) |
 | `--out-img file.img` | export the card on exit if it was modified |
+| `--eeprom-ro` | Pokitto: load the `.eeprom` next to the firmware but never write it back (reproducible runs) |
 | `-w [n]`, `-W` | Pokitto: ignore the next *n* (or all) faulting flash writes instead of raising a HardFault |
 
 Started without arguments, the window opens empty; games can be dropped onto
@@ -162,6 +163,21 @@ Diagnostics are enabled through environment variables; the most useful:
 | `EMU_DEBUG=1`, `SD_DEBUG=1`, `NVM_DEBUG=1`, `EMU_DMA_DEBUG=1`, `EMU_LCD_DEBUG=1` | peripheral traces |
 | `FAT_DUMP=file`, `FAT_DUMP_EXIT=file` | write the FAT image as built at mount, or the card at exit |
 | `FLASH_DUMP=file` | write the META flash at exit (after any self-programming) |
+
+## Tests
+
+```sh
+tests/unit/run.sh                                        # core unit tests (flash programming)
+GM0_GAMES=dir tests/parity/run.sh build/bin/gm0          # bit-exact parity on local games
+```
+
+`tests/parity/run.sh` runs each game listed in `tests/parity/games.txt`
+(1500 frames, scripted input) and compares three SHA-256 fingerprints with
+`tests/parity/refs.txt`: the screen (`EMU_TRACE` lines), the `--wav`
+recording and the `--shot` capture.  The games are not in the repository
+(`GM0_GAMES` defaults to `wasm/`).  Each game runs alone in a throwaway
+directory, with `--eeprom-ro`, so no saved EEPROM is inherited.  Rewrite the
+references (`-u`) only after a change that is meant to alter the output.
 
 ## Known limitations
 

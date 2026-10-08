@@ -70,6 +70,7 @@ gm0 [firmware] [carte] [options]
 | `--shot fichier.ppm` | capture d'écran en fin d'exécution |
 | `--wav fichier.wav` | enregistre l'audio de la session (48 kHz, rendu depuis le temps émulé) |
 | `--out-img fichier.img` | exporte la carte en sortie si elle a été modifiée |
+| `--eeprom-ro` | Pokitto : charge le `.eeprom` à côté du firmware sans jamais le réécrire (exécutions reproductibles) |
 | `-w [n]`, `-W` | Pokitto : ignore les *n* (ou toutes les) prochaines écritures flash fautives au lieu de lever une HardFault |
 
 Lancée sans argument, la fenêtre s'ouvre vide ; on y dépose un jeu (`.bin`,
@@ -165,6 +166,22 @@ Les diagnostics s'activent par variables d'environnement ; les plus utiles :
 | `EMU_DEBUG=1`, `SD_DEBUG=1`, `NVM_DEBUG=1`, `EMU_DMA_DEBUG=1`, `EMU_LCD_DEBUG=1` | traces des périphériques |
 | `FAT_DUMP=fichier`, `FAT_DUMP_EXIT=fichier` | écrit l'image FAT telle que construite au montage, ou la carte en sortie |
 | `FLASH_DUMP=fichier` | écrit la flash META en sortie (après une éventuelle auto-programmation) |
+
+## Tests
+
+```sh
+tests/unit/run.sh                                        # tests unitaires du cœur (programmation flash)
+GM0_GAMES=dossier tests/parity/run.sh build/bin/gm0      # parité bit à bit sur des jeux locaux
+```
+
+`tests/parity/run.sh` fait tourner chaque jeu listé dans `tests/parity/games.txt`
+(1500 frames, entrées scriptées) et compare trois empreintes SHA-256 à
+`tests/parity/refs.txt` : l'écran (lignes `EMU_TRACE`), l'enregistrement
+`--wav` et la capture `--shot`.  Les jeux ne sont pas dans le dépôt
+(`GM0_GAMES` vaut `wasm/` par défaut).  Chaque jeu tourne seul dans un
+dossier jetable, avec `--eeprom-ro` : aucune EEPROM sauvegardée n'est
+héritée.  Ne réécrire les références (`-u`) qu'après un changement censé
+modifier la sortie.
 
 ## Limitations connues
 
