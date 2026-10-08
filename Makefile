@@ -1,4 +1,4 @@
-# Build navigateur : wasm/gm0-standalone.html — un seul fichier autonome
+# Build navigateur : wasm/gm0.html — un seul fichier autonome
 # (wasm embarqué en base64, utilisable en file:// ; les jeux listés dans
 # wasm/games.js sont embarqués s'ils sont posés à côté).
 # (nécessite emsdk : source ~/emsdk/emsdk_env.sh, ou emcc déjà dans le PATH).
@@ -17,7 +17,7 @@ EMFLAGS += $(EXTRA_EMFLAGS)
 wasm: gm0.c wasm/index.html wasm/games.js wasm/make_single.py
 	$(EMCC) $(EMFLAGS) -sSINGLE_FILE=1 -o wasm/gm0_single.js gm0.c -lm
 	python3 wasm/make_single.py
-	@echo "wasm : ouvrir wasm/gm0-standalone.html (file:// ou http)"
+	@echo "wasm : ouvrir wasm/gm0.html (file:// ou http)"
 
 # Windows, build croisé depuis Linux (MinGW-w64), un seul gm0.exe (SDL2 statique).
 #   paquets natifs (pacman, mingw-w64-gcc + mingw-w64-sdl2 + mingw-w64-zlib) : `make win`
@@ -45,5 +45,5 @@ win:
 	@echo "gm0.exe : $(WIN_BUILD)/bin/gm0.exe$(if $(filter OFF,$(WIN_STATIC)), (SDL2.dll copiée à côté),)"
 
 clean:
-	rm -f wasm/gm0_single.js wasm/gm0-standalone.html
+	rm -f wasm/gm0_single.js wasm/gm0.html
 .PHONY: clean wasm win win-setup

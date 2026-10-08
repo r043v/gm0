@@ -49,7 +49,7 @@ chargement) sont activés par défaut ; `-DGM0_OSD=OFF` les retire.
 Build WebAssembly (emsdk requis, `emcc` dans le `PATH`) :
 
 ```sh
-make wasm                    # produit wasm/gm0-standalone.html
+make wasm                    # produit wasm/gm0.html
 ```
 
 Le résultat est un fichier unique, module wasm embarqué, ouvrable

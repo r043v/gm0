@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fusionne index.html + gm0_single.js (wasm embarqué en base64,
 build -sSINGLE_FILE=1) en un unique fichier HTML autonome :
-gm0-standalone.html — distribuable tel quel, ouvrable en file://.
+gm0.html — distribuable tel quel, ouvrable en file://.
 
 Le titre affiche l'heure du build : un standalone périmé (renvoyé par
 mail, extrait d'un vieux zip, onglet resté ouvert) se reconnaît d'un
@@ -44,6 +44,6 @@ h1 = 'Gamebuino META / Pokitto — emulator (wasm)</span></h1>'
 assert h1 in h, 'titre de l\'overlay introuvable'
 h = h.replace('</h1>', f'</h1>\n<div>build {build}</div>', 1)
 
-out = d / 'gm0-standalone.html'
+out = d / 'gm0.html'
 out.write_text(h)
 print(f'{out.name} : {out.stat().st_size / 1024:.0f} Kio (build {build})')

@@ -7,7 +7,7 @@ gm0.exe
 wasm/gm0.js
 wasm/gm0.wasm
 wasm/gm0_single.js
-wasm/gm0-standalone.html
+wasm/gm0.html
 
 # firmwares et jeux de test locaux
 wasm/test/
