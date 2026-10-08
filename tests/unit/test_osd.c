@@ -69,7 +69,7 @@ int main(void) {
         osd_push_at(0, "OLD");   /* plus ancienne : au-dessus */
         osd_push_at(0, "NEW");   /* plus récente : en bas */
         memcpy(snap, buf, sizeof(uint32_t) * SCR_W * SCR_H * cell * cell);
-        osd_draw(buf, cell, 0);
+        osd_draw(buf, stride, cell, 0);
         int top0 = (int)SCR_H - OSD_MARGIN - OSD_BOX;      /* ligne la plus récente */
         int top1 = top0 - OSD_STEP;                        /* la précédente, au-dessus */
         /* 'N' ligne 0 "#...#" : pixel (3, top0+1) allumé */
@@ -93,10 +93,10 @@ int main(void) {
     osdCount = 0;
     for (unsigned i = 0; i < SCR_W * SCR_H; i++) buf[i] = 0xff123456u;
     memcpy(snap, buf, sizeof(uint32_t) * SCR_W * SCR_H);
-    osd_draw(buf, 1, 0);
+    osd_draw(buf, SCR_W, 1, 0);
     CHECK(memcmp(buf, snap, sizeof(uint32_t) * SCR_W * SCR_H) == 0, "pile vide : tampon modifié");
     osd_push_at(0, "GONE");
-    osd_draw(buf, 1, OSD_MS);
+    osd_draw(buf, SCR_W, 1, OSD_MS);
     CHECK(osdCount == 0 && memcmp(buf, snap, sizeof(uint32_t) * SCR_W * SCR_H) == 0,
           "entrée échue encore dessinée");
 
