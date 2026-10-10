@@ -37,6 +37,15 @@ find_package(ZLIB REQUIRED)
 
 add_executable(gm0 gm0.c)
 
+# Jeu embarqué : -DGM0_BUNDLE=chemin/jeu.zip (carte SD complète + firmware),
+# lancé directement quand aucun firmware n'est donné en argument
+set(GM0_BUNDLE "" CACHE FILEPATH "zip à embarquer dans l'exécutable")
+if(GM0_BUNDLE)
+    get_filename_component(GM0_BUNDLE_ABS "${GM0_BUNDLE}" ABSOLUTE)
+    target_compile_definitions(gm0 PRIVATE "GM0_BUNDLE_ZIP=\"${GM0_BUNDLE_ABS}\"")
+    set_source_files_properties(gm0.c PROPERTIES OBJECT_DEPENDS "${GM0_BUNDLE_ABS}")
+endif()
+
 # Interface en français (par défaut : anglais)
 option(GM0_FR "French interface (default: English)" OFF)
 if(GM0_FR)

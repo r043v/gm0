@@ -5744,6 +5744,16 @@ int main(int argc, char **argv) {
 #elif !defined(__EMSCRIPTEN__)
 /* ------------------------------------------------------------ natif --- */
 
+#ifdef GM0_BUNDLE_ZIP
+/* jeu embarqué (cmake -DGM0_BUNDLE=jeu.zip) : le zip est inclus tel quel
+ * dans l'exécutable et se charge comme une carte SD complète */
+__asm__(".section .rodata\n"
+        ".global gm0_bundle_start\n.global gm0_bundle_end\n"
+        "gm0_bundle_start:\n.incbin \"" GM0_BUNDLE_ZIP "\"\ngm0_bundle_end:\n"
+        ".byte 0\n.text\n");
+extern const uint8_t gm0_bundle_start[], gm0_bundle_end[];
+#endif
+
 int main(int argc, char **argv) {
     if (argc < 2)
         fprintf(stderr, TR("gm0 : lancé sans firmware — déposez un .bin "
@@ -5808,6 +5818,10 @@ int main(int argc, char **argv) {
             else { load_sd_from_path(argv[i]); sd_explicit = 1; }
         }
     }
+#ifdef GM0_BUNDLE_ZIP
+    if (!fwLoaded && !sd_explicit)
+        zip_load_card(gm0_bundle_start, (size_t)(gm0_bundle_end - gm0_bundle_start));
+#endif
     if (fwLoaded) boot_vectors();
     fwNeedsBoot = 0;
 

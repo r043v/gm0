@@ -27,3 +27,4 @@ wasm/ziptest/
 # python
 __pycache__/
 *.pyc
+GalaxyFighters.exe
