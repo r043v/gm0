@@ -198,6 +198,15 @@ int main(void) {
     SDL_DestroyWindow(win);
     SDL_Quit();
 
+    /* ordre des couleurs : META permute R/B (dalle BGR), Pokitto non */
+    emuTarget = TGT_META;
+    CHECK(rgb565_argb(0xf800) == 0xff0000f8u, "META : rouge 565 -> %08x", rgb565_argb(0xf800));
+    CHECK(rgb565_argb(0x001f) == 0xfff80000u, "META : bleu 565 -> %08x", rgb565_argb(0x001f));
+    emuTarget = TGT_POKITTO;
+    CHECK(rgb565_argb(0xf800) == 0xfff80000u, "Pokitto : rouge 565 -> %08x", rgb565_argb(0xf800));
+    CHECK(rgb565_argb(0x001f) == 0xff0000f8u, "Pokitto : bleu 565 -> %08x", rgb565_argb(0x001f));
+    CHECK(rgb565_argb(0x07e0) == 0xff00fc00u, "Pokitto : vert 565 -> %08x", rgb565_argb(0x07e0));
+
     printf("%d vérifications, %d échec(s)\n", checks, fails);
     return fails ? 1 : 0;
 }

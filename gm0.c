@@ -4549,10 +4549,12 @@ static const char *filter_name(int f) {
     return names[f];
 }
 
-/* RVB565 → ARGB8888 : même correspondance que la sortie brute (R et B
- * permutés, expansion par décalage, sans mise à l'échelle) */
+/* RVB565 → ARGB8888, expansion par décalage, sans mise à l'échelle.  META :
+ * R et B permutés (dalle câblée BGR, la lib pré-swappe) ; Pokitto : les
+ * pixels sont déjà en RVB565 natif, pas de permutation. */
 static inline uint32_t rgb565_argb(uint16_t p) {
     uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
+    if (emuTarget == TGT_POKITTO) { uint32_t t = r; r = b; b = t; }
     return 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
 }
 /* la même couleur à k % d'intensité, canal par canal */
