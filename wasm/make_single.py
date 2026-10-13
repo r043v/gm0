@@ -8,9 +8,16 @@ mail, extrait d'un vieux zip, onglet resté ouvert) se reconnaît d'un
 coup d'œil au lieu de ressembler à une version cassée."""
 import pathlib
 import time
+import argparse
+import json
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--js', type=pathlib.Path)
+parser.add_argument('--output', type=pathlib.Path)
+parser.add_argument('--game', type=pathlib.Path, help='User-provided game to embed and start')
+args = parser.parse_args()
 
 d = pathlib.Path(__file__).resolve().parent
-js = (d / 'gm0_single.js').read_text()
+js = (args.js or d / 'gm0_single.js').read_text()
 # le JS inliné ne doit pas fermer le conteneur <script> de l'hôte
 js = js.replace('</script', '<\\/script')
 
@@ -28,11 +35,17 @@ for m in re.finditer(r"^\s*\{.*?f:\s*'([^']+)'", gjs, re.M):
         embed[m.group(1)] = base64.b64encode(f.read_bytes()).decode()
 inline = 'window.OFFLINE_EMBED = {' + ', '.join(
     f'"{k}": "{v}"' for k, v in embed.items()) + '};\n' + gjs
+if args.game:
+    name = args.game.name
+    gamebytes = base64.b64encode(args.game.read_bytes()).decode()
+    inline = 'window.OFFLINE_EMBED = ' + json.dumps({name:gamebytes}) + ';\n'
+    inline += 'window.OFFLINE_GAMES = ' + json.dumps([{'n':args.game.stem,'f':name}]) + ';\n'
+    inline += 'window.GM0_AUTO_GAME = ' + json.dumps(name) + ';\n'
 inline = inline.replace('</script', '<\\/script')
 h = h.replace(games_tag, '<script>\n' + inline + '\n</script>')
 manquants = [m.group(1) for m in re.finditer(r"^\s*\{.*?f:\s*'([^']+)'", gjs, re.M)
              if m.group(1) not in embed]
-if manquants:
+if manquants and not args.game:
     print('attention : fichiers absents, non embarqués :', ', '.join(manquants))
 
 tag = '<script async src="gm0.js"></script>'
@@ -44,6 +57,7 @@ h1 = 'Gamebuino META / Pokitto — emulator (wasm)</span></h1>'
 assert h1 in h, 'titre de l\'overlay introuvable'
 h = h.replace('</h1>', f'</h1>\n<div>build {build}</div>', 1)
 
-out = d / 'gm0.html'
+out = args.output or d / 'gm0.html'
+out.parent.mkdir(parents=True,exist_ok=True)
 out.write_text(h)
 print(f'{out.name} : {out.stat().st_size / 1024:.0f} Kio (build {build})')

@@ -28,3 +28,6 @@ wasm/ziptest/
 __pycache__/
 *.pyc
 GalaxyFighters.exe
+
+logs/
+output/

@@ -70,6 +70,37 @@ Sans eux, `make win-setup` installe la même chaîne dans
 de la même façon.  `make win WIN_STATIC=OFF` garde SDL2 dans un `SDL2.dll`
 séparé.
 
+### Jeux embarqués
+
+`main` exécute les firmwares META/Pokitto. La lecture directe des cartouches
+SG-1000 est sur [`z80`](https://github.com/r043v/gm0/tree/z80).
+
+Construire un exécutable natif qui démarre le jeu sans argument :
+
+```sh
+cmake -G Ninja -S . -B build-bundle -DGM0_BUNDLE=/chemin/jeu.zip
+cmake --build build-bundle
+```
+
+`GM0_BUNDLE` accepte un firmware `.bin` ou `.pop`, ou un ZIP contenant le
+firmware et les fichiers de sa carte SD (dont la ROM utilisée par le firmware).
+Utiliser un ZIP si le jeu lit des fichiers sur la carte. Une ROM Game Boy brute
+doit d’abord être convertie en firmware META/Pokitto avec m0boy. Un jeu ou une
+carte donnés en argument remplacent le jeu embarqué. Sous Windows, SDL2 est
+liée statiquement par défaut lorsqu’elle est disponible.
+
+Pour un HTML unique qui démarre le jeu intégré (emsdk requis) :
+
+```sh
+emcmake cmake -G Ninja -S . -B build-wasm -DGM0_WEB_GAME=/chemin/jeu.zip
+cmake --build build-wasm     # build-wasm/gm0.html
+```
+
+`GM0_WEB_GAME` accepte les mêmes formats. Le module et le jeu sont intégrés
+au HTML pour fonctionner hors ligne ; le son du navigateur demande toujours
+un geste utilisateur. Garder les jeux fournis et les builds générés hors des
+sources suivies.
+
 ## Utilisation
 
 ```sh

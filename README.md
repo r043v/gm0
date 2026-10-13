@@ -69,6 +69,36 @@ Without them, `make win-setup` installs the same toolchain under
 `~/.local/mingw-w64` (about 440 MB, no root), then `make win` works the same
 way.  `make win WIN_STATIC=OFF` keeps SDL2 in a separate `SDL2.dll`.
 
+### Embedded games
+
+`main` runs META/Pokitto firmwares. Direct SG-1000 cartridge support lives on
+[`z80`](https://github.com/r043v/gm0/tree/z80).
+
+Build a native executable that starts your game without arguments:
+
+```sh
+cmake -G Ninja -S . -B build-bundle -DGM0_BUNDLE=/path/game.zip
+cmake --build build-bundle
+```
+
+`GM0_BUNDLE` accepts a `.bin` or `.pop` firmware, or a ZIP containing the
+firmware and its SD assets (including any ROM needed by the firmware).
+Use a ZIP for games that read files from the card. A raw Game Boy ROM must
+first be converted to a META/Pokitto firmware with m0boy. An explicit game
+or card argument overrides the embedded game. Windows builds use static
+SDL2 by default when available.
+
+For a single HTML that starts the embedded game (emsdk required):
+
+```sh
+emcmake cmake -G Ninja -S . -B build-wasm -DGM0_WEB_GAME=/path/game.zip
+cmake --build build-wasm     # build-wasm/gm0.html
+```
+
+`GM0_WEB_GAME` accepts the same game formats. The module and game are embedded
+in the HTML for offline use; browser audio still requires a user gesture.
+Keep user-provided games and generated builds outside tracked sources.
+
 ## Usage
 
 ```sh

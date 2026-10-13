@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>META / Pokitto — déposez un firmware .bin</title>
+<title>gm0 — Gamebuino META / Pokitto</title>
 <style>
   /* fond sur html seulement : propagé au viewport, peint sous les éléments
    * z-index négatifs (le % derrière le canvas reste visible) */
@@ -84,15 +84,19 @@
          .pop (loader Pokitto), .zip ou dossier acceptés. Un .zip = carte SD
          complète (son premier .bin lance le jeu — bouton « 🎮 Jeux » pour
          changer). META : flèches/ZQSD, Entrée=MENU, Espace=A, Ctrl=B,
-         *=HOME. Pokitto : IJKL/flèches, A=« a », B=« s », C=« d » — ou manette.">The target (META or Pokitto) is auto-detected — .bin,
+         *=HOME.
+         F8=filtres, F10=échelle, F11=plein écran. Pokitto : IJKL/flèches,
+         A=« a », B=« s », C=« d » — ou manette.">The target (META or Pokitto) is auto-detected — .bin,
          .pop (Pokitto loader), .zip or folder accepted. A .zip = full SD
          card (its first .bin boots the game — the « 🎮 Games » button
          switches). META: arrows/ZQSD/WASD, Enter=MENU, Space=A, Ctrl=B,
-         *=HOME. Pokitto: IJKL/arrows, A=“a”, B=“s”, C=“d” — or gamepad.</small>
+         *=HOME.
+         F8=filters, F10=scale, F11=fullscreen. Pokitto: IJKL/arrows,
+         A=“a”, B=“s”, C=“d” — or gamepad.</small>
 </div>
 <div id="pct"></div>
 <div id="dock">
-  <button id="pickFiles" title="One file: .zip (SD card) or .bin (game)" data-fr-title="Un fichier : .zip (carte SD) ou .bin (jeu)" aria-label="Open a file">📄</button>
+  <button id="pickFiles" title="Game: .bin, .pop or .zip" data-fr-title="Jeu : .bin, .pop ou .zip" aria-label="Open a file">📄</button>
   <button id="pickFolder" title="A game folder (bin + rom + save)" data-fr-title="Un répertoire de jeu (bin + rom + sauvegarde)" aria-label="Open a folder">📁</button>
   <div class="sep"></div>
   <button id="pauseBtn" title="Pause / resume" data-fr-title="Pause / reprise" disabled>⏸</button>
@@ -183,8 +187,8 @@ async function loadSet(items) {
   if (roots.size === 1 && items.some(it => it.path.includes('/'))) {
     items = items.map(it => ({ ...it, path: it.path.split('/').slice(1).join('/') }));
   }
-  const bins = items.filter(it => /\.bin$/i.test(it.path));
-  const rest = items.filter(it => !/\.bin$/i.test(it.path) || !bins.includes(it));
+  const bins = items.filter(it => /\.(bin|pop)$/i.test(it.path));
+  const rest = items.filter(it => !/\.(bin|pop)$/i.test(it.path) || !bins.includes(it));
   // un .zip = carte SD complète (son premier .bin devient le firmware)
   const zips = items.filter(it => /\.zip$/i.test(it.path));
   if (zips.length) {
@@ -202,7 +206,7 @@ async function loadSet(items) {
   const firmwareBin = bins.length === 1 ? bins[0] : bins.find(b => !b.path.includes('/'));
 
   if (!firmwareBin && bins.length === 0) {
-    setStatus(T('firmware .bin manquant — carte ignorée', 'missing .bin firmware — card ignored'));
+    setStatus(T('jeu .bin/.pop manquant — carte ignorée', 'missing .bin/.pop game — card ignored'));
     if (items.length === 1 && /\.img$/i.test(items[0].path)) {
       cCardImage(new Uint8Array(await items[0].file.arrayBuffer()));
       setStatus(T('carte SD chargée (image) — déposez un firmware .bin', 'SD card loaded (image) — drop a .bin firmware'));
@@ -210,7 +214,7 @@ async function loadSet(items) {
     return;
   }
   if (bins.length > 1 && !firmwareBin) {
-    setStatus(T(`${bins.length} fichiers .bin : déposez un seul jeu (ou son dossier)`, `${bins.length} .bin files: drop a single game (or its folder)`));
+    setStatus(T(`${bins.length} jeux : déposez un seul jeu (ou son dossier)`, `${bins.length} games: drop a single game (or its folder)`));
     return;
   }
   setStatus(T('lecture du firmware…', 'reading firmware…'));
@@ -317,7 +321,7 @@ async function openLightbox() {
   }
   for (let i = 0; i < names.length; i++) {
     const fullPath = new TextDecoder().decode(names[i]).replace(/\0.*$/, '');
-    const base = fullPath.split('/').pop().replace(/\.bin$/i, '');
+    const base = fullPath.split('/').pop().replace(/\.(bin|pop)$/i, '');
     const folder = fullPath.includes('/') ? fullPath.split('/')[0] : base;
     const div = document.createElement('div');
     div.className = 'game';
@@ -500,6 +504,10 @@ var Module = {
   canvas: document.getElementById('canvas'),
   printErr: (s) => console.log(s),
   onAbort: (s) => __show('ABORT : ' + s),
+  onRuntimeInitialized: () => {
+    if(window.GM0_AUTO_GAME)offlineBytes(window.GM0_AUTO_GAME)
+      .then(bytes=>loadDirect(bytes,window.GM0_AUTO_GAME)).catch(e=>__show(String(e)));
+  },
 };
 window.addEventListener('error', e => { __show('ERREUR : ' + e.message);
   document.title = 'ERR ' + e.message; });

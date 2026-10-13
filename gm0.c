@@ -30,6 +30,9 @@
 #include <time.h>
 #include <math.h>
 #include <stdarg.h>
+#ifdef GM0_EMBEDDED_GAME
+#include "gm0_bundle.h"
+#endif
 
 /* Interface : anglais par défaut ; français avec -DGM0_FR (CMake -DGM0_FR=ON).
  * Les traces de débogage étiquetées [xxx] restent en français. */
@@ -5179,9 +5182,11 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
         else if ((w0 & 0xFFFF0000u) == 0x20000000u) emuTarget = TGT_META;
         pk_screen_reconfig();
     }
-    free(fwData);
-    fwData = malloc(len ? len : 1);
-    memcpy(fwData, data, len);
+    size_t payloadOffset=(size_t)(payload-data);
+    uint8_t *copy=malloc(len?len:1);
+    if(!copy) { fwLoaded=0;return; }
+    memcpy(copy,data,len);
+    free(fwData);fwData=copy;payload=fwData+payloadOffset;
     fwLen = len;
     /* Pokitto : flash à 0 dès l'adresse 0 (comme la référence) ; META :
      * 0xff, application derrière le bootloader de 16 Ko (comme le TS) */
@@ -5207,7 +5212,8 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
  * EEPROM, comme la référence) */
 static void fw_restart(void) {
     if (!fwData) return;
-    load_firmware_data(fwData, fwLen, fwPath);
+    char name[sizeof(fwPath)];snprintf(name,sizeof(name),"%s",fwPath);
+    load_firmware_data(fwData, fwLen, name);
     if (emuTarget == TGT_META) boot_vectors();
     audio_start();
     machineEpoch++;
@@ -5215,14 +5221,15 @@ static void fw_restart(void) {
 }
 
 static void load_firmware(const char *p, int rebindCard) {
-    FILE *f = fopen(p, "rb");
+    SDL_RWops *f = SDL_RWFromFile(p, "rb");
     if (!f) { fprintf(stderr, TR("firmware introuvable : %s\n", "firmware not found: %s\n"), p); return; }
-    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    Sint64 sz=SDL_RWsize(f);
+    if(sz<=0) { SDL_RWclose(f);return; }
     uint8_t *data = malloc((size_t)sz);
-    if (fread(data, 1, (size_t)sz, f) == 0) {
-        fprintf(stderr, TR("firmware vide\n", "empty firmware\n")); free(data); fclose(f); return;
+    if (!data||SDL_RWread(f,data,1,(size_t)sz)!=(size_t)sz) {
+        fprintf(stderr, TR("firmware illisible\n", "unreadable firmware\n")); free(data); SDL_RWclose(f); return;
     }
-    fclose(f);
+    SDL_RWclose(f);
     load_firmware_data(data, (size_t)sz, p);
     free(data);
     /* la carte SD est le répertoire contenant le firmware ; une carte
@@ -5746,22 +5753,14 @@ int main(int argc, char **argv) {
 #elif !defined(__EMSCRIPTEN__)
 /* ------------------------------------------------------------ natif --- */
 
-#ifdef GM0_BUNDLE_ZIP
-/* jeu embarqué (cmake -DGM0_BUNDLE=jeu.zip) : le zip est inclus tel quel
- * dans l'exécutable et se charge comme une carte SD complète */
-__asm__(".section .rodata\n"
-        ".global gm0_bundle_start\n.global gm0_bundle_end\n"
-        "gm0_bundle_start:\n.incbin \"" GM0_BUNDLE_ZIP "\"\ngm0_bundle_end:\n"
-        ".byte 0\n.text\n");
-extern const uint8_t gm0_bundle_start[], gm0_bundle_end[];
-#endif
-
 int main(int argc, char **argv) {
+#ifndef GM0_EMBEDDED_GAME
     if (argc < 2)
         fprintf(stderr, TR("gm0 : lancé sans firmware — déposez un .bin "
                         "dans la fenêtre (carte SD = son répertoire).\n",
                         "gm0: started without a firmware — drop a .bin "
                         "into the window (SD card = its directory).\n"));
+#endif
     memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
     if (getenv("EMU_TARGET")) {
         if (strcasecmp(getenv("EMU_TARGET"), "pokitto") == 0) emuTarget = TGT_POKITTO;
@@ -5820,9 +5819,13 @@ int main(int argc, char **argv) {
             else { load_sd_from_path(argv[i]); sd_explicit = 1; }
         }
     }
-#ifdef GM0_BUNDLE_ZIP
-    if (!fwLoaded && !sd_explicit)
-        zip_load_card(gm0_bundle_start, (size_t)(gm0_bundle_end - gm0_bundle_start));
+#ifdef GM0_EMBEDDED_GAME
+    if (!fwLoaded && !sd_explicit) {
+        if (sizeof(gm0_bundle_data) > 3 && gm0_bundle_data[0] == 'P' && gm0_bundle_data[1] == 'K')
+            zip_load_card(gm0_bundle_data, sizeof(gm0_bundle_data));
+        else
+            load_firmware_data(gm0_bundle_data, sizeof(gm0_bundle_data), gm0_bundle_name);
+    }
 #endif
     if (fwLoaded) boot_vectors();
     fwNeedsBoot = 0;
@@ -5927,7 +5930,7 @@ int main(int argc, char **argv) {
 
 static int vfile_is_game(const VFile *v) {
     size_t l = strlen(v->path);
-    return l > 4 && strcasecmp(v->path + l - 4, ".bin") == 0;
+    return l > 4 && (strcasecmp(v->path + l - 4, ".bin") == 0 || strcasecmp(v->path + l - 4, ".pop") == 0);
 }
 
 EMSCRIPTEN_KEEPALIVE
