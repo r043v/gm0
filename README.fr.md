@@ -11,6 +11,17 @@ binaire.  La cible est détectée d'après l'image du firmware (pointeur de pile
 initial dans la SRAM SAMD21 ou LPC) et peut être forcée par `--target`.  Le
 même cœur C est compilé en natif et en WebAssembly.
 
+Les cartouches `.sg` s’exécutent directement dans le cœur Z80/TMS9918A/SN76489,
+sans firmware META/Pokitto recompilé. Lancer `gm0 jeu.sg` ; F5, F8, F10, F11
+et les manettes utilisent le frontal commun. Commandes : flèches, Espace=A,
+Ctrl=B, Entrée=Start (bouton 1), `*`=Pause (NMI) ; le `*` du pavé numérique
+et Maj+8 fonctionnent aussi. Cartouches sans mapper, jusqu’à 48 Kio ; PAL
+et extensions non pris en charge.
+
+Intégrer une cartouche avec `-DGM0_BUNDLE=/chemin/jeu.sg` (l’alias de packaging
+`-DGM0_SG_ROM=/chemin/jeu.sg` est également accepté), ou utiliser
+`-DGM0_WEB_GAME=/chemin/jeu.sg` pour un HTML autonome.
+
 - **CPU** — interpréteur Thumb ARMv6-M, compté en cycles d'après les tables
   du Cortex-M0+, défauts du cache NVM compris sur la META.
 - **Périphériques META** — PORT, SERCOM4/5 (écran ST7735, carte SD en SPI,
@@ -31,6 +42,10 @@ même cœur C est compilé en natif et en WebAssembly.
 | WebAssembly | Jouable | même cœur ; page servie ou fichier HTML autonome unique |
 
 Le dépôt ne contient ni jeux ni firmwares.
+
+Le support SG-1000 est expérimental ; les tests du cœur et des commandes utilisent
+une cartouche synthétique. Il ne constitue pas une garantie de compatibilité
+avec toutes les cartouches.
 
 ## Compilation
 
@@ -72,8 +87,9 @@ séparé.
 
 ### Jeux embarqués
 
-`main` exécute les firmwares META/Pokitto. La lecture directe des cartouches
-SG-1000 est sur [`z80`](https://github.com/r043v/gm0/tree/z80).
+Cette branche `z80` ajoute la lecture directe des cartouches SG-1000 au
+frontal META/Pokitto. [`main`](https://github.com/r043v/gm0/tree/main) conserve
+l’émulation des firmwares META/Pokitto et les bundles génériques.
 
 Construire un exécutable natif qui démarre le jeu sans argument :
 
@@ -82,7 +98,7 @@ cmake -G Ninja -S . -B build-bundle -DGM0_BUNDLE=/chemin/jeu.zip
 cmake --build build-bundle
 ```
 
-`GM0_BUNDLE` accepte un firmware `.bin` ou `.pop`, ou un ZIP contenant le
+`GM0_BUNDLE` accepte une cartouche `.sg`, un firmware `.bin` ou `.pop`, ou un ZIP contenant le
 firmware et les fichiers de sa carte SD (dont la ROM utilisée par le firmware).
 Utiliser un ZIP si le jeu lit des fichiers sur la carte. Une ROM Game Boy brute
 doit d’abord être convertie en firmware META/Pokitto avec m0boy. Un jeu ou une
@@ -109,9 +125,9 @@ gm0 [firmware] [carte] [options]
 
 | Argument | Sens |
 |---|---|
-| `firmware` | `.bin`, ou `.pop` (Pokitto) |
+| `firmware` | `.bin`, `.pop` (Pokitto), ou `.sg` (SG-1000) |
 | `carte` | image brute `.img`, `.zip` (carte complète), ou dossier (FAT16 construit à la volée). Sur META, la carte est par défaut le dossier du firmware. |
-| `--target meta\|pokitto` | force la cible |
+| `--target meta\|pokitto\|sg1000` | force la cible |
 | `--frames N` | exécute N frames puis quitte |
 | `--shot fichier.ppm` | capture d'écran en fin d'exécution |
 | `--wav fichier.wav` | enregistre l'audio de la session (48 kHz, rendu depuis le temps émulé) |
@@ -298,6 +314,9 @@ l'émulateur.
 
 Écosystèmes : [gamebuino.com](https://gamebuino.com) pour la META,
 [PokittoLib](https://github.com/pokitto/PokittoLib) pour la Pokitto.
+
+Le cœur SG-1000 provient de [m0boy](https://github.com/r043v/m0boy) et conserve
+sa [licence MIT](cores/sg1000/LICENSE).
 
 ## Licence
 

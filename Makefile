@@ -14,8 +14,9 @@ EMFLAGS := -O3 -flto -sUSE_SDL=2 -sUSE_ZLIB=1 -sALLOW_MEMORY_GROWTH=1 -sENVIRONM
 #   make wasm EXTRA_EMFLAGS=-DGM0_NO_OSD
 EMFLAGS += $(EXTRA_EMFLAGS)
 
-wasm: gm0.c wasm/index.html wasm/games.js wasm/make_single.py
-	$(EMCC) $(EMFLAGS) -sSINGLE_FILE=1 -o wasm/gm0_single.js gm0.c -lm
+SG_SOURCES := cores/sg1000/z80.c cores/sg1000/sg1000.c cores/sg1000/sg_audio.c cores/sg1000/tms9918.c
+wasm: gm0.c $(SG_SOURCES) wasm/index.html wasm/games.js wasm/make_single.py
+	$(EMCC) $(EMFLAGS) -sSINGLE_FILE=1 -o wasm/gm0_single.js gm0.c $(SG_SOURCES) -lm
 	python3 wasm/make_single.py
 	@echo "wasm : ouvrir wasm/gm0.html (file:// ou http)"
 

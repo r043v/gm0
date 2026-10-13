@@ -33,6 +33,10 @@
 #ifdef GM0_EMBEDDED_GAME
 #include "gm0_bundle.h"
 #endif
+#include "cores/sg1000/sg1000.h"
+#ifdef GM0_SG_EMBEDDED
+#include "sg_embedded_rom.h"
+#endif
 
 /* Interface : anglais par défaut ; français avec -DGM0_FR (CMake -DGM0_FR=ON).
  * Les traces de débogage étiquetées [xxx] restent en français. */
@@ -84,8 +88,8 @@ static const char *em_save_key(const char *path) {
 
 /* Le tampon d'écran doit contenir la plus grande des deux cibles
  * (160x128 META, 220x176 Pokitto) ; SCR_W/SCR_H suivent la cible. */
-#define MAX_SCREEN_W 220u
-#define MAX_SCREEN_H 176u
+#define MAX_SCREEN_W 256u
+#define MAX_SCREEN_H 192u
 
 static uint8_t  flash[FLASH_SIZE];
 static uint8_t  sram[SRAM_SIZE];
@@ -246,6 +250,11 @@ static uint32_t maxFrames;
 
 #define TGT_META    0
 #define TGT_POKITTO 1
+#define TGT_SG1000 2
+static sg1000_t sgMachine;
+static uint8_t sgButtons;
+static uint64_t sgAudioSamples;
+static double sgAudioBase;
 static int emuTarget = TGT_META;   /* fixé par --target ou détection */
 static int targetForced;           /* --target explicite */
 
@@ -277,9 +286,11 @@ static inline void nvm_access(uint32_t a) { flashWaits += nvm_miss(a); }
 
 static double pk_core_hz(void); /* fréquence du cœur telle que configurée */
 static double ticks_per_sec(void) {
+    if (emuTarget == TGT_SG1000) return 3579545.0;
     return emuTarget == TGT_POKITTO ? pk_core_hz() : emuTicksPerSec;
 }
 static uint32_t frame_ticks(void) {
+    if (emuTarget == TGT_SG1000) return 59736;
     return (uint32_t)(ticks_per_sec() / 59.7275 + 0.5);
 }
 
@@ -513,8 +524,7 @@ static void audio_flush_pending(void) {
     __atomic_store_n(&aqP.end, n, __ATOMIC_RELEASE);
 }
 /* nouveau niveau de sortie, maintenant (temps émulé) */
-static void audio_level(int16_t v) {
-    double t = emu_clock();
+static void audio_level_at(double t, int16_t v) {
     aqP.levels++;
     /* écritures bit à bit d'un même échantillon (~10 cycles d'écart) :
      * seule la valeur stable part dans la file */
@@ -522,6 +532,7 @@ static void audio_level(int16_t v) {
     audio_flush_pending();
     aqPendValid = 1; aqPendVal = v; aqPendTime = t;
 }
+static void audio_level(int16_t v) { audio_level_at(emu_clock(), v); }
 /* fin de frame : publie le niveau retenu (rafale terminée) et l'horloge —
  * le consommateur avance même sans nouveau niveau (silence, valeur tenue) */
 static void audio_frame(void) {
@@ -1390,7 +1401,7 @@ static int zip_load_card(const uint8_t *data, size_t len) {
      * que reset_machine va libérer (sd_unload) */
     static uint8_t **datas = 0;
     if (!datas) datas = malloc(sizeof(uint8_t *) * 256);
-    int fwb = -1, fpop = -1;
+    int fwb = -1, fpop = -1, fsg = -1;
     for (int i = 0; i < n; i++) {
         datas[i] = zip_entry_data(&ents[i]);
         if (!datas[i]) { /* entrée illisible : retirée de la liste */
@@ -1400,9 +1411,11 @@ static int zip_load_card(const uint8_t *data, size_t len) {
         size_t l = strlen(ents[i].name);
         if (fwb < 0 && l > 4 && strcasecmp(ents[i].name + l - 4, ".bin") == 0) fwb = i;
         if (fpop < 0 && l > 4 && strcasecmp(ents[i].name + l - 4, ".pop") == 0) fpop = i;
+        if (fsg < 0 && l > 3 && strcasecmp(ents[i].name + l - 3, ".sg") == 0) fsg = i;
     }
     /* Pokitto : jeux distribués en .pop (conteneur du loader) + assets */
     if (fwb < 0) fwb = fpop;
+    if (fwb < 0) fwb = fsg;
     /* PAS d'aplatissement : les jeux ouvrent leurs assets avec le préfixe
     * de leur dossier (PICOMON/MUSICS/...), comme dans le dossier posé
     * à la racine de la carte ; l'ancien retrait du préfixe tuait la
@@ -4557,7 +4570,7 @@ static const char *filter_name(int f) {
  * pixels sont déjà en RVB565 natif, pas de permutation. */
 static inline uint32_t rgb565_argb(uint16_t p) {
     uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
-    if (emuTarget == TGT_POKITTO) { uint32_t t = r; r = b; b = t; }
+    if (emuTarget != TGT_META) { uint32_t t = r; r = b; b = t; }
     return 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
 }
 /* la même couleur à k % d'intensité, canal par canal */
@@ -4969,6 +4982,7 @@ static uint8_t key_bit(SDL_Keycode sym) {
 }
 
 static void btn_press(uint8_t mask) {
+    if (emuTarget == TGT_SG1000) { sgButtons |= mask; return; }
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 1); return; }
     /* buttonData reste toujours en ordre lib ; la conversion (pad lu à
      * 24 MHz) se fait à la réponse, cf. sercom4_write */
@@ -4978,6 +4992,7 @@ static void btn_press(uint8_t mask) {
 }
 
 static void btn_release(uint8_t mask) {
+    if (emuTarget == TGT_SG1000) { sgButtons &= (uint8_t)~mask; return; }
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 0); return; }
     buttonData |= mask;
     if (mask & BTN_HOME) homeHeld = 0;
@@ -5065,6 +5080,7 @@ static double rawEmuMsTotal, rawWallMsTotal; /* cumuls sur tout le run (ligne [b
 static char titleBuf[1200]; /* dernier titre construit (HUD wasm) */
 static char hudTitle[1240]; /* titre de la fenêtre native : jeu + % */
 static int titlePct;      /* dernier % (HUD wasm) */
+static int titleRawPct;
 
 /* décharge la carte SD courante (image ou image FAT d'un répertoire) */
 static void sd_unload(void) {
@@ -5168,7 +5184,49 @@ static void fw_strip_container(const uint8_t **data, size_t *len) {
     }
 }
 
+static void sg_row(void *ctx,unsigned y,const uint8_t *row) {
+    (void)ctx;
+    for(unsigned x=0;x<SG_WIDTH;x++) {
+        uint32_t rgb=sg1000_palette[row[x]&15];
+        pix[y*SG_WIDTH+x]=(uint16_t)(((rgb>>8)&0xf800)|((rgb>>5)&0x07e0)|((rgb>>3)&0x001f));
+    }
+}
+static void sg_frame_audio(void *ctx) {
+    (void)ctx;
+    uint8_t samples[512];
+    unsigned n=(sgMachine.audio_head-sgMachine.audio_tail)&511;
+    sg1000_audio_render(&sgMachine,samples,n);
+    for(unsigned i=0;i<n;i++) {
+        double t=sgAudioBase+(double)(++sgAudioSamples)/22050.0;
+        audio_level_at(t,(int16_t)(((int)samples[i]-128)*256));
+    }
+}
+static int is_sg_path(const char *name) {
+    const char *ext=strrchr(name,'.');
+    return ext&&strcasecmp(ext,".sg")==0;
+}
+static void load_sg_data(const uint8_t *data,size_t len,const char *display) {
+    if(!len||len>49152) { fprintf(stderr,"Unsupported SG-1000 cartridge size\n");fwLoaded=0;return; }
+    uint8_t *copy=malloc(len);
+    if(!copy) { fwLoaded=0;return; }
+    memcpy(copy,data,len);
+    sgAudioBase=emu_clock();audio_rebase();tickCount=0;
+    free(fwData);fwData=copy;fwLen=len;
+    emuTarget=TGT_SG1000;
+    snprintf(fwPath,sizeof(fwPath),"%s",display);
+    const char *base=strrchr(fwPath,'/');fwName=base?base+1:fwPath;
+    sgButtons=0;sgAudioSamples=0;
+    sg1000_init(&sgMachine,fwData,fwLen);
+    sgMachine.row=sg_row;sgMachine.frame=sg_frame_audio;sg1000_audio_rate(&sgMachine,22050);
+    memset(pix,0,sizeof(pix));
+    fwLoaded=1;pk_screen_reconfig();
+    osd_push("%s : %s",TR("CHARGE","LOADED"),fwName);
+}
+
 static void load_firmware_data(const uint8_t *data, size_t len, const char *display) {
+    if(is_sg_path(display)||(targetForced&&emuTarget==TGT_SG1000)) {
+        load_sg_data(data,len,display);return;
+    }
     const uint8_t *payload = data;
     size_t plen = len;
     fw_strip_container(&payload, &plen);
@@ -5213,6 +5271,9 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
 static void fw_restart(void) {
     if (!fwData) return;
     char name[sizeof(fwPath)];snprintf(name,sizeof(name),"%s",fwPath);
+    if(emuTarget==TGT_SG1000) {
+        load_sg_data(fwData,fwLen,name);audio_start();machineEpoch++;refresh_title();return;
+    }
     load_firmware_data(fwData, fwLen, name);
     if (emuTarget == TGT_META) boot_vectors();
     audio_start();
@@ -5272,6 +5333,7 @@ static void load_sd_from_path(const char *p) {
 }
 
 static void boot_vectors(void) {
+    if(emuTarget==TGT_SG1000)return;
     if (emuTarget == TGT_POKITTO) {
         /* vecteurs déjà chargés par pk_reset_core */
         fprintf(stderr, "Pokitto: SP=%08x PC=%08x\n", regs[13], regs[15]);
@@ -5292,7 +5354,7 @@ static void boot_vectors(void) {
 static void refresh_title(void) {
     char title[1200];
     if (fwLoaded) snprintf(title, sizeof(title), "%.900s", fwName);
-    else snprintf(title, sizeof(title), TR("déposez un firmware .bin", "drop a .bin firmware"));
+    else snprintf(title, sizeof(title), TR("déposez un jeu .bin/.pop/.sg", "drop a .bin/.pop/.sg game"));
     SDL_SetWindowTitle(emuWin, title);
 }
 
@@ -5310,8 +5372,8 @@ static void audio_start(void) {
 
 /* dimensions SDL selon la cible (appelé aussi au changement de cible) */
 static void pk_screen_reconfig(void) {
-    SCR_W = emuTarget == TGT_POKITTO ? 220 : 160;
-    SCR_H = emuTarget == TGT_POKITTO ? 176 : 128;
+    SCR_W = emuTarget == TGT_SG1000 ? 256 : emuTarget == TGT_POKITTO ? 220 : 160;
+    SCR_H = emuTarget == TGT_SG1000 ? 192 : emuTarget == TGT_POKITTO ? 176 : 128;
     if (!emuRen) return;
     SDL_SetWindowSize(emuWin, (int)(SCR_W * 2), (int)(SCR_H * 2));
     scale_apply();
@@ -5413,9 +5475,13 @@ static int sdl_init_all(void) {
 
 /* boucle d'événements ; renvoie 0 pour quitter */
 static int poll_events(void) {
+    static uint8_t heldKeys[SDL_NUM_SCANCODES];
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) return 0;
+#ifndef __EMSCRIPTEN__
+        else if(ev.type==SDL_KEYDOWN&&ev.key.keysym.sym==SDLK_ESCAPE)return 0;
+#endif
 #ifndef __EMSCRIPTEN__
         else if (ev.type == SDL_DROPFILE) { /* le navigateur gère ses drops */
             char *fp = ev.drop.file;
@@ -5475,11 +5541,22 @@ static int poll_events(void) {
             osd_push("%s", dispFull ? TR("PLEIN ECRAN", "FULLSCREEN") : TR("FENETRE", "WINDOWED"));
         }
         else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
-            uint8_t m = key_bit(ev.key.keysym.sym);
+            SDL_Scancode sc=ev.key.keysym.scancode;
+            uint8_t m=key_bit(ev.key.keysym.sym);
+            if(ev.type==SDL_KEYDOWN&&ev.key.keysym.sym==SDLK_8&&(ev.key.keysym.mod&KMOD_SHIFT))m=BTN_HOME;
+            if(sc>SDL_SCANCODE_UNKNOWN&&sc<SDL_NUM_SCANCODES) {
+                if(ev.type==SDL_KEYDOWN)heldKeys[sc]=m;
+                else { if(heldKeys[sc])m=heldKeys[sc];heldKeys[sc]=0; }
+            }
             if (m) {
                 if (ev.type == SDL_KEYDOWN) btn_press(m);
                 else btn_release(m);
             }
+        }
+        else if(ev.type==SDL_WINDOWEVENT&&ev.window.event==SDL_WINDOWEVENT_FOCUS_LOST) {
+            uint8_t m=0;
+            for(unsigned i=0;i<SDL_NUM_SCANCODES;i++){m|=heldKeys[i];heldKeys[i]=0;}
+            btn_release(m);
         }
         else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
             if (!pad && SDL_IsGameController(ev.cdevice.which)) {
@@ -5588,15 +5665,10 @@ static void update_title_pct(void) {
         if (pct < 0) pct = 0;
         /* PAS d'écrêtage à 100 : un dépassement (EMU_NOPACE, vieux binaire
          * face aux firmwares récents) doit se VOIR dans le titre. */
-        if (pct > 999) pct = 999;
         titlePct = pct;
+        titleRawPct = raw;
         snprintf(titleBuf, sizeof(titleBuf), "%.900s", fwName);
-        if (raw > pct + 5 && raw > 100) {
-            if (raw > 9999) raw = 9999;
-            snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %% - %d %%", fwName, pct, raw);
-        } else {
-            snprintf(hudTitle, sizeof(hudTitle), "%.900s — %d %%", fwName, pct);
-        }
+        snprintf(hudTitle, sizeof(hudTitle), TR("%.900s — actuel %d %% | possible %d %%", "%.900s — current %d %% | possible %d %%"),fwName,pct,raw);
     } else {
         snprintf(titleBuf, sizeof(titleBuf), TR("déposez un firmware .bin", "drop a .bin firmware"));
         snprintf(hudTitle, sizeof(hudTitle), "%s", titleBuf);
@@ -5641,6 +5713,18 @@ static void step_batch(uint32_t target) {
 }
 
 static void run_emulated_frame(void) {
+    if(emuTarget==TGT_SG1000) {
+        uint8_t b=((sgButtons&BTN_UP)?1:0)|((sgButtons&BTN_DOWN)?2:0)|
+            ((sgButtons&BTN_LEFT)?4:0)|((sgButtons&BTN_RIGHT)?8:0)|
+            ((sgButtons&(BTN_A|BTN_MENU))?16:0)|((sgButtons&BTN_B)?32:0);
+        sg1000_buttons(&sgMachine,0,b);sg1000_pause(&sgMachine,!!(sgButtons&BTN_HOME));
+        unsigned target=sgMachine.frames+1;
+        while(sgMachine.frames<target&&!sgMachine.cpu.fault)sg1000_step(&sgMachine);
+        tickCount=(uint32_t)sgMachine.cpu.cycles;
+        audio_frame();
+        if(sgMachine.cpu.fault) { fprintf(stderr,"SG-1000 CPU fault at %04x\n",sgMachine.cpu.pc);fwLoaded=0; }
+        return;
+    }
     uint32_t target = emu_nextFrameTick;
     step_batch(target);
     /* re-base sur tickCount : l'ancien `+= frame_ticks()` laissait
@@ -5663,6 +5747,7 @@ static void frame_epoch_sync(void) {
     emu_nextFrameTick = tickCount + frame_ticks();
     titleTick = tickCount;
     titleMs = SDL_GetTicks();
+    rawEmuMs=rawWallMs=0;
 }
 
 /* n frames émulées ; la perf brute (titre « brut N % », ligne [bench])
@@ -5753,13 +5838,16 @@ int main(int argc, char **argv) {
 #elif !defined(__EMSCRIPTEN__)
 /* ------------------------------------------------------------ natif --- */
 
+
 int main(int argc, char **argv) {
-#ifndef GM0_EMBEDDED_GAME
     if (argc < 2)
+#if !defined(GM0_EMBEDDED_GAME) && !defined(GM0_SG_EMBEDDED)
         fprintf(stderr, TR("gm0 : lancé sans firmware — déposez un .bin "
                         "dans la fenêtre (carte SD = son répertoire).\n",
                         "gm0: started without a firmware — drop a .bin "
                         "into the window (SD card = its directory).\n"));
+#else
+        (void)argc;
 #endif
     memset(sram, 0xff, SRAM_SIZE); /* comme le TS (constructeur Atsamd21) */
     if (getenv("EMU_TARGET")) {
@@ -5795,7 +5883,8 @@ int main(int argc, char **argv) {
             ++i;
             if (strcasecmp(argv[i], "pokitto") == 0) emuTarget = TGT_POKITTO;
             else if (strcasecmp(argv[i], "meta") == 0) emuTarget = TGT_META;
-            else { fprintf(stderr, TR("cible inconnue : %s (meta|pokitto)\n", "unknown target: %s (meta|pokitto)\n"), argv[i]); return 1; }
+            else if (strcasecmp(argv[i], "sg1000") == 0) emuTarget = TGT_SG1000;
+            else { fprintf(stderr, TR("cible inconnue : %s (meta|pokitto|sg1000)\n", "unknown target: %s (meta|pokitto|sg1000)\n"), argv[i]); return 1; }
             targetForced = 1;
         } else if (strcmp(argv[i], "--out-img") == 0 && i + 1 < argc) {
             snprintf(outImgPath, sizeof(outImgPath), "%s", argv[++i]);
@@ -5827,6 +5916,9 @@ int main(int argc, char **argv) {
             load_firmware_data(gm0_bundle_data, sizeof(gm0_bundle_data), gm0_bundle_name);
     }
 #endif
+#ifdef GM0_SG_EMBEDDED
+    if(!fwLoaded&&!sd_explicit)load_sg_data(sg_embedded_rom,sizeof(sg_embedded_rom),sg_embedded_name);
+#endif
     if (fwLoaded) boot_vectors();
     fwNeedsBoot = 0;
 
@@ -5835,7 +5927,6 @@ int main(int argc, char **argv) {
     Uint32 frame = 0;
     int running = 1;
     uint64_t perfFreq = SDL_GetPerformanceFrequency();
-    const uint64_t frameDur = (uint64_t)((double)perfFreq / 59.7275 + 0.5); /* 1/59,7 s */
     uint64_t nextPace = 0; /* échéance temps réel de la prochaine frame */
     titleMs = SDL_GetTicks();
     titleTick = tickCount;
@@ -5880,6 +5971,7 @@ int main(int argc, char **argv) {
         static int noPace = -1; /* EMU_NOPACE=1 : vitesse brute (mesure) */
         if (noPace < 0) noPace = getenv("EMU_NOPACE") ? 1 : 0;
         if (!noPace) {
+            uint64_t frameDur=(uint64_t)((double)perfFreq*frame_ticks()/ticks_per_sec()+0.5);
             uint64_t now = SDL_GetPerformanceCounter();
             if (nextPace == 0) nextPace = now + frameDur;
             nextPace += frameDur;
@@ -5930,7 +6022,7 @@ int main(int argc, char **argv) {
 
 static int vfile_is_game(const VFile *v) {
     size_t l = strlen(v->path);
-    return l > 4 && (strcasecmp(v->path + l - 4, ".bin") == 0 || strcasecmp(v->path + l - 4, ".pop") == 0);
+    return is_sg_path(v->path)||(l>4&&(strcasecmp(v->path+l-4,".bin")==0||strcasecmp(v->path+l-4,".pop")==0));
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -6087,7 +6179,7 @@ static void wasm_loop(void) {
      * (pas tronqué) : un rAF à 60,0 Hz exact donne 16,68 ms < frameMs, la
      * troncature restait à due=0 pour toujours (machine à l'arrêt). */
     double now = emscripten_get_now();
-    const double frameMs = 16.743;
+    const double frameMs = (double)frame_ticks()*1000.0/ticks_per_sec();
     if (wasmLastFrame == 0) wasmLastFrame = now;
     int due = (int)((now - wasmLastFrame) / frameMs + 0.5);
     if (due > 4) { due = 1; wasmLastFrame = now; }
@@ -6103,11 +6195,13 @@ static void wasm_loop(void) {
     if (fwLoaded && titleMs != hudMs && titleBuf[0]) {
         hudMs = titleMs;
         EM_ASM({ const p = document.getElementById('pct');
-                 if (p) { p.textContent = $0;   /* $0 = int */
+                 if (p) { p.textContent = $0 + ' % | ' + $2 + ' %';
+                          p.title = 'Current | possible';
                           p.style.display = 'block'; }
                  const g = document.getElementById('gamename');
                  if (g) g.textContent = UTF8ToString($1);
-               }, titlePct, fwName);
+                 document.title = UTF8ToString($3);
+               }, titlePct, fwName, titleRawPct, hudTitle);
     }
     blit(emuRen);
 }

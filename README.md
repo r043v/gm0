@@ -11,6 +11,17 @@ target is detected from the firmware image (initial stack pointer in SAMD21
 or LPC SRAM) and can be forced with `--target`.  The same C core is compiled
 natively and to WebAssembly.
 
+SG-1000 `.sg` files execute directly in the Z80/TMS9918A/SN76489 core,
+without a recompiled META/Pokitto firmware. Run `gm0 game.sg`; F5, F8, F10,
+F11 and gamepads use the shared frontend. Controls: arrows, Space=A,
+Ctrl=B, Enter=Start (button 1), `*`=Pause (NMI); keypad `*` and Shift+8 also
+work. Only unbanked cartridges up to 48 KiB are supported; PAL and extensions
+are not supported.
+
+Embed a cartridge with `-DGM0_BUNDLE=/path/game.sg` (the packaging alias
+`-DGM0_SG_ROM=/path/game.sg` is also supported), or use
+`-DGM0_WEB_GAME=/path/game.sg` for a standalone HTML.
+
 - **CPU** — ARMv6-M Thumb interpreter, cycle-counted per the Cortex-M0+
   timing tables, including NVM cache misses on the META.
 - **META peripherals** — PORT, SERCOM4/5 (ST7735 display, SPI SD card,
@@ -28,6 +39,7 @@ natively and to WebAssembly.
 |---|---|---|
 | Gamebuino META | Playable | lapinou (bare-metal drivers), Celeste, Cats & Coins, Picomon, Yatzy, Reuben Quest, site loaders, converted Game Boy firmwares (DMA/SPI protocols 0.4.0+) |
 | Pokitto | Playable | Pandemic, Galaxy Fighters (`.pop` with music streamed from the card) |
+| SG-1000 (`z80`) | Experimental | synthetic core/input tests; unbanked cartridges only |
 | WebAssembly | Playable | same core; served page or single self-contained HTML file |
 
 The repository ships no games or firmware.
@@ -71,8 +83,9 @@ way.  `make win WIN_STATIC=OFF` keeps SDL2 in a separate `SDL2.dll`.
 
 ### Embedded games
 
-`main` runs META/Pokitto firmwares. Direct SG-1000 cartridge support lives on
-[`z80`](https://github.com/r043v/gm0/tree/z80).
+This `z80` branch adds direct SG-1000 cartridge emulation to the shared
+META/Pokitto frontend. [`main`](https://github.com/r043v/gm0/tree/main) keeps
+META/Pokitto firmware emulation and generic game bundles.
 
 Build a native executable that starts your game without arguments:
 
@@ -81,7 +94,7 @@ cmake -G Ninja -S . -B build-bundle -DGM0_BUNDLE=/path/game.zip
 cmake --build build-bundle
 ```
 
-`GM0_BUNDLE` accepts a `.bin` or `.pop` firmware, or a ZIP containing the
+`GM0_BUNDLE` accepts a `.sg` cartridge, a `.bin` or `.pop` firmware, or a ZIP containing the
 firmware and its SD assets (including any ROM needed by the firmware).
 Use a ZIP for games that read files from the card. A raw Game Boy ROM must
 first be converted to a META/Pokitto firmware with m0boy. An explicit game
@@ -107,9 +120,9 @@ gm0 [firmware] [card] [options]
 
 | Argument | Meaning |
 |---|---|
-| `firmware` | `.bin`, or `.pop` (Pokitto) |
+| `firmware` | `.bin`, `.pop` (Pokitto), or `.sg` (SG-1000) |
 | `card` | `.img` raw image, `.zip` (full card), or a folder (FAT16 built on the fly). On the META the card defaults to the firmware's folder. |
-| `--target meta\|pokitto` | force the target |
+| `--target meta\|pokitto\|sg1000` | force the target |
 | `--frames N` | run N frames, then exit |
 | `--shot file.ppm` | write a screenshot at exit |
 | `--wav file.wav` | record the session audio (48 kHz, rendered from emulated time) |
@@ -287,6 +300,9 @@ chip-select pull-ups), META binaries, and the official
 
 Ecosystems: [gamebuino.com](https://gamebuino.com) for the META,
 [PokittoLib](https://github.com/pokitto/PokittoLib) for the Pokitto.
+
+The SG-1000 core comes from [m0boy](https://github.com/r043v/m0boy) and retains
+its [MIT license](cores/sg1000/LICENSE).
 
 ## License
 

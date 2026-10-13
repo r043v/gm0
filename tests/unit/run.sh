@@ -10,7 +10,7 @@ sdl=$(pkg-config --cflags --libs sdl2 2>/dev/null || echo "-lSDL2")
 for t in "$here"/test_*.c; do
     name=$(basename "$t" .c)
     # -O0 : tests de logique, pas de performance ; warnings du cœur tolérés
-    "$cc" -O0 -g -o "$out/$name" "$t" $sdl -lz -lm
+    "$cc" -O0 -g -o "$out/$name" "$t" "$here"/../../cores/sg1000/*.c $sdl -lz -lm
     "$out/$name"
 done
 # le build sans OSD doit compiler sans avertissement

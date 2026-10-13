@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>gm0 — Gamebuino META / Pokitto</title>
+<title>gm0 — META / Pokitto / SG-1000</title>
 <style>
   /* fond sur html seulement : propagé au viewport, peint sous les éléments
    * z-index négatifs (le % derrière le canvas reste visible) */
@@ -78,25 +78,25 @@
 <body>
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
 <div id="overlay">
-  <h1><span data-fr="Gamebuino META / Pokitto — émulateur (wasm)">Gamebuino META / Pokitto — emulator (wasm)</span></h1>
+  <h1><span data-fr="META / Pokitto / SG-1000 — émulateur (wasm)">META / Pokitto / SG-1000 — emulator (wasm)</span></h1>
   <div data-fr="… ou déposez-les directement ici.">… or drop them straight here.</div>
-  <small data-fr="La cible (META ou Pokitto) est détectée automatiquement — .bin,
-         .pop (loader Pokitto), .zip ou dossier acceptés. Un .zip = carte SD
+  <small data-fr="La cible (META, Pokitto ou SG-1000) est détectée automatiquement — .bin,
+         .pop (loader Pokitto), .sg, .zip ou dossier acceptés. Un .zip = carte SD
          complète (son premier .bin lance le jeu — bouton « 🎮 Jeux » pour
          changer). META : flèches/ZQSD, Entrée=MENU, Espace=A, Ctrl=B,
-         *=HOME.
+         *=HOME. SG-1000 : flèches, Entrée=Start, *=Pause, Espace=A, Ctrl=B.
          F8=filtres, F10=échelle, F11=plein écran. Pokitto : IJKL/flèches,
-         A=« a », B=« s », C=« d » — ou manette.">The target (META or Pokitto) is auto-detected — .bin,
-         .pop (Pokitto loader), .zip or folder accepted. A .zip = full SD
+         A=« a », B=« s », C=« d » — ou manette.">The target (META, Pokitto or SG-1000) is auto-detected — .bin,
+         .pop (Pokitto loader), .sg, .zip or folder accepted. A .zip = full SD
          card (its first .bin boots the game — the « 🎮 Games » button
          switches). META: arrows/ZQSD/WASD, Enter=MENU, Space=A, Ctrl=B,
-         *=HOME.
+         *=HOME. SG-1000: arrows, Enter=Start, *=Pause, Space=A, Ctrl=B.
          F8=filters, F10=scale, F11=fullscreen. Pokitto: IJKL/arrows,
          A=“a”, B=“s”, C=“d” — or gamepad.</small>
 </div>
 <div id="pct"></div>
 <div id="dock">
-  <button id="pickFiles" title="Game: .bin, .pop or .zip" data-fr-title="Jeu : .bin, .pop ou .zip" aria-label="Open a file">📄</button>
+  <button id="pickFiles" title="Game: .sg, .bin, .pop or .zip" data-fr-title="Jeu : .sg, .bin, .pop ou .zip" aria-label="Open a file">📄</button>
   <button id="pickFolder" title="A game folder (bin + rom + save)" data-fr-title="Un répertoire de jeu (bin + rom + sauvegarde)" aria-label="Open a folder">📁</button>
   <div class="sep"></div>
   <button id="pauseBtn" title="Pause / resume" data-fr-title="Pause / reprise" disabled>⏸</button>
@@ -187,8 +187,8 @@ async function loadSet(items) {
   if (roots.size === 1 && items.some(it => it.path.includes('/'))) {
     items = items.map(it => ({ ...it, path: it.path.split('/').slice(1).join('/') }));
   }
-  const bins = items.filter(it => /\.(bin|pop)$/i.test(it.path));
-  const rest = items.filter(it => !/\.(bin|pop)$/i.test(it.path) || !bins.includes(it));
+  const bins = items.filter(it => /\.(bin|pop|sg)$/i.test(it.path));
+  const rest = items.filter(it => !/\.(bin|pop|sg)$/i.test(it.path) || !bins.includes(it));
   // un .zip = carte SD complète (son premier .bin devient le firmware)
   const zips = items.filter(it => /\.zip$/i.test(it.path));
   if (zips.length) {
@@ -206,7 +206,7 @@ async function loadSet(items) {
   const firmwareBin = bins.length === 1 ? bins[0] : bins.find(b => !b.path.includes('/'));
 
   if (!firmwareBin && bins.length === 0) {
-    setStatus(T('jeu .bin/.pop manquant — carte ignorée', 'missing .bin/.pop game — card ignored'));
+    setStatus(T('jeu .bin/.pop/.sg manquant — carte ignorée', 'missing .bin/.pop/.sg game — card ignored'));
     if (items.length === 1 && /\.img$/i.test(items[0].path)) {
       cCardImage(new Uint8Array(await items[0].file.arrayBuffer()));
       setStatus(T('carte SD chargée (image) — déposez un firmware .bin', 'SD card loaded (image) — drop a .bin firmware'));
@@ -321,7 +321,7 @@ async function openLightbox() {
   }
   for (let i = 0; i < names.length; i++) {
     const fullPath = new TextDecoder().decode(names[i]).replace(/\0.*$/, '');
-    const base = fullPath.split('/').pop().replace(/\.(bin|pop)$/i, '');
+    const base = fullPath.split('/').pop().replace(/\.(bin|pop|sg)$/i, '');
     const folder = fullPath.includes('/') ? fullPath.split('/')[0] : base;
     const div = document.createElement('div');
     div.className = 'game';
