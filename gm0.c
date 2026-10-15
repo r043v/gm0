@@ -2960,14 +2960,38 @@ static int      spiDmaCh = -1;   /* canal SERCOM4-TX en cours, -1 = aucun */
  * spiOnly ; toute écriture qui change TC, SysTick ou le canal SPI le retire) */
 static int      spiOnly;
 static uint32_t tcDeadline;
-/* durée d'un octet SPI = 8 bits × 2(BAUD+1) / 48 MHz = (BAUD+1)/3 µs, soit
- * (BAUD+1) × ticks/µs / 3 ticks — non entier (6,67 ticks à 24 MHz dans le
- * domaine 20 M) : l'arrondi entier à 7 ralentissait l'écran de 5 %, assez
- * pour qu'une trame pleine (40 960 octets, 13,7 ms) déborde de la frame et
- * affame l'audio (Gargoyle's Quest).  Accumulateur en tiers de tick. */
+/* durée d'un octet SPI = 8 bits × 2(BAUD+1) / horloge du SERCOM4, soit
+ * (BAUD+1) × ticks/µs / 3 ticks à 48 MHz — non entier (6,67 ticks à
+ * 24 MHz dans le domaine 20 M) : l'arrondi entier à 7 ralentissait l'écran
+ * de 5 %, assez pour qu'une trame pleine (40 960 octets, 13,7 ms) déborde
+ * de la frame et affame l'audio (Gargoyle's Quest).  Accumulateur en tiers
+ * de tick. */
 static uint32_t spiBeatAcc;      /* tiers de tick accumulés */
-static uint32_t spiBeatTicks = 20; /* tiers de tick par beat = (BAUD+1) × ticks/µs */
-static uint32_t spiBaud;         /* SERCOM4 BAUD (f = 48 MHz / (2×(b+1))) */
+static uint32_t spiBeatTicks = 20; /* tiers de tick par beat */
+static uint32_t spiBaud;         /* SERCOM4 BAUD (f = horloge / (2×(b+1))) */
+/* Horloge du SERCOM4 (GCLK6) : le DFLL48M, ou le FDPLL96M que le firmware
+ * monte pour l'écran — 96 MHz pour 48, 72 pour 36 (meta_clock.cpp, les
+ * réglages sont dans gbl_board.h).  Sans ce modèle les octets SPI gardaient
+ * la cadence du DFLL48M (écran deux fois plus lent que sur la console) et
+ * le pavé était relu dans l'ordre « 24 MHz » : à 12 MHz depuis la PLL le
+ * BAUD vaut 3, pas 1. */
+static uint8_t  dpllOn;               /* SYSCTRL DPLLCTRLA.ENABLE (bit 1) */
+static uint16_t dpllLdr = 95;         /* SYSCTRL DPLLRATIO.LDR (12 bits) : sortie = (LDR+1) MHz */
+static uint8_t  gclk6Pll;             /* GENCTRL de GCLK6 : source FDPLL96M */
+static uint32_t gclkGenCtrl[16];      /* dernier GENCTRL écrit, par générateur */
+static uint32_t sercom4_hz(void) {
+    return gclk6Pll && dpllOn ? (uint32_t)(dpllLdr + 1u) * 1000000u : 48000000u;
+}
+/* Durée d'un octet SPI (8 bits × 2(BAUD+1) / horloge), en ticks puis en
+ * tiers de tick (accumulateur du cadencement DMA). */
+static uint32_t spi_byte_ticks(void) {
+    uint32_t hz = sercom4_hz();
+    return (uint32_t)(((uint64_t)16u * ((spiBaud & 0xffu) + 1u) * emuTicksPerUs * 1000000u + hz / 2u) / hz);
+}
+static uint32_t spi_byte_thirds(void) {
+    uint32_t hz = sercom4_hz();
+    return (uint32_t)(((uint64_t)48u * ((spiBaud & 0xffu) + 1u) * emuTicksPerUs * 1000000u + hz / 2u) / hz);
+}
 static uint8_t  dmaTrig[DMAC_CHANNELS], dmaOn[DMAC_CHANNELS];
 static uint8_t  dmacIntFlag[DMAC_CHANNELS]; /* INTFLAG par canal : TCMPL=0x02, SUSP=0x04 */
 static uint8_t  dmacIntEn[DMAC_CHANNELS];   /* CHINTENSET par canal (lecture) */
@@ -3439,7 +3463,13 @@ static uint32_t periph_read(uint32_t a, uint32_t m) {
     uint32_t r = a & 0x3fcu;
     switch (APB_PERIPH(a)) {
     case P_SYSCTRL:
-        return r == 0x0c ? 0b11010010 : 0;                  /* PCLKSR : tout prêt */
+        if (r == 0x0c)                                      /* PCLKSR : tout prêt */
+            return 0b11010010u | (dpllOn ? (1u << 9) | (1u << 10) : 0u); /* DPLLLCKF/DPLLLCKR */
+        if (r == 0x50) {                                    /* DPLLSTATUS : LOCK|CLKRDY */
+            if (ENVFLAG("EMU_SYSCTRL_DEBUG")) fprintf(stderr, "[sysctrl] r050 -> %d\n", dpllOn);
+            return dpllOn ? 3u : 0u;
+        }
+        return 0;
     case P_NVMCTRL:
         switch (r) {
         case 0x04: return nvmCtrlB;                         /* CTRLB */
@@ -3581,7 +3611,7 @@ static void dmac_rearm_from(uint32_t done_ch) {
  * 8 bits @ f/2(BAUD+1), en tiers de tick (3 Mo/s à BAUD=0) ;
  * EMU_SPI_INSTANT : un octet par tick */
 static void spi_arm(uint32_t ch) {
-    spiBeatTicks = ((spiBaud & 0xFFu) + 1) * emuTicksPerUs;
+    spiBeatTicks = spi_byte_thirds();
     if (spiBeatTicks < 3 || ENVFLAG("EMU_SPI_INSTANT")) spiBeatTicks = 3;
     spiBeatAcc = 0;
     spiDmaCh = (int)ch; spiOnly = 0;
@@ -3656,9 +3686,12 @@ static void dmac_chid_chctrla_write(uint32_t ch, uint32_t v) {
         dma_load(ch, dmac_desc);
         if (dmaOn[ch]) {
             spi_arm(ch);
-            { static int n; if (n++ < 6)
-                fprintf(stderr, "[dma spi] ch=%u ctrl=%04x src=%x dst=%x n=%u beats=%u t\n",
-                        (unsigned)ch, dmaCtrl[ch], dmaSrc[ch], dmaDst[ch], dmaCnt[ch], spiBeatTicks); }
+            { static uint32_t last; /* une ligne par changement de cadence */
+              if (spiBeatTicks != last) {
+                last = spiBeatTicks;
+                fprintf(stderr, "[dma spi] ch=%u ctrl=%04x src=%x dst=%x n=%u hz=%u beats=%u\n",
+                        (unsigned)ch, dmaCtrl[ch], dmaSrc[ch], dmaDst[ch], dmaCnt[ch],
+                        sercom4_hz(), spiBeatTicks); } }
             if (ENVFLAG("EMU_CHUNK_DEBUG") && dmaCnt[ch] == 320) {
                 static int cn;
                 uint32_t base = dmaSrc[ch] - 320; /* SRCINC : base du bloc */
@@ -3777,13 +3810,29 @@ static void tc_write(int i, uint32_t r, uint32_t v, uint32_t m) {
 static void periph_write(uint32_t a, uint32_t v, uint32_t m) {
     uint32_t r = a & 0x3fcu;
     switch (APB_PERIPH(a)) {
+    case P_SYSCTRL:
+        /* FDPLL96M (meta_clock.cpp) : sortie = (LDR+1) × 1 MHz (référence
+         * GCLK5 à 1 MHz, DIVSEL=0) ; le verrouillage est instantané. */
+        if (ENVFLAG("EMU_SYSCTRL_DEBUG")) fprintf(stderr, "[sysctrl] w%03x=%08x m=%08x\n", r, v, m);
+        switch (r) {                                        /* CMSIS sysctrl.h */
+        case 0x44: if (m & 2u) dpllOn = (uint8_t)((v >> 1) & 1u); return;   /* DPLLCTRLA.ENABLE */
+        case 0x48: if (m & 0xfffu) dpllLdr = (uint16_t)(v & 0xfffu); return; /* DPLLRATIO.LDR */
+        }
+        return;
     case P_GCLK:
-        /* sans effet : la cadence des TC est dérivée de CTRLA/CC0, et le
-         * générateur vaut 48 MHz pour les configurations audio rencontrées
-         * (lib standard comme jeux maison) */
+        /* sans effet sur la cadence des TC (dérivée de CTRLA/CC0), mais le
+         * générateur 6 (SERCOM4) est suivi : au-delà de 24 MHz l'écran le
+         * fait venir du FDPLL96M. */
+        if (r == 0x04) {
+            uint32_t id = (v >> 8) & 0xfu, w = MERGE(gclkGenCtrl[id], v, m);
+            gclkGenCtrl[id] = w;
+            if (id == 6u) gclk6Pll = (w & (1u << 6)) != 0u && ((w >> 16) & 0x1fu) == 0x8u;
+        }
         if (!dbg()) return;
         if (r == 0x00 && (m >> 16) && dbgTc4Cfg < 16) { fprintf(stderr, "[gclk] CLKCTRL <- %x\n", v >> 16); dbgTc4Cfg++; }
-        if (r == 0x04 || r == 0x08) fprintf(stderr, "[gclk] %s <- %x\n", r == 0x04 ? "GENCTRL" : "GENDIV", v);
+        if (r == 0x04 || r == 0x08)
+            fprintf(stderr, "[gclk] %s <- %x%s\n", r == 0x04 ? "GENCTRL" : "GENDIV", v,
+                    r == 0x04 && ((v >> 8) & 0xfu) == 6u ? (gclk6Pll ? " (SERCOM4 sur FDPLL96M)" : " (SERCOM4 sur DFLL48M)") : "");
         return;
     case P_NVMCTRL:
         nvmctrl_write(r, v, m);
@@ -3893,10 +3942,12 @@ static void sercom4_write(uint8_t v) {
     if ((portB_out & (1u << 3)) == 0 || (portA_out & (1u << 25)) == 0) {
         /* boutons : PB03 (lib standard) ou PA25 (certains jeux maison
          * pilotent ce CS en direct — même registre à décalage).  L'ordre
-         * des bits dépend de la vitesse SPI de la lecture : 12 MHz
-         * (BAUD=1, jeux lib) = ordre lib ; 24 MHz (BAUD=0, ex. lapinou)
-         * = ordre historique des jeux maison. */
-        int order24 = (spiBaud & 0xffu) != 1u;
+         * des bits dépend de la vitesse SPI de la lecture : 12 MHz (jeux
+         * lib) = ordre lib ; au-delà (24 MHz, ex. lapinou) = ordre
+         * historique des jeux maison.  La vitesse se calcule depuis
+         * l'horloge du SERCOM4 : BAUD=1 ne veut 12 MHz qu'avec le
+         * DFLL48M, depuis la PLL (96 MHz) 12 MHz vaut BAUD=3. */
+        int order24 = sercom4_hz() / (2u * ((spiBaud & 0xffu) + 1u)) > 12000000u;
         static int orderForce = -1;
         if (orderForce < 0)
             orderForce = getenv("EMU_BTN_ORDER") && getenv("EMU_BTN_ORDER")[0] == 'l' ? 1 : 0;
@@ -3905,9 +3956,9 @@ static void sercom4_write(uint8_t v) {
         if (ENVFLAG("EMU_BTN_DEBUG") && buttonData != 0xffu) {
             static int bn;
             if (bn++ < 40)
-                fprintf(stderr, "[btnread] t=%u v=%02x boutons=%02x PB03=%d PA25=%d baud=%u\n",
+                fprintf(stderr, "[btnread] t=%u v=%02x boutons=%02x PB03=%d PA25=%d baud=%u ord=%d\n",
                         tickCount, v, buttonData, (portB_out >> 3) & 1,
-                        (portA_out >> 25) & 1, spiBaud & 0xFF);
+                        (portA_out >> 25) & 1, spiBaud & 0xFF, order24);
         }
     }
     if (!dmaBeatSkipSd) sd_byte(v);
@@ -3916,7 +3967,7 @@ static void sercom4_write(uint8_t v) {
         if (spiDmaWrite) done = now;
         else {
             uint32_t start = (int32_t)(spiLastDone - now) > 0 ? spiLastDone : now;
-            done = start + 16u * ((spiBaud & 0xffu) + 1u);
+            done = start + spi_byte_ticks();
         }
         spiPrevDone = spiLastDone;
         spiLastDone = done;
@@ -5120,6 +5171,7 @@ static void reset_core(void) {
     spiRxN = 0; spiLastDone = spiPrevDone = 0;
     dacData = 0;
     spiDmaCh = -1; spiBeatAcc = 0; spiBeatTicks = 20; spiBaud = 0;
+    dpllOn = 0; dpllLdr = 95; gclk6Pll = 0; memset(gclkGenCtrl, 0, sizeof gclkGenCtrl);
     memset(dmacIntFlag, 0, sizeof dmacIntFlag);
     timerFrom = spiFrom = timerDeadline = tickCount; spiOnly = 0;
     dacWrites = 0;

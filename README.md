@@ -208,7 +208,7 @@ Diagnostics are enabled through environment variables; the most useful:
 | `EMU_PROF=file` | per-address cycle profile written at exit |
 | `EMU_AUDIO_STATS=1` | audio producer/consumer statistics |
 | `EMU_FIXED_RTC=t`, `ADC_FIXED=1` | deterministic RTC and ADC |
-| `EMU_DEBUG=1`, `SD_DEBUG=1`, `NVM_DEBUG=1`, `EMU_DMA_DEBUG=1`, `EMU_LCD_DEBUG=1` | peripheral traces |
+| `EMU_DEBUG=1`, `SD_DEBUG=1`, `NVM_DEBUG=1`, `EMU_DMA_DEBUG=1`, `EMU_LCD_DEBUG=1`, `EMU_SYSCTRL_DEBUG=1` | peripheral traces |
 | `FAT_DUMP=file`, `FAT_DUMP_EXIT=file` | write the FAT image as built at mount, or the card at exit |
 | `FLASH_DUMP=file` | write the META flash at exit (after any self-programming) |
 
