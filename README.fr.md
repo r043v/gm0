@@ -185,6 +185,10 @@ l'émulateur TypeScript d'origine a été abandonnée volontairement en octobre
 - TC4/TC5 tournent à la cadence dérivée de leur prescaler CTRLA et de CC0 ;
   le DMA SPI vers l'écran est cadencé par le baud du SERCOM pendant que le
   CPU continue de tourner.
+- L'ordre des couleurs de l'écran META suit le bit BGR courant du MADCTL
+  (ST7735) : BGR=1 tant que le jeu ne réinitialise pas l'écran (état laissé
+  par le bootloader), et RVB565 natif après une init finale à BGR=0 (0x60,
+  lib standard et jeux m0boy).
 
 ## Performance
 

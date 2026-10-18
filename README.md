@@ -178,6 +178,10 @@ original TypeScript emulator was dropped deliberately in October 2026.
 - TC4/TC5 run at the rate derived from their CTRLA prescaler and CC0; the
   SPI DMA to the display is clocked by the SERCOM baud rate while the CPU
   keeps running.
+- The META display's color order follows the current MADCTL BGR bit
+  (ST7735): BGR=1 until the game re-initializes the screen (the state the
+  bootloader leaves), and native RGB565 after a final init with BGR=0
+  (0x60, standard library and m0boy games).
 
 ## Performance
 

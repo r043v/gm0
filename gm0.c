@@ -2804,18 +2804,20 @@ static void pk_debug_dump(void) {
 }
 
 static long stWrites = 0, ramwrTotal = 0;
-/* le panneau META est câblé BGR ; une init qui déclare MADCTL.BGR=1
- * (jeux maison à init custom, ex. lapinou : 0xC8) envoie des couleurs
- * d'ordre natif — l'émulateur doit inverser R/B à l'affichage.  La lib
- * standard ne déclare jamais BGR et pré-swappe elle-même. */
-static int lcdBgrSwapped;
+/* bit BGR courant du MADCTL.  pix[] garde l'ordre « BGR » que l'affichage
+ * META permute (rgb565_argb) : avec BGR=1 (état laissé par le bootloader,
+ * jeux lib qui ne réinitialisent pas l'écran) les pixels passent tels
+ * quels ; avec BGR=0 (init finale 0x60 de la lib, m0boy) le RVB565 natif
+ * est permuté à l'écriture pour sortir droit.  La valeur courante compte,
+ * pas un verrou : la lib envoie 0xC8 puis 0x60. */
+static int lcdMadctlBgr = 1;
 /* COLMOD (0x3A, bits 2:0) : 3 = 12 bpp RGB444 (2 pixels sur 3 octets),
  * 5 = 16 bpp RGB565 (défaut des firmwares), 6 = 18 bpp RGB666 (3 octets par
  * pixel, 6 bits en haut de chaque octet) — datasheet ST7735 §9.7.19-22 */
 static uint8_t lcdColmod = 5;
 static uint8_t lcdPixBuf[3];
 static void lcd_put_pixel(uint16_t p) {
-    if (lcdBgrSwapped) p = (uint16_t)((p >> 11) | (p & 0x07e0u) | ((p & 0x1fu) << 11));
+    if (!lcdMadctlBgr) p = (uint16_t)((p >> 11) | (p & 0x07e0u) | ((p & 0x1fu) << 11));
     if (lcd_x < 160 && lcd_y < 128) pix[lcd_y * 160 + lcd_x] = p;
     if (++lcd_x > lcd_xEnd) { lcd_x = lcd_xStart; if (++lcd_y > lcd_yEnd) lcd_y = lcd_yStart; }
 }
@@ -2860,9 +2862,9 @@ static uint8_t st7735_byte(uint8_t v) {
         return 0xff;
     }
     if (lcd_lastCommand == 0x36) {
-        if (v & 0x08) lcdBgrSwapped = 1;
+        lcdMadctlBgr = (v >> 3) & 1;
         if (ENVFLAG("EMU_LCD_DEBUG"))
-            fprintf(stderr, "[lcd] MADCTL <- %02x (BGR=%d, verrou=%d)\n", v, (v >> 3) & 1, lcdBgrSwapped);
+            fprintf(stderr, "[lcd] MADCTL <- %02x (BGR=%d)\n", v, lcdMadctlBgr);
     }
     { /* données */
         switch (lcd_lastCommand) {
@@ -4604,7 +4606,7 @@ static const char *filter_name(int f) {
 }
 
 /* RVB565 → ARGB8888, expansion par décalage, sans mise à l'échelle.  META :
- * R et B permutés (dalle câblée BGR, la lib pré-swappe) ; Pokitto : les
+ * R et B permutés (pix[] en ordre BGR, voir lcdMadctlBgr) ; Pokitto : les
  * pixels sont déjà en RVB565 natif, pas de permutation. */
 static inline uint32_t rgb565_argb(uint16_t p) {
     uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
@@ -5177,7 +5179,7 @@ static void reset_core(void) {
     dacWrites = 0;
     lcd_xStart = lcd_xEnd = lcd_yStart = lcd_yEnd = lcd_x = lcd_y = 0;
     lcd_argIndex = lcd_lastCommand = lcd_tmp = 0;
-    lcdBgrSwapped = 0;
+    lcdMadctlBgr = 1;
     lcdColmod = 5;
     memset(pix, 0, sizeof pix);
     emu_nextFrameTick = tickCount + frame_ticks();
