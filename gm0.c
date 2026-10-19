@@ -246,6 +246,7 @@ static uint32_t maxFrames;
 
 #define TGT_META    0
 #define TGT_POKITTO 1
+#define TGT_ESPBOY  2
 static int emuTarget = TGT_META;   /* fixé par --target ou détection */
 static int targetForced;           /* --target explicite */
 
@@ -276,8 +277,9 @@ static inline void nvm_access(uint32_t a) { flashWaits += nvm_miss(a); }
 
 
 static double pk_core_hz(void); /* fréquence du cœur telle que configurée */
+static double esp_cpu_hz(void);  /* ESPboy : 80 ou 160 MHz */
 static double ticks_per_sec(void) {
-    return emuTarget == TGT_POKITTO ? pk_core_hz() : emuTicksPerSec;
+    return emuTarget == TGT_POKITTO ? pk_core_hz() : emuTarget == TGT_ESPBOY ? esp_cpu_hz() : emuTicksPerSec;
 }
 static uint32_t frame_ticks(void) {
     return (uint32_t)(ticks_per_sec() / 59.7275 + 0.5);
@@ -541,6 +543,79 @@ static void dac_write(uint16_t v) {
     int s = (v - 512) * 64;
     if (s > 32767) s = 32767; else if (s < -32768) s = -32768;
     audio_level((int16_t)s);
+}
+
+/* ===================================================== ESPBOY ==========
+ * ESP8266 (Xtensa LX106) : esp8266_xt.h exécute le firmware tel quel, la
+ * ROM et le SDK sont émulés au niveau des fonctions (esp8266.h).  Écran
+ * ST7735 128x128, sigma-delta GPIO0 -> sortie audio commune, boutons du
+ * MCP23017.  Les sauvegardes du firmware (flash 0x3C0000-0x3FB000) sont
+ * écrites dans <jeu>.sav à côté du firmware / du zip. */
+#define ESP_BEFORE_FREQ() do { tickCount = (uint32_t)xt.cycles; emu_clock(); } while (0)
+#include "esp8266.h"
+
+static uint8_t espKeys;          /* bit 0 gauche, 1 haut, 2 bas, 3 droite, 4 B, 5 A, 6 aux. gauche, 7 aux. droit */
+static double esp_cpu_hz(void) { return esp.cpu_hz > 0 ? esp.cpu_hz : 80e6; }
+static void esp_audio_out(uint8_t v) {
+    tickCount = (uint32_t)xt.cycles;
+    audio_level((int16_t)(((int)v - 128) * 256));
+}
+static void esp_log(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+}
+static uint8_t esp_buttons_pressed(void) { return espKeys; }
+
+static uint8_t *espFw, *espRom; static char *espSym;
+static size_t espFwLen, espRomLen, espSymLen;
+static char espSavePath[1100];   /* fichier de sauvegarde de la flash utilisateur */
+static char espRomPathOpt[1024], espSymPathOpt[1024]; /* --rom / --sym */
+static unsigned espSaveTick;
+
+static int esp_is_image(const uint8_t *d, size_t n) { return n > 8 && (d[0] == 0xE9 || !memcmp(d, "\177ELF", 4)); }
+
+static void esp_save_flush(int force) {
+    if (!espSavePath[0] || (!esp.flash_dirty && !force)) return;
+    esp.flash_dirty = 0;
+    const uint8_t *src = xt_flash + ESP_SAVE_OFF;
+    size_t n = ESP_SAVE_END - ESP_SAVE_OFF;
+#ifdef __EMSCRIPTEN__
+    em_ls_set(em_save_key(espSavePath), src, (int)n);
+#else
+    FILE *f = fopen(espSavePath, "wb");
+    if (f) { fwrite(src, 1, n, f); fclose(f); }
+#endif
+}
+static void esp_save_load(void) {
+    if (!espSavePath[0]) return;
+    size_t n = ESP_SAVE_END - ESP_SAVE_OFF;
+#ifdef __EMSCRIPTEN__
+    em_ls_get(em_save_key(espSavePath), xt_flash + ESP_SAVE_OFF, (int)n);
+#else
+    FILE *f = fopen(espSavePath, "rb");
+    if (f) {
+        size_t r = fread(xt_flash + ESP_SAVE_OFF, 1, n, f);
+        fclose(f);
+        printf(TR("ESPboy : sauvegardes relues (%s, %zu o)\n", "ESPboy: saves loaded (%s, %zu B)\n"), espSavePath, r);
+    }
+#endif
+}
+static uint8_t *file_slurp(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t *b = malloc((size_t)sz + 1);
+    if (!b || fread(b, 1, (size_t)sz, f) != (size_t)sz) { fclose(f); free(b); return NULL; }
+    fclose(f);
+    b[sz] = 0; *n = (size_t)sz;
+    return b;
+}
+
+static int esp_start(const uint8_t *fw, size_t fwlen, const uint8_t *rom, size_t romlen,
+                     const uint8_t *sym, size_t symlen, const char *name, const char *savePath);
+static char espZipPath[1100];    /* zip en cours de chargement (nom de la sauvegarde) */
+static int l_ends_with(const char *s, const char *suf) {
+    size_t a = strlen(s), b = strlen(suf);
+    return a >= b && strcasecmp(s + a - b, suf) == 0;
 }
 
 /* --------------------------------------------------- carte SD (PA27) */
@@ -1400,6 +1475,26 @@ static int zip_load_card(const uint8_t *data, size_t len) {
         size_t l = strlen(ents[i].name);
         if (fwb < 0 && l > 4 && strcasecmp(ents[i].name + l - 4, ".bin") == 0) fwb = i;
         if (fpop < 0 && l > 4 && strcasecmp(ents[i].name + l - 4, ".pop") == 0) fpop = i;
+    }
+    /* ESPboy : firmware.bin (image ESP, magic E9) + rom.bin + firmware.sym */
+    {
+        int efw = -1, erom = -1, esym = -1;
+        for (int i = 0; i < n; i++) {
+            const char *b = strrchr(ents[i].name, '/'); b = b ? b + 1 : ents[i].name;
+            if (efw < 0 && !strcasecmp(b, "firmware.bin") && esp_is_image(datas[i], ents[i].usize)) efw = i;
+            else if (erom < 0 && !strcasecmp(b, "rom.bin")) erom = i;
+            else if (esym < 0 && l_ends_with(b, ".sym")) esym = i;
+            else if (efw < 0 && l_ends_with(b, ".elf") && esp_is_image(datas[i], ents[i].usize)) efw = i;
+        }
+        if (efw >= 0) {
+            reset_machine();
+            const char *zp = espZipPath[0] ? espZipPath : ents[efw].name;
+            char save[1200]; snprintf(save, sizeof save, "%s.sav", zp);
+            int r = esp_start(datas[efw], ents[efw].usize, erom >= 0 ? datas[erom] : NULL, erom >= 0 ? ents[erom].usize : 0,
+                              esym >= 0 ? datas[esym] : NULL, esym >= 0 ? ents[esym].usize : 0, zp, save);
+            for (int i = 0; i < n; i++) free(datas[i]);
+            return r == 0 ? 2 : 0;
+        }
     }
     /* Pokitto : jeux distribués en .pop (conteneur du loader) + assets */
     if (fwb < 0) fwb = fpop;
@@ -5021,7 +5116,13 @@ static uint8_t key_bit(SDL_Keycode sym) {
     return 0;
 }
 
+/* touches de la machine -> bits du MCP23017 de l'ESPboy */
+static uint8_t esp_key_bits(uint8_t m) {
+    return (uint8_t)(((m & BTN_LEFT) ? 1u : 0u) | ((m & BTN_UP) ? 2u : 0u) | ((m & BTN_DOWN) ? 4u : 0u) | ((m & BTN_RIGHT) ? 8u : 0u) |
+                     ((m & BTN_B) ? 16u : 0u) | ((m & BTN_A) ? 32u : 0u) | ((m & BTN_HOME) ? 64u : 0u) | ((m & BTN_MENU) ? 128u : 0u));
+}
 static void btn_press(uint8_t mask) {
+    if (emuTarget == TGT_ESPBOY) { espKeys |= esp_key_bits(mask); return; }
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 1); return; }
     /* buttonData reste toujours en ordre lib ; la conversion (pad lu à
      * 24 MHz) se fait à la réponse, cf. sercom4_write */
@@ -5031,6 +5132,7 @@ static void btn_press(uint8_t mask) {
 }
 
 static void btn_release(uint8_t mask) {
+    if (emuTarget == TGT_ESPBOY) { espKeys &= (uint8_t)~esp_key_bits(mask); return; }
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 0); return; }
     buttonData |= mask;
     if (mask & BTN_HOME) homeHeld = 0;
@@ -5222,7 +5324,68 @@ static void fw_strip_container(const uint8_t **data, size_t *len) {
     }
 }
 
+/* le firmware (copie à conserver : la machine redémarre dessus), sa ROM et ses symboles */
+static int esp_start(const uint8_t *fw, size_t fwlen, const uint8_t *rom, size_t romlen,
+                     const uint8_t *sym, size_t symlen, const char *name, const char *savePath) {
+    free(espFw); free(espRom); free(espSym);
+    espFw = malloc(fwlen + 1); memcpy(espFw, fw, fwlen); espFwLen = fwlen;
+    espRom = rom ? malloc(romlen + 1) : NULL; if (espRom) memcpy(espRom, rom, romlen); espRomLen = rom ? romlen : 0;
+    espSym = sym ? malloc(symlen + 1) : NULL; if (espSym) { memcpy(espSym, sym, symlen); espSym[symlen] = 0; } espSymLen = sym ? symlen : 0;
+    audio_rebase();
+    tickCount = 0;
+    int r = esp_power_on(espFw, espFwLen, espRom, espRomLen, espSym, espSymLen);
+    if (r) {
+        fprintf(stderr, r == -2 ? TR("ESPboy : symboles absents (ni .sym ni ELF) : démarrage impossible\n",
+                                     "ESPboy: no symbols (neither .sym nor ELF): cannot boot\n")
+                                : TR("ESPboy : firmware illisible\n", "ESPboy: unreadable firmware\n"));
+        return -1;
+    }
+    snprintf(espSavePath, sizeof espSavePath, "%s", savePath ? savePath : "");
+    esp_save_load();
+    emuTarget = TGT_ESPBOY;
+    pk_screen_reconfig();
+    snprintf(fwPath, sizeof(fwPath), "%s", name);
+    { const char *b = strrchr(fwPath, '/'); fwName = b ? b + 1 : fwPath; }
+    fwLoaded = 1;
+    printf(TR("firmware ESPboy : %s (%zu Ko%s)\n", "ESPboy firmware: %s (%zu KB%s)\n"), name, fwlen / 1024, rom ? TR(" + ROM", " + ROM") : "");
+    osd_push("%s : %s", TR("CHARGE", "LOADED"), fwName);
+    return 0;
+}
+
+/* .bin / .elf déposé ou passé en ligne de commande : rom.bin et .sym à côté */
+static void esp_load_firmware(const uint8_t *data, size_t len, const char *path) {
+    char dir[1100], base[1100], romp[1200], symp[1200], stem[1100];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *sl = strrchr(dir, '/');
+    if (sl) { sl[1] = 0; snprintf(base, sizeof base, "%s", sl + 1 - dir + path); } else { dir[0] = 0; snprintf(base, sizeof base, "%s", path); }
+    snprintf(stem, sizeof stem, "%s%s", dir, base);
+    char *dot = strrchr(stem, '.'); if (dot) *dot = 0;
+    snprintf(romp, sizeof romp, "%srom.bin", dir);
+    size_t rn = 0, sn = 0;
+    uint8_t *rom = file_slurp(espRomPathOpt[0] ? espRomPathOpt : romp, &rn);
+    snprintf(symp, sizeof symp, "%s.sym", stem);
+    uint8_t *sym = file_slurp(espSymPathOpt[0] ? espSymPathOpt : symp, &sn);
+    if (!sym) { snprintf(symp, sizeof symp, "%sfirmware.sym", dir); sym = file_slurp(symp, &sn); }
+    char save[1200]; snprintf(save, sizeof save, "%s.sav", stem);
+    esp_start(data, len, rom, rn, sym, sn, path, save);
+    free(rom); free(sym);
+}
+
+static void esp_frame(void) {
+    esp_run((uint64_t)(esp.cpu_hz / 59.7275 + 0.5));
+    tickCount = (uint32_t)xt.cycles;
+    memcpy(pix, esp_fb, sizeof esp_fb);
+    if (esp.flash_dirty && ++espSaveTick >= 60) { espSaveTick = 0; esp_save_flush(0); }
+}
+static void esp_restart_game(void) {
+    esp_save_flush(0);
+    audio_rebase(); tickCount = 0;
+    esp_power_on(espFw, espFwLen, espRom, espRomLen, espSym, espSymLen);
+    esp_save_load();
+}
+
 static void load_firmware_data(const uint8_t *data, size_t len, const char *display) {
+    if (esp_is_image(data, len)) { esp_load_firmware(data, len, display); pk_screen_reconfig(); return; }
     const uint8_t *payload = data;
     size_t plen = len;
     fw_strip_container(&payload, &plen);
@@ -5265,6 +5428,7 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
 /* F5 : redémarre le firmware courant (la Pokitto garde sa carte et son
  * EEPROM, comme la référence) */
 static void fw_restart(void) {
+    if (emuTarget == TGT_ESPBOY && espFw) { esp_restart_game(); audio_start(); machineEpoch++; refresh_title(); return; }
     if (!fwData) return;
     char name[sizeof(fwPath)];snprintf(name,sizeof(name),"%s",fwPath);
     load_firmware_data(fwData, fwLen, name);
@@ -5304,6 +5468,7 @@ static void load_firmware(const char *p, int rebindCard) {
 }
 
 static void load_sd_from_path(const char *p) {
+    snprintf(espZipPath, sizeof espZipPath, "%s", p);
     struct stat st;
     if (stat(p, &st) == 0 && S_ISDIR(st.st_mode)) { sd_unload(); fat_build_from_dir(p); return; }
     FILE *g = fopen(p, "rb");
@@ -5326,6 +5491,7 @@ static void load_sd_from_path(const char *p) {
 }
 
 static void boot_vectors(void) {
+    if (emuTarget == TGT_ESPBOY) return; /* esp_power_on a déjà préparé le démarrage */
     if (emuTarget == TGT_POKITTO) {
         /* vecteurs déjà chargés par pk_reset_core */
         fprintf(stderr, "Pokitto: SP=%08x PC=%08x\n", regs[13], regs[15]);
@@ -5364,7 +5530,7 @@ static void audio_start(void) {
 
 /* dimensions SDL selon la cible (appelé aussi au changement de cible) */
 static void pk_screen_reconfig(void) {
-    SCR_W = emuTarget == TGT_POKITTO ? 220 : 160;
+    SCR_W = emuTarget == TGT_POKITTO ? 220 : emuTarget == TGT_ESPBOY ? 128 : 160;
     SCR_H = emuTarget == TGT_POKITTO ? 176 : 128;
     if (!emuRen) return;
     SDL_SetWindowSize(emuWin, (int)(SCR_W * 2), (int)(SCR_H * 2));
@@ -5695,6 +5861,7 @@ static void step_batch(uint32_t target) {
 }
 
 static void run_emulated_frame(void) {
+    if (emuTarget == TGT_ESPBOY) { esp_frame(); audio_frame(); return; }
     uint32_t target = emu_nextFrameTick;
     step_batch(target);
     /* re-base sur tickCount : l'ancien `+= frame_ticks()` laissait
@@ -5821,6 +5988,10 @@ int main(int argc, char **argv) {
         if (strcasecmp(getenv("EMU_TARGET"), "meta") == 0) emuTarget = TGT_META;
     }
 
+    for (int i = 1; i + 1 < argc; i++) { /* ESPboy : --rom / --sym valent quel que soit leur rang */
+        if (strcmp(argv[i], "--rom") == 0) snprintf(espRomPathOpt, sizeof espRomPathOpt, "%s", argv[i + 1]);
+        if (strcmp(argv[i], "--sym") == 0) snprintf(espSymPathOpt, sizeof espSymPathOpt, "%s", argv[i + 1]);
+    }
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--build-vcard") == 0 && i + 3 < argc) {
             /* debug : --build-vcard out.img fichier1 fichier2 ... */
@@ -5853,6 +6024,10 @@ int main(int argc, char **argv) {
             targetForced = 1;
         } else if (strcmp(argv[i], "--out-img") == 0 && i + 1 < argc) {
             snprintf(outImgPath, sizeof(outImgPath), "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--rom") == 0 && i + 1 < argc) {
+            snprintf(espRomPathOpt, sizeof espRomPathOpt, "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--sym") == 0 && i + 1 < argc) {
+            snprintf(espSymPathOpt, sizeof espSymPathOpt, "%s", argv[++i]);
         } else if (strcmp(argv[i], "--eeprom-ro") == 0) {
             pk_eepromRO = 1;
         } else if (strcmp(argv[i], "-W") == 0) {
@@ -5955,6 +6130,13 @@ int main(int argc, char **argv) {
     prof_write();
     pk_debug_dump();
     pk_eeprom_save();
+    if (emuTarget == TGT_ESPBOY) {
+        esp_save_flush(0);
+        fprintf(stderr, TR("[esp] flash : %llu lectures, %llu écritures, %llu effacements ; SPI %llu octets ; défauts de cache %u (estimations de temps)\n",
+                           "[esp] flash: %llu reads, %llu writes, %llu erases; SPI %llu bytes; cache misses %u (timing estimates)\n"),
+                (unsigned long long)esp.flash_reads, (unsigned long long)esp.flash_writes, (unsigned long long)esp.flash_erases,
+                (unsigned long long)esp.spi_bytes, xt_flash_misses);
+    }
     card_export(outImgPath, 0);
     card_export(getenv("FAT_DUMP_EXIT"), 1);
     { const char *fd = getenv("FLASH_DUMP"); /* flash après auto-patch du jeu */

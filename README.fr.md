@@ -1,14 +1,15 @@
 # gm0
 
-**Émulateur compté en cycles de la Gamebuino META (SAMD21, Cortex-M0+) et de
-la Pokitto (LPC11U6x, Cortex-M0+), écrit en C, avec un frontal SDL2 et un
-build WebAssembly.**
+**Émulateur compté en cycles de la Gamebuino META (SAMD21, Cortex-M0+), de
+la Pokitto (LPC11U6x, Cortex-M0+) et de l'ESPboy (ESP8266, Xtensa LX106),
+écrit en C, avec un frontal SDL2 et un build WebAssembly.**
 
 > English version: [README.md](README.md)
 
-gm0 exécute les firmwares non modifiés des deux consoles depuis un seul
+gm0 exécute les firmwares non modifiés des trois consoles depuis un seul
 binaire.  La cible est détectée d'après l'image du firmware (pointeur de pile
-initial dans la SRAM SAMD21 ou LPC) et peut être forcée par `--target`.  Le
+initial dans la SRAM SAMD21 ou LPC ; en-tête d'image `0xE9` ou ELF pour
+l'ESPboy) et peut être forcée par `--target` (META et Pokitto).  Le
 même cœur C est compilé en natif et en WebAssembly.
 
 - **CPU** — interpréteur Thumb ARMv6-M, compté en cycles d'après les tables
@@ -19,6 +20,12 @@ même cœur C est compilé en natif et en WebAssembly.
   priorités et empilement des exceptions, NVMCTRL minimal.
 - **Périphériques Pokitto** — SYSCON/PLL, CT32B, SCT, SSP, GPIO, IAP et API
   ROM, EEPROM 4 Ko persistée, conteneur `.pop` lu nativement.
+- **ESPboy** — interpréteur Xtensa LX106 qui exécute le code du firmware (cœur
+  Arduino, runtime, code généré) ; la ROM de la puce et le SDK Espressif
+  (binaire fermé) sont **émulés fonction par fonction** (voir
+  [ESPboy](#espboy)) : libc de la ROM, virgule flottante logicielle, `ets_*`,
+  fonctions de flash, timer1, GPIO et sortie audio sigma-delta, SPI1 vers
+  l'écran ST7735 (128×128), boutons du MCP23017.
 - **Stockage** — carte SD SPI sur image brute, `.zip`, ou dossier de l'hôte
   converti en FAT16 à la volée ; les sauvegardes des jeux sont réécrites.
 
@@ -28,6 +35,7 @@ même cœur C est compilé en natif et en WebAssembly.
 |---|---|---|
 | Gamebuino META | Jouable | lapinou (pilotes bare-metal), Celeste, Cats & Coins, Picomon, Yatzy, Reuben Quest, loaders du site, firmwares Game Boy convertis (protocoles DMA/SPI 0.4.0+) |
 | Pokitto | Jouable | Pandemic, Galaxy Fighters (`.pop`, musique streamée depuis la carte) |
+| ESPboy | Démarre et fait tourner les firmwares m0boy (Game Boy, SG-1000, Game Gear, Master System) | firmwares convertis par m0boy ; non comparé à une console |
 | WebAssembly | Jouable | même cœur ; page servie ou fichier HTML autonome unique |
 
 Le dépôt ne contient ni jeux ni firmwares.
@@ -129,6 +137,41 @@ Exécution sans affichage (tests, captures) :
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
   gm0 jeu.bin carte/ --frames 300 --shot capture.ppm
 ```
+
+### ESPboy
+
+```sh
+gm0 jeu.zip                          # firmware.bin + firmware.sym [+ rom.bin], tel que compile.sh de m0boy l'emballe
+gm0 firmware.bin --rom rom.bin       # firmware.sym est cherché à côté
+gm0 firmware.elf [--rom rom.bin]     # l'ELF porte les symboles
+```
+
+Le code du firmware est exécuté tel quel (cœur Xtensa, carte mémoire avec les
+règles d'accès de la puce : un chargement 8 ou 16 bits en IRAM ou en flash
+mappée arrête l'émulation, comme le `LoadStoreError` de la puce).  Ce qui est
+d'Espressif — ROM de boot et SDK, non livrés ici — est émulé **par fonction** :
+le démarrage (`eboot`, `app_entry`, `user_init`) n'est pas exécuté, la machine
+fait ce qu'il laisse (pile cont, ISR de timer1, constructeurs C++) puis appelle
+`setup()` et `loop()`.  Accrochés par nom (`firmware.sym` ou l'ELF) : `micros`,
+`delay`, `system_update_cpu_freq`, `twi_writeTo/readFrom`,
+`spi_flash_read/write/erase_sector`, `system_restart`, chien de garde et mode
+Wi-Fi.  Toute autre fonction de la ROM appelée et non émulée arrête l'exécution
+en donnant son nom.
+
+- Le temps est compté en cycles du cœur à 80 ou 160 MHz : 1 par instruction,
+  +2 par branche prise, défauts du cache de flash (32 Kio direct, lignes de 32
+  octets, 64 cycles à 160 MHz), octets SPI à l'horloge programmée, effacement
+  de flash 45 ms et programmation 0,7 ms par page.  **Ce sont des estimations,
+  pas des mesures de la puce.**
+- L'écran prend la fenêtre 128×128 en (2, 3) de la RAM du ST7735 (`MADCTL`
+  ignoré hors du bit BGR, supposé compenser le panneau).
+- Les sauvegardes du firmware (flash `0x3C0000-0x3FB000`) sont conservées dans
+  `<nom>.sav` à côté du firmware (ou du zip).
+- Tests : `tests/esp/run_tests.py` compare le cœur Xtensa et les fonctions de
+  la ROM à l'hôte sur des programmes C compilés pour lx106 à plusieurs niveaux
+  d'optimisation ; `tests/test_esp.py` fait tourner un petit firmware sur toute
+  la machine (écran, boutons, audio par timer1, sauvegardes en flash).  Tous
+  deux demandent le `toolchain-xtensa` de PlatformIO (sinon ils sont sautés).
 
 ### Commandes
 

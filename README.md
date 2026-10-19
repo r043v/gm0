@@ -1,14 +1,15 @@
 # gm0
 
-**A cycle-counted emulator for the Gamebuino META (SAMD21, Cortex-M0+) and
-the Pokitto (LPC11U6x, Cortex-M0+), written in C with an SDL2 frontend and a
-WebAssembly build.**
+**A cycle-counted emulator for the Gamebuino META (SAMD21, Cortex-M0+), the
+Pokitto (LPC11U6x, Cortex-M0+) and the ESPboy (ESP8266, Xtensa LX106),
+written in C with an SDL2 frontend and a WebAssembly build.**
 
 > Version française : [README.fr.md](README.fr.md)
 
-gm0 runs unmodified firmware for both consoles from a single binary.  The
+gm0 runs unmodified firmware for the three consoles from a single binary.  The
 target is detected from the firmware image (initial stack pointer in SAMD21
-or LPC SRAM) and can be forced with `--target`.  The same C core is compiled
+or LPC SRAM; `0xE9` image header or ELF for the ESPboy) and can be forced with
+`--target` (META and Pokitto).  The same C core is compiled
 natively and to WebAssembly.
 
 - **CPU** — ARMv6-M Thumb interpreter, cycle-counted per the Cortex-M0+
@@ -19,6 +20,11 @@ natively and to WebAssembly.
   exception stacking, minimal NVMCTRL.
 - **Pokitto peripherals** — SYSCON/PLL, CT32B, SCT, SSP, GPIO, IAP and ROM
   API, persistent 4 KB EEPROM, native `.pop` container support.
+- **ESPboy** — Xtensa LX106 interpreter running the firmware's own code (Arduino
+  core, runtime, generated code); the chip's boot ROM and the closed Espressif
+  SDK are *emulated by function* (see [ESPboy](#espboy)): ROM libc, soft
+  floating point, `ets_*`, flash functions, timer1, GPIO and the sigma-delta
+  audio output, SPI1 to the ST7735 (128×128), the MCP23017 buttons.
 - **Storage** — SPI SD card backed by a raw image, a `.zip`, or a host folder
   converted to FAT16 on the fly; saves written by games are written back.
 
@@ -28,6 +34,7 @@ natively and to WebAssembly.
 |---|---|---|
 | Gamebuino META | Playable | lapinou (bare-metal drivers), Celeste, Cats & Coins, Picomon, Yatzy, Reuben Quest, site loaders, converted Game Boy firmwares (DMA/SPI protocols 0.4.0+) |
 | Pokitto | Playable | Pandemic, Galaxy Fighters (`.pop` with music streamed from the card) |
+| ESPboy | Boots and plays m0boy firmwares (Game Boy, SG-1000, Game Gear, Master System) | firmwares converted by m0boy; not checked against a console |
 | WebAssembly | Playable | same core; served page or single self-contained HTML file |
 
 The repository ships no games or firmware.
@@ -110,6 +117,7 @@ gm0 [firmware] [card] [options]
 | `firmware` | `.bin`, or `.pop` (Pokitto) |
 | `card` | `.img` raw image, `.zip` (full card), or a folder (FAT16 built on the fly). On the META the card defaults to the firmware's folder. |
 | `--target meta\|pokitto` | force the target |
+| `--rom file`, `--sym file` | ESPboy: ROM image (`rom.bin`, flash `0x100000`) and symbol file of a `.bin` (default: `rom.bin` and `<name>.sym` / `firmware.sym` next to it) |
 | `--frames N` | run N frames, then exit |
 | `--shot file.ppm` | write a screenshot at exit |
 | `--wav file.wav` | record the session audio (48 kHz, rendered from emulated time) |
@@ -128,6 +136,42 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
   gm0 game.bin card/ --frames 300 --shot shot.ppm
 ```
 
+### ESPboy
+
+```sh
+gm0 game.zip                         # firmware.bin + firmware.sym [+ rom.bin], as m0boy's compile.sh packs it
+gm0 firmware.bin --rom rom.bin       # firmware.sym is looked up next to it
+gm0 firmware.elf [--rom rom.bin]     # the ELF carries the symbols
+```
+
+The ESPboy build keeps the machine honest where the code *is* the firmware's
+(Xtensa core, memory map with the chip's access rules: byte and halfword loads
+from IRAM or the mapped flash stop the run, as `LoadStoreError` does on the
+chip) and *approximate* where the code is Espressif's: the boot ROM and the SDK
+are not shipped here, so what the firmware calls of them is emulated by
+function.  Start-up (`eboot`, `app_entry`, `user_init`) is **not** run: the
+machine does what it leaves behind (cont stack, timer1 ISR, C++ constructors)
+and calls `setup()` then `loop()`.  Hooked by symbol name (`firmware.sym`, or the
+ELF): `micros`, `delay`, `system_update_cpu_freq`, `twi_writeTo/readFrom`,
+`spi_flash_read/write/erase_sector`, `system_restart`, watchdog and Wi-Fi mode
+calls.  Anything else of the ROM that is called and not emulated stops the run
+with its name.
+
+- Time is counted in CPU cycles at 80 or 160 MHz: 1 per instruction, +2 per
+  taken branch, flash cache misses (32 KiB direct-mapped, 32-byte lines, 64
+  cycles at 160 MHz), SPI bytes at the programmed clock, flash erase 45 ms and
+  program 0.7 ms per page.  **These are estimates, not measurements of the
+  chip**; the `[bench]` line and the speed printed by m0boy's tools follow them.
+- The display model takes the 128×128 window at (2, 3) of the ST7735 RAM
+  (`MADCTL` ignored beyond the BGR bit, assumed to compensate the panel).
+- The firmware's flash saves (`0x3C0000-0x3FB000`) persist in `<name>.sav` next
+  to the firmware (or the zip).
+- Tests: `tests/esp/run_tests.py` compares the Xtensa core and the ROM
+  functions with the host on C programs built for lx106 at several
+  optimisation levels; `tests/test_esp.py` runs a small firmware through the
+  whole machine (display, buttons, timer1 audio, flash saves).  Both need
+  PlatformIO's `toolchain-xtensa` and are skipped without it.
+
 ### Controls
 
 | | META | Pokitto |
@@ -136,6 +180,10 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy \
 | A / B | Space or J / Ctrl or K | Space or A / Ctrl, S or B |
 | MENU / C | Enter or U | Enter, D or C |
 | HOME / backlight | `*` or I (hold 3 s to reset the game) | F |
+
+ESPboy (META keys): D-pad as the META, A = ACT (J), B = ESC (K), MENU (U) = right
+auxiliary button (Start), HOME (I) = left auxiliary button (Select; hold for the
+Game Boy frontend's menu).
 
 | Key | Action |
 |---|---|
@@ -195,6 +243,7 @@ without frame pacing, as a multiple of real time:
 | Cats & Coins | META | 5.5× |
 | converted Game Boy firmware (sml) | META | 5.0× |
 | Pandemic | Pokitto | 4.1× |
+| converted Game Boy firmware (sml) | ESPboy | 1.6× |
 
 Numbers depend on the host and its load.  The WebAssembly build runs at full
 speed in current browsers.
