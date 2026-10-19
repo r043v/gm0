@@ -294,7 +294,15 @@ static void rom_delay_us(void) { if (!esp.sleeping) esp_sleep(xt.cycles + (uint6
 /* esp_time_scale > 1 : micros()/millis() courent plus vite que le temps émulé, pour qu'un frontal qui attend
  * l'échéance de son image tourne à la vitesse que le processeur permet (mesure de marge, jamais par défaut) */
 static double esp_time_scale = 1.0;
-static void hk_micros(void) { A(2) = (uint32_t)(esp_us() * esp_time_scale); }
+/* temps d'attente : les appels de micros() très rapprochés sont la boucle qui attend l'échéance de l'image
+ * (frontaux de m0boy) ; leur durée cumulée donne la part du processeur qui reste libre */
+static uint64_t esp_idle_cycles, esp_last_micros;
+static void hk_micros(void) {
+    uint64_t d = xt.cycles - esp_last_micros;
+    if (d < 300) esp_idle_cycles += d;
+    esp_last_micros = xt.cycles;
+    A(2) = (uint32_t)(esp_us() * esp_time_scale);
+}
 static void hk_millis(void) { A(2) = (uint32_t)(esp_us() * esp_time_scale / 1000.0); }
 static void hk_delay(void) { if (!esp.sleeping) esp_sleep(xt.cycles + (uint64_t)((double)A(2) * esp.cpu_hz / 1e3)); else esp_sleep(0); }
 static void hk_ret(void) { }

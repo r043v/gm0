@@ -35,6 +35,7 @@ int main(int argc, char **argv) {
     size_t fn = 0, rn = 0, sn = 0;
     uint8_t *fw = fwp ? slurp(fwp, &fn) : NULL, *rom = romp ? slurp(romp, &rn) : NULL, *sym = symp ? slurp(symp, &sn) : NULL;
     if (!fw) { fprintf(stderr, "usage: fw_run fw.elf|fw.bin [rom.bin] [--sym f] [--frames n] [--shot f.ppm]\n"); return 2; }
+    { const char *m = getenv("GM0_ESP_FLASH_MISS"); esp_miss_opt = m ? (uint32_t)atoi(m) : 0; }
     int r = esp_power_on(fw, fn, rom, rn, (const char *)sym, sn);
     if (r) { fprintf(stderr, "chargement impossible (%d)\n", r); return 1; }
     struct timespec t0, t1;
@@ -57,6 +58,8 @@ int main(int argc, char **argv) {
     printf("écran : %llu pixels, %llu images, audio : %lu changements ; SPI %llu octets ; flash : %llu lectures %llu écritures %llu effacements (%u écritures sur secteur non effacé) ; défauts de cache flash %u\n",
            (unsigned long long)esp.lcd_pixels, (unsigned long long)esp.lcd_frames, audio_changes, (unsigned long long)esp.spi_bytes,
            (unsigned long long)esp.flash_reads, (unsigned long long)esp.flash_writes, (unsigned long long)esp.flash_erases, esp.flash_bad_writes, xt_flash_misses);
+    printf("processeur libre (attente de l'échéance de l'image) : %.1f %% ; occupé : %.1f %% du temps (estimation)\n",
+           100.0 * (double)esp_idle_cycles / (double)(xt.cycles - c0), 100.0 - 100.0 * (double)esp_idle_cycles / (double)(xt.cycles - c0));
     { uint32_t g = esp_sym("gbl_frame"); /* images GB émulées : estimation de la vitesse */
       if (g) printf("gbl_frame=%u en %.2f s émulées : %.1f images/s (59.7 = pleine vitesse ; estimation, pas une mesure)\n", esp_peek32(g),
                     (double)(xt.cycles - c0) / esp.cpu_hz, esp_peek32(g) / ((double)(xt.cycles - c0) / esp.cpu_hz)); }
