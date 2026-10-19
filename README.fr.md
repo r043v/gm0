@@ -164,7 +164,9 @@ en donnant son nom.
   de flash 45 ms et programmation 0,7 ms par page.  **Ce sont des estimations,
   pas des mesures de la puce.**
 - L'écran prend la fenêtre 128×128 en (2, 3) de la RAM du ST7735 (`MADCTL`
-  ignoré hors du bit BGR, supposé compenser le panneau).
+  est sinon ignoré).  Le panneau est BGR : les pixels ne sont lus en RGB565
+  que si `MADCTL.BGR` (bit 3) est à 1, ce que pose le firmware m0boy (`0xC8`) ;
+  à 0, le rouge et le bleu sont échangés comme sur la puce.
 - Les sauvegardes du firmware (flash `0x3C0000-0x3FB000`) sont conservées dans
   `<nom>.sav` à côté du firmware (ou du zip).
 - Tests : `tests/esp/run_tests.py` compare le cœur Xtensa et les fonctions de

@@ -53,4 +53,12 @@ with tempfile.TemporaryDirectory(prefix='gm0-esp-') as tmp:
     env.pop('EMU_INPUT')
     run(gm0, elf, '--frames', 30, '--shot', shot('d.ppm'))
     assert hashlib.md5(ppm(shot('d.ppm'))).digest() == hashlib.md5(b).digest()
+    # MADCTL.BGR à 0 : le panneau BGR échange le rouge et le bleu
+    elf2 = tmp / 'fw2.elf'
+    run(gcc[0], '-O2', '-DMADCTL=0xc0', '-mlongcalls', '-mtext-section-literals', '-ffreestanding', '-nostdlib', '-T', ld,
+        '-o', elf2, root / 'tests/esp/fw_test.c', '-Wl,--entry=setup')
+    run(gm0, elf2, '--frames', 30, '--shot', shot('e.ppm'))
+    e = ppm(shot('e.ppm'))
+    assert px(e, 100, 100) == bytes([0, 50 << 2, 25 << 3]), px(e, 100, 100).hex()
+
 print('machine ESPboy : écran, boutons, audio, timer1, sauvegarde de la flash : ok')

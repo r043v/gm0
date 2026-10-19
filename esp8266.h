@@ -352,6 +352,9 @@ static void esp_install_hooks(void) {
 static void lcd_pixel(uint16_t c) {
     int x = esp.lcd_x - 2, y = esp.lcd_y - 3; /* fenêtre visible 128x128 de la mémoire 132x162 (assumé) */
     if (esp.lcd_inv) c = (uint16_t)~c;
+    /* le panneau est BGR : les données sont lues dans l'ordre RVB seulement si MADCTL.BGR (bit 3) est à 1,
+     * ce que le firmware pose (0xC8) ; à 0, rouge et bleu sont échangés comme sur la puce */
+    if (!(esp.lcd_madctl & 8)) c = (uint16_t)(((c & 31u) << 11) | (c & 0x7e0u) | (c >> 11));
     if ((unsigned)x < ESP_SCR_W && (unsigned)y < ESP_SCR_H) esp_fb[y * ESP_SCR_W + x] = c;
     esp.lcd_pixels++;
     if (++esp.lcd_x > esp.lcd_x1) {
@@ -363,7 +366,7 @@ static void lcd_byte(int dc, uint8_t b) {
     if (!dc) {
         esp.lcd_cmd = b; esp.lcd_argn = 0; esp.lcd_hi = 0;
         if (b == 0x2c) { esp.lcd_x = esp.lcd_x0; esp.lcd_y = esp.lcd_y0; }
-        else if (b == 0x01) { esp.lcd_on = 0; esp.lcd_inv = 0; }
+        else if (b == 0x01) { esp.lcd_on = 0; esp.lcd_inv = 0; esp.lcd_madctl = 0; }
         else if (b == 0x20) esp.lcd_inv = 0;
         else if (b == 0x21) esp.lcd_inv = 1;
         else if (b == 0x29) esp.lcd_on = 1;
@@ -639,7 +642,7 @@ static void esp_machine_reset(void) {
     memset(esp.rtc, 0, sizeof esp.rtc); memset(esp.iomux, 0, sizeof esp.iomux); memset(esp.regs, 0, sizeof esp.regs);
     memset(esp.isr, 0, sizeof esp.isr);
     esp.isr_depth = 0; esp.sleeping = 0; esp.t1_on = 0; esp.t1_load = esp.t1_ctrl = 0; esp.dc = 0;
-    esp.lcd_x0 = 0; esp.lcd_x1 = 127; esp.lcd_y0 = 0; esp.lcd_y1 = 127;
+    esp.lcd_x0 = 0; esp.lcd_x1 = 127; esp.lcd_y0 = 0; esp.lcd_y1 = 127; esp.lcd_madctl = 0;
     memset(esp.mcp, 0, sizeof esp.mcp); esp.mcp_ptr = 0;
     esp.sd_value = 128;
     memset(esp_fb, 0, sizeof esp_fb);

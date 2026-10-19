@@ -51,7 +51,12 @@ static uint32_t saved[4];
 
 void setup(void) {
     system_update_cpu_freq(160);
-    cmd(0x01); cmd(0x11); cmd(0x29);
+    cmd(0x01); cmd(0x11);
+#ifndef MADCTL
+#define MADCTL 0xc8 /* MX | MY | BGR : ce que pose le firmware m0boy */
+#endif
+    cmd(0x36); data(MADCTL);
+    cmd(0x29);
     spi_flash_read(0x3c0000, saved, 16);
     uint32_t had = saved[0] == 0x50415645u; /* « EVAP » écrit par une partie précédente */
     ets_isr_attach(9, (void *)isr, 0);

@@ -163,7 +163,9 @@ with its name.
   program 0.7 ms per page.  **These are estimates, not measurements of the
   chip**; the `[bench]` line and the speed printed by m0boy's tools follow them.
 - The display model takes the 128×128 window at (2, 3) of the ST7735 RAM
-  (`MADCTL` ignored beyond the BGR bit, assumed to compensate the panel).
+  (`MADCTL` is otherwise ignored).  The panel is BGR: pixels are read as RGB565
+  only while `MADCTL.BGR` (bit 3) is set, as m0boy's firmware does (`0xC8`);
+  with the bit clear, red and blue are swapped as on the chip.
 - The firmware's flash saves (`0x3C0000-0x3FB000`) persist in `<name>.sav` next
   to the firmware (or the zip).
 - Tests: `tests/esp/run_tests.py` compares the Xtensa core and the ROM
