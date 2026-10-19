@@ -12,9 +12,17 @@
  * et ROM lèvent LoadStoreError (cause 3), les accès non alignés
  * LoadStoreAlignment (cause 9) : ils arrêtent l'émulation avec un diagnostic.
  *
- * Temps : 1 cycle par instruction, +2 par branche prise, +64 (à 160 MHz) par
- * ligne de 32 octets de flash absente du cache direct de 32 Kio.  Ce sont des
- * ESTIMATIONS, pas des mesures de la puce.
+ * Temps (cycles du cœur) : 1 par instruction, 2 pour MULL, +2 par branche, saut
+ * ou appel pris (RET : +3), +1 si l'instruction suivante utilise le registre
+ * qu'un chargement vient de remplir, MEMW 4 après un rangement ; un chargement
+ * (L32I, L32R...) en IRAM, ROM ou flash coûte 5 de plus, un registre de
+ * périphérique 15 en lecture et 10 en écriture (à 160 MHz ; moitié à 80 MHz,
+ * temps de bus), la DRAM rien.  Ces coûts sont ceux que l'émulateur d'ESPboy
+ * de référence (ESPboy-edu/espboy_emulator, MIT) a mesurés sur une console
+ * (tests/sketches/timing, boucles chaudes) ; ils ne disent rien du coût d'un
+ * défaut du cache d'instructions : un modèle optionnel (xt_miss_cycles, par
+ * ligne de 32 octets, cache direct de 32 Kio) est éteint par défaut et NON
+ * validé.  Le reste du temps (flash, SPI) est estimé par la machine.
  */
 #ifndef ESP8266_XT_H
 #define ESP8266_XT_H
@@ -74,7 +82,9 @@ static struct {
 
 /* modèle de cache de flash (32 Kio, direct, lignes de 32 octets) et coûts */
 static uint32_t xt_ctag[1024];
-static uint32_t xt_miss_cycles = 64;   /* par ligne ; 32 à 80 MHz (la machine le règle) */
+static uint32_t xt_miss_cycles = 0;    /* défaut de cache d'instructions : modèle optionnel, éteint */
+static uint32_t xt_extra;              /* cycles ajoutés par la mémoire que l'instruction touche */
+static uint32_t xt_imem_extra = 5, xt_p_read = 15, xt_p_write = 10; /* mesurés à 160 MHz ; la machine les règle */
 static uint32_t xt_flash_misses, xt_lastline = ~0u;
 
 /* rappels de la machine */
@@ -95,6 +105,7 @@ static void xt_fault(const char *fmt, ...) {
 }
 
 static inline void xt_flash_touch(uint32_t off) {
+    if (!xt_miss_cycles) return;
     uint32_t line = off >> 5, i = line & 1023u;
     if (xt_ctag[i] != line) {
         xt_ctag[i] = line;
@@ -116,17 +127,21 @@ static uint32_t xt_load(uint32_t a, unsigned size) {
         if (size != 4) { xt_fault("LoadStoreError : lecture %u octets en flash %08x, pc=%08x", size, a, xt.pc); return 0; }
         if (a & 3) { xt_fault("LoadStoreAlignment : lecture 32 bits en %08x, pc=%08x", a, xt.pc); return 0; }
         xt_flash_touch(off);
+        xt_extra += xt_imem_extra;
         uint32_t v; memcpy(&v, xt_flash + off, 4); return v;
     }
     if ((off = a - XT_IRAM_BASE) < XT_IRAM_SIZE) {
         if (size != 4) { xt_fault("LoadStoreError : lecture %u octets en IRAM %08x, pc=%08x", size, a, xt.pc); return 0; }
         if (a & 3) { xt_fault("LoadStoreAlignment : lecture 32 bits en %08x, pc=%08x", a, xt.pc); return 0; }
+        xt_extra += xt_imem_extra;
         uint32_t v; memcpy(&v, xt_iram + off, 4); return v;
     }
     if (a >= XT_PERIPH_BASE && a < XT_PERIPH_BASE + 0x10000u) {
         if (size != 4) { xt_fault("lecture périphérique %u octets en %08x, pc=%08x", size, a, xt.pc); return 0; }
+        xt_extra += xt_p_read;
         return xt_periph_read(a);
     }
+    if (a - 0x3FF20000u < 0x20000u) xt_extra += 3; /* compteur WDEV, ROM de données */
     if (a - 0x3FF20000u < 0x20000u) return size == 4 ? xt_periph_read(a) : xt_periph_read(a & ~3u) >> (8 * (a & 3u)); /* ROM de données, WDEV (aléa) */
     if ((off = a - XT_DPORT_BASE) < sizeof xt_dport) {
         uint32_t v = 0;
@@ -154,6 +169,7 @@ static void xt_store(uint32_t a, uint32_t v, unsigned size) {
     }
     if (a >= XT_PERIPH_BASE && a < XT_PERIPH_BASE + 0x10000u) {
         if (size != 4) { xt_fault("écriture périphérique %u octets en %08x, pc=%08x", size, a, xt.pc); return; }
+        xt_extra += xt_p_write;
         xt_periph_write(a, v);
         return;
     }
@@ -224,12 +240,58 @@ static int xt_illegal(uint32_t pc) {
     return 0;
 }
 
+/* registres lus par l'instruction (masque de a0-a15), pour l'interverrouillage
+ * chargement -> utilisation : un registre qu'un chargement vient de remplir
+ * coûte un cycle de plus à l'instruction suivante qui le lit */
+static unsigned xt_reads(uint32_t b0, uint32_t b1, uint32_t b2) {
+    const uint32_t op0 = b0 & 15u, t = b0 >> 4, s = b1 & 15u, r = b1 >> 4;
+    const unsigned S = 1u << s, T = 1u << t;
+    if (op0 >= 8) {
+        switch (op0) {
+        case 8: case 11: return S;                       /* L32I.N, ADDI.N */
+        case 9: case 10: return S | T;                   /* S32I.N, ADD.N */
+        case 12: return (t & 8) ? S : 0;                 /* BEQZ.N / BNEZ.N */
+        case 13: return r == 0 ? S : r == 15 && t == 0 ? 1u : 0; /* MOV.N, RET.N */
+        }
+        return 0;
+    }
+    const uint32_t op1 = b2 & 15u, op2 = b2 >> 4;
+    switch (op0) {
+    case 0:
+        switch (op1) {
+        case 0:
+            if (op2 == 0) return r == 0 ? (t == 8 ? 1u : S) : r == 1 || r == 6 ? S : 0;
+            if (op2 == 4) return r <= 3 || r >= 14 ? S : 0;
+            if (op2 == 6) return T;
+            if (op2 == 5) return 0;
+            return S | T;
+        case 1:
+            if (op2 <= 1 || op2 == 10) return S;
+            if (op2 == 2 || op2 == 3 || op2 == 4 || op2 == 6 || op2 == 9 || op2 == 11) return T;
+            return S | T;
+        case 2: return S | T;
+        case 3: return op2 == 0 ? 0 : op2 == 1 ? T : op2 == 2 || op2 == 3 ? S : S | T;
+        case 4: case 5: return T;
+        }
+        return 0;
+    case 2:
+        if (r == 10) return 0;
+        if (r == 4 || r == 5 || r == 6 || r == 14 || r == 15) return S | T;
+        return S;
+    case 6: return (t & 3) == 0 ? 0 : S;
+    case 7: return (r == 6 || r == 7 || r == 14 || r == 15) ? S : S | T;
+    }
+    return 0;
+}
+
 /* exécute jusqu'au cycle `until` (ou la fin demandée par la machine) */
 static void xt_run(uint64_t until) {
     uint32_t cbase = 0, cend = 0;
     const uint8_t *cmem = NULL;
     uint32_t pc = xt.pc;
     uint32_t *a = xt.a;
+    unsigned lastload = 16;   /* registre rempli par l'instruction précédente (16 : aucun) */
+    int after_store = 0;      /* l'instruction précédente a rangé : MEMW attend */
 
     while (!xt.halted && xt.cycles < until) {
         if (xt.cycles >= xt.next_event) {
@@ -254,6 +316,10 @@ static void xt_run(uint64_t until) {
         fprintf(stderr, "%08x %02x%02x%02x  a0=%08x a1=%08x a2=%08x a3=%08x a4=%08x\n", pc, b0, b1, ip[2], a[0], a[1], a[2], a[3], a[4]);
 #endif
         uint32_t next, cost = 1;
+        unsigned loaded = 16;
+        int stored = 0;
+        xt_extra = 0;
+        if (lastload < 16 && (xt_reads(b0, b1, ip[2]) >> lastload & 1u)) cost++;
         xt.pc = pc;
 
         if (op0 >= 8) { /* instructions 16 bits (density) */
@@ -263,9 +329,9 @@ static void xt_run(uint64_t until) {
             case 8: { /* L32I.N */
                 uint32_t v = xt_load(a[s] + (r << 2), 4);
                 if (xt.halted) goto out;
-                a[t] = v; break; }
+                a[t] = v; loaded = t; break; }
             case 9: /* S32I.N */
-                xt_store(a[s] + (r << 2), a[t], 4); break;
+                xt_store(a[s] + (r << 2), a[t], 4); stored = 1; break;
             case 10: a[r] = a[s] + a[t]; break; /* ADD.N */
             case 11: a[r] = a[s] + (t ? t : (uint32_t)-1); break; /* ADDI.N */
             case 12: /* ST2 */
@@ -281,7 +347,7 @@ static void xt_run(uint64_t until) {
             case 13: /* ST3 */
                 if (r == 0) a[t] = a[s]; /* MOV.N */
                 else if (r == 15) {
-                    if (t == 0) { next = a[0]; cost += 2; } /* RET.N */
+                    if (t == 0) { next = a[0]; cost += 3; } /* RET.N */
                     else if (t == 3) { /* NOP.N */ }
                     else if (t == 2) { xt.halted = 2; snprintf(xt.msg, sizeof xt.msg, "BREAK.N %u en %08x", s, pc); goto out; }
                     else { xt_fault("instruction narrow %02x%02x illégale en %08x", b1, b0, pc); goto out; }
@@ -303,7 +369,7 @@ static void xt_run(uint64_t until) {
                         case 0: /* SNM0 : CALLX/JX/RET */
                             if (t == 0xC) { const uint32_t tgt = a[s]; a[0] = pc + 3; next = tgt; cost += 2; } /* CALLX0 */
                             else if (t == 0xA) { next = a[s]; cost += 2; }                  /* JX */
-                            else if (t == 8) { next = a[0]; cost += 2; }                    /* RET */
+                            else if (t == 8) { next = a[0]; cost += 3; }                    /* RET */
                             else if (t == 0 && s == 0) { /* ILL : fonction émulée (ROM, accrochée) ou vraie faute */
                                 xt.pc = pc;
                                 if (!xt_illegal(pc)) goto out;
@@ -311,7 +377,7 @@ static void xt_run(uint64_t until) {
                             } else { xt_fault("SNM0 t=%u illégal (fenêtres ?) en %08x", t, pc); goto out; }
                             break;
                         case 1: a[t] = a[s]; break; /* MOVSP */
-                        case 2: break; /* SYNC : ISYNC RSYNC ESYNC DSYNC EXCW MEMW EXTW NOP */
+                        case 2: if (t == 12 && after_store) cost = 4; break; /* SYNC : ISYNC... MEMW (attend le rangement) */
                         case 4: xt.halted = 2; snprintf(xt.msg, sizeof xt.msg, "BREAK %u,%u en %08x", s, t, pc); goto out;
                         case 5: xt_fault("SYSCALL en %08x", pc); goto out;
                         case 6: /* RSIL */
@@ -388,7 +454,7 @@ static void xt_run(uint64_t until) {
                     break;
                 case 2: /* RST2 */
                     switch (op2) {
-                    case 8: a[r] = a[s] * a[t]; break; /* MULL */
+                    case 8: a[r] = a[s] * a[t]; cost = 2; break; /* MULL */
                     case 10: a[r] = (uint32_t)(((uint64_t)a[s] * a[t]) >> 32); break; /* MULUH */
                     case 11: a[r] = (uint32_t)(((int64_t)(int32_t)a[s] * (int32_t)a[t]) >> 32); break; /* MULSH */
                     case 12: case 13: case 14: case 15:
@@ -434,28 +500,28 @@ static void xt_run(uint64_t until) {
                 uint32_t addr = ((pc + 3) & ~3u) + (0xFFFC0000u | (((b2 << 8) | b1) << 2));
                 uint32_t v = xt_load(addr, 4);
                 if (xt.halted) goto out;
-                a[t] = v; break; }
+                a[t] = v; loaded = t; break; }
             case 2: { /* LSAI */
                 const uint32_t imm8 = b2;
                 switch (r) {
-                case 0: { uint32_t v = xt_load(a[s] + imm8, 1); if (xt.halted) goto out; a[t] = v; break; }
-                case 1: { uint32_t v = xt_load(a[s] + (imm8 << 1), 2); if (xt.halted) goto out; a[t] = v; break; }
-                case 2: { uint32_t v = xt_load(a[s] + (imm8 << 2), 4); if (xt.halted) goto out; a[t] = v; break; }
-                case 4: xt_store(a[s] + imm8, a[t], 1); break;
-                case 5: xt_store(a[s] + (imm8 << 1), a[t], 2); break;
-                case 6: xt_store(a[s] + (imm8 << 2), a[t], 4); break;
+                case 0: { uint32_t v = xt_load(a[s] + imm8, 1); if (xt.halted) goto out; a[t] = v; loaded = t; break; }
+                case 1: { uint32_t v = xt_load(a[s] + (imm8 << 1), 2); if (xt.halted) goto out; a[t] = v; loaded = t; break; }
+                case 2: { uint32_t v = xt_load(a[s] + (imm8 << 2), 4); if (xt.halted) goto out; a[t] = v; loaded = t; break; }
+                case 4: xt_store(a[s] + imm8, a[t], 1); stored = 1; break;
+                case 5: xt_store(a[s] + (imm8 << 1), a[t], 2); stored = 1; break;
+                case 6: xt_store(a[s] + (imm8 << 2), a[t], 4); stored = 1; break;
                 case 7: break; /* cache : sans effet */
-                case 9: { uint32_t v = xt_load(a[s] + (imm8 << 1), 2); if (xt.halted) goto out; a[t] = (uint32_t)(int32_t)(int16_t)v; break; }
+                case 9: { uint32_t v = xt_load(a[s] + (imm8 << 1), 2); if (xt.halted) goto out; a[t] = (uint32_t)(int32_t)(int16_t)v; loaded = t; break; }
                 case 10: a[t] = (uint32_t)xt_sext((s << 8) | imm8, 12); break; /* MOVI */
-                case 11: { uint32_t v = xt_load(a[s] + (imm8 << 2), 4); if (xt.halted) goto out; a[t] = v; break; } /* L32AI */
+                case 11: { uint32_t v = xt_load(a[s] + (imm8 << 2), 4); if (xt.halted) goto out; a[t] = v; loaded = t; break; } /* L32AI */
                 case 12: a[t] = a[s] + (uint32_t)xt_sext(imm8, 8); break; /* ADDI */
                 case 13: a[t] = a[s] + ((uint32_t)xt_sext(imm8, 8) << 8); break; /* ADDMI */
                 case 14: { /* S32C1I */
                     uint32_t ad = a[s] + (imm8 << 2), old = xt_load(ad, 4);
                     if (xt.halted) goto out;
                     if (old == xt.sr[SR_SCOMPARE1]) xt_store(ad, a[t], 4);
-                    a[t] = old; break; }
-                case 15: xt_store(a[s] + (imm8 << 2), a[t], 4); break; /* S32RI */
+                    a[t] = old; loaded = t; stored = 1; break; }
+                case 15: xt_store(a[s] + (imm8 << 2), a[t], 4); stored = 1; break; /* S32RI */
                 default: xt_fault("LSAI r=%u illégal en %08x", r, pc); goto out;
                 }
                 break; }
@@ -522,7 +588,9 @@ static void xt_run(uint64_t until) {
         }
         if (xt.halted) break;
         if (xt.lcount && next == xt.lend && !(xt.ps & XT_PS_EXCM)) { xt.lcount--; next = xt.lbeg; }
-        xt.cycles += cost;
+        xt.cycles += cost + xt_extra;
+        lastload = loaded;
+        after_store = stored;
         pc = next;
         continue;
     out:

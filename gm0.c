@@ -5333,6 +5333,7 @@ static int esp_start(const uint8_t *fw, size_t fwlen, const uint8_t *rom, size_t
     espSym = sym ? malloc(symlen + 1) : NULL; if (espSym) { memcpy(espSym, sym, symlen); espSym[symlen] = 0; } espSymLen = sym ? symlen : 0;
     audio_rebase();
     tickCount = 0;
+    { const char *m = getenv("GM0_ESP_FLASH_MISS"); esp_miss_opt = m ? (uint32_t)atoi(m) : 0; }
     int r = esp_power_on(espFw, espFwLen, espRom, espRomLen, espSym, espSymLen);
     if (r) {
         fprintf(stderr, r == -2 ? TR("ESPboy : symboles absents (ni .sym ni ELF) : démarrage impossible\n",
@@ -5374,6 +5375,7 @@ static void esp_load_firmware(const uint8_t *data, size_t len, const char *path)
 static void esp_frame(void) {
     esp_run((uint64_t)(esp.cpu_hz / 59.7275 + 0.5));
     tickCount = (uint32_t)xt.cycles;
+    esp_lcd_render(esp_fb);
     memcpy(pix, esp_fb, sizeof esp_fb);
     if (esp.flash_dirty && ++espSaveTick >= 60) { espSaveTick = 0; esp_save_flush(0); }
 }

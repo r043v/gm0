@@ -29,6 +29,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--shot") && i + 1 < argc) shot = argv[++i];
         else if (!strcmp(argv[i], "--keys") && i + 1 < argc) keys = argv[++i];
+        else if (!strcmp(argv[i], "--time-scale") && i + 1 < argc) esp_time_scale = atof(argv[++i]);
         else if (!fwp) fwp = argv[i]; else romp = argv[i];
     }
     size_t fn = 0, rn = 0, sn = 0;
@@ -60,6 +61,7 @@ int main(int argc, char **argv) {
       if (g) printf("gbl_frame=%u en %.2f s émulées : %.1f images/s (59.7 = pleine vitesse ; estimation, pas une mesure)\n", esp_peek32(g),
                     (double)(xt.cycles - c0) / esp.cpu_hz, esp_peek32(g) / ((double)(xt.cycles - c0) / esp.cpu_hz)); }
     if (shot) {
+        esp_lcd_render(esp_fb);
         FILE *f = fopen(shot, "wb");
         fprintf(f, "P6\n%d %d\n255\n", ESP_SCR_W, ESP_SCR_H);
         for (int i = 0; i < ESP_SCR_W * ESP_SCR_H; i++) {

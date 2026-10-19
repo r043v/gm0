@@ -51,11 +51,19 @@ static uint32_t saved[4];
 
 void setup(void) {
     system_update_cpu_freq(160);
+    REG(0x60000774) = 1;           /* RTC_GPIO_ENABLE : GPIO16 (D/C) en sortie */
+    REG(0x3ff00004) |= 2;          /* DPORT : interruption de front de FRC1 autorisée */
+    { unsigned char pu[2] = {0x0c, 0xff}; twi_writeTo(0x20, pu, 2, 1); } /* GPPUA : tirages des boutons (sans eux, 0 = tout appuyé) */
+#ifdef CS_HIGH
+    { unsigned char b[3] = {0x01, 0xfe, 0}, o[2] = {0x15, 0x01}; /* IODIRB : B0 en sortie ; OLATB : B0 haut = écran non sélectionné */
+      twi_writeTo(0x20, b, 2, 1); twi_writeTo(0x20, o, 2, 1); }
+#endif
     cmd(0x01); cmd(0x11);
 #ifndef MADCTL
 #define MADCTL 0xc8 /* MX | MY | BGR : ce que pose le firmware m0boy */
 #endif
     cmd(0x36); data(MADCTL);
+    cmd(0x3a); data(5); /* 16 bits par pixel (au reset : 18) */
     cmd(0x29);
     spi_flash_read(0x3c0000, saved, 16);
     uint32_t had = saved[0] == 0x50415645u; /* « EVAP » écrit par une partie précédente */

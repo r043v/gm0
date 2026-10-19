@@ -158,15 +158,29 @@ fait ce qu'il laisse (pile cont, ISR de timer1, constructeurs C++) puis appelle
 Wi-Fi.  Toute autre fonction de la ROM appelée et non émulée arrête l'exécution
 en donnant son nom.
 
-- Le temps est compté en cycles du cœur à 80 ou 160 MHz : 1 par instruction,
-  +2 par branche prise, défauts du cache de flash (32 Kio direct, lignes de 32
-  octets, 64 cycles à 160 MHz), octets SPI à l'horloge programmée, effacement
-  de flash 45 ms et programmation 0,7 ms par page.  **Ce sont des estimations,
-  pas des mesures de la puce.**
-- L'écran prend la fenêtre 128×128 en (2, 3) de la RAM du ST7735 (`MADCTL`
-  est sinon ignoré).  Le panneau est BGR : les pixels ne sont lus en RGB565
-  que si `MADCTL.BGR` (bit 3) est à 1, ce que pose le firmware m0boy (`0xC8`) ;
-  à 0, le rouge et le bleu sont échangés comme sur la puce.
+- Le temps est compté en cycles du cœur à 80 ou 160 MHz avec les coûts que
+  l'[émulateur ESPboy-edu/espboy_emulator](https://github.com/ESPboy-edu/espboy_emulator)
+  (MIT) a mesurés sur une console, boucles chaudes : 1 par instruction, 2 pour
+  `MULL`, +2 par branche ou appel pris (`RET` +3), +1 si l'instruction suivante
+  utilise un registre qu'un chargement vient de remplir, `MEMW` 4 après un
+  rangement, +5 par chargement en IRAM, ROM ou flash mappée (littéraux compris),
+  +15 par lecture d'un registre de périphérique et +10 par écriture (moitié en
+  cycles à 80 MHz, temps de bus), rien depuis la DRAM.  Ni validé ici ni dans
+  cette référence : le coût d'un défaut du cache d'instructions
+  (`GM0_ESP_FLASH_MISS=<cycles par ligne de 32 octets>` active un cache direct
+  de 32 Kio, éteint par défaut), les octets SPI à l'horloge que programme le
+  firmware, l'effacement de flash 45 ms et la programmation 0,7 ms par page.
+  Ce sont donc des estimations bâties sur des coûts d'instruction mesurés, pas
+  des mesures de ce firmware sur la puce.
+- L'écran est le modèle de la fiche du ST7735S (mémoire 132×162 en 18 bits,
+  miroirs de `MADCTL`, pixels de 12/16/18 bits) avec ce que fait le panneau de
+  l'ESPboy : adresses de colonne et de ligne sur leur octet bas seulement,
+  `SWRESET` qui garde `MADCTL` et `COLMOD`, panneau BGR (`MADCTL.BGR` à 0
+  échange rouge et bleu au balayage, mémoire déjà écrite comprise), blanc
+  endormi ou éteint, et il n'écoute que si B0 du MCP23017 (CS) est bas.  Avec la
+  config de TFT_eSPI (`MADCTL` 0xC8, fenêtre colonne 2, ligne 3, comme le
+  firmware m0boy), le pixel (x, y) de la vitre est la mémoire (129 − x,
+  128 − y).  Mode partiel, défilement et veille ne sont pas modélisés.
 - Les sauvegardes du firmware (flash `0x3C0000-0x3FB000`) sont conservées dans
   `<nom>.sav` à côté du firmware (ou du zip).
 - Tests : `tests/esp/run_tests.py` compare le cœur Xtensa et les fonctions de

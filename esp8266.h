@@ -44,6 +44,8 @@ static uint8_t esp_buttons_pressed(void);  /* bit 0 gauche, 1 haut, 2 bas, 3 dro
 
 /* ---------------------------------------------------------------- état */
 static uint16_t esp_fb[ESP_SCR_W * ESP_SCR_H];
+static uint32_t esp_gram[162][132];       /* mémoire d'image du ST7735 : 18 bits, R 17:12, V 11:6, B 5:0 */
+static uint32_t esp_miss_opt;             /* GM0_ESP_FLASH_MISS : défaut de cache d'instructions (optionnel, non validé) */
 static struct {
     double   cpu_hz;
     uint64_t cycle_base; double us_base;   /* temps : us_base à cycle_base */
@@ -68,9 +70,11 @@ static struct {
     unsigned flash_bad_writes; int flash_dirty;
     uint64_t spi_bytes, flash_reads, flash_writes, flash_erases;
     /* écran */
-    int lcd_cmd, lcd_argn, lcd_hi, lcd_x, lcd_y, lcd_x0, lcd_x1, lcd_y0, lcd_y1, lcd_on, lcd_inv;
-    uint8_t lcd_args[16], lcd_madctl, lcd_colmod, lcd_hi_byte;
+    int      lcd_cmd, lcd_argn, lcd_npix, lcd_writing, lcd_sleeping, lcd_on, lcd_inv;
+    int      lcd_xs, lcd_xe, lcd_ys, lcd_ye, lcd_cx, lcd_cy;
+    uint8_t  lcd_args[16], lcd_madctl, lcd_colmod, lcd_pix[3];
     uint64_t lcd_pixels, lcd_frames;
+    uint16_t lcd_last_ys;
     uint32_t cont_bytes;                    /* CONT_STACKSIZE du firmware */
     uint32_t scont, stage;                  /* démarrage : structure cont, étape */
     const uint8_t *fw; size_t fwlen; int fw_is_elf; /* image, pour redémarrer */
@@ -82,7 +86,11 @@ static void esp_set_freq(unsigned mhz) {
     esp.us_base = esp_us();
     esp.cycle_base = xt.cycles;
     esp.cpu_hz = mhz * 1e6;
-    xt_miss_cycles = mhz >= 160 ? 64 : 32;
+    /* coûts mesurés à 160 MHz (émulateur de référence) ; temps de bus : moitié en cycles à 80 MHz */
+    xt_imem_extra = 5;
+    xt_p_read = mhz >= 160 ? 15 : 8;
+    xt_p_write = mhz >= 160 ? 10 : 5;
+    xt_miss_cycles = esp_miss_opt ? (mhz >= 160 ? esp_miss_opt : esp_miss_opt / 2) : 0;
     uint32_t cpu2x = 0;
     memcpy(&cpu2x, xt_dport + 0x14, 4);
     cpu2x = (cpu2x & ~1u) | (mhz >= 160 ? 1u : 0u);
@@ -283,8 +291,11 @@ static void esp_sleep(uint64_t until_cycle) {
 static void rom_delay_us(void) { if (!esp.sleeping) esp_sleep(xt.cycles + (uint64_t)((double)A(2) * esp.cpu_hz / 1e6)); else esp_sleep(0); }
 
 /* ---- SDK / cœur Arduino accrochés par nom */
-static void hk_micros(void) { A(2) = (uint32_t)esp_us(); }
-static void hk_millis(void) { A(2) = (uint32_t)(esp_us() / 1000.0); }
+/* esp_time_scale > 1 : micros()/millis() courent plus vite que le temps émulé, pour qu'un frontal qui attend
+ * l'échéance de son image tourne à la vitesse que le processeur permet (mesure de marge, jamais par défaut) */
+static double esp_time_scale = 1.0;
+static void hk_micros(void) { A(2) = (uint32_t)(esp_us() * esp_time_scale); }
+static void hk_millis(void) { A(2) = (uint32_t)(esp_us() * esp_time_scale / 1000.0); }
 static void hk_delay(void) { if (!esp.sleeping) esp_sleep(xt.cycles + (uint64_t)((double)A(2) * esp.cpu_hz / 1e3)); else esp_sleep(0); }
 static void hk_ret(void) { }
 static void hk_ret1(void) { A(2) = 1; }
@@ -292,11 +303,26 @@ static void hk_ret0(void) { A(2) = 0; }
 static void hk_get_cpu_freq(void) { A(2) = (uint32_t)(esp.cpu_hz / 1e6); }
 static void hk_update_cpu_freq(void) { unsigned m = A(2); if (m != 80 && m != 160) { A(2) = 0; return; } esp_set_freq(m); A(2) = 1; }
 static void hk_restart(void) { esp.restart = 1; esp_stay = 1; xt.halted = 2; snprintf(xt.msg, sizeof xt.msg, "redémarrage"); }
+/* MCP23017 : niveau des broches d'un port (sortie : le verrou ; entrée : le dehors, boutons à la masse sur A,
+ * sinon le tirage) ; le CS de l'écran est la broche B0, bas = sélectionné, et reste sélectionné tant que B0 est
+ * une entrée sans tirage */
+static uint8_t esp_mcp_pins(int port, uint8_t pressed) {
+    uint8_t dir = esp.mcp[0x00 + port], olat = esp.mcp[0x14 + port], pu = esp.mcp[0x0c + port];
+    uint8_t outside = pu;
+    if (port == 0) outside &= (uint8_t)~pressed;
+    return (uint8_t)((olat & ~dir) | (outside & dir));
+}
+static int esp_lcd_selected(void) { return !(esp_mcp_pins(1, 0) & 1); }
 static void hk_twi_write(void) {
     uint32_t addr = A(2), buf = A(3), len = A(4);
     if (addr == 0x20) {
         if (len >= 1) esp.mcp_ptr = esp_peek8(buf);
-        for (uint32_t i = 1; i < len; i++) if (esp.mcp_ptr < sizeof esp.mcp) esp.mcp[esp.mcp_ptr++] = esp_peek8(buf + i);
+        for (uint32_t i = 1; i < len; i++) {
+            uint8_t reg = esp.mcp_ptr;
+            if (reg == 0x12 || reg == 0x13) reg += 2;     /* GPIO écrit le verrou */
+            if (reg < sizeof esp.mcp) esp.mcp[reg] = esp_peek8(buf + i);
+            esp.mcp_ptr = (uint8_t)((esp.mcp_ptr + 1) % 0x16);
+        }
         A(2) = 0;
     } else if (addr == 0x60) { for (uint32_t i = 0; i < len && i < 3; i++) esp.dac[i] = esp_peek8(buf + i); A(2) = 0; }
     else A(2) = 2; /* NACK */
@@ -305,11 +331,11 @@ static void hk_twi_read(void) {
     uint32_t addr = A(2), buf = A(3), len = A(4);
     if (addr != 0x20) { A(2) = 2; return; }
     for (uint32_t i = 0; i < len; i++) {
-        uint8_t v = 0xff;
-        if (esp.mcp_ptr == 0x12) v = (uint8_t)~esp_buttons_pressed();   /* GPIOA : actif bas */
+        uint8_t v = 0;
+        if (esp.mcp_ptr == 0x12 || esp.mcp_ptr == 0x13) v = esp_mcp_pins(esp.mcp_ptr - 0x12, esp_buttons_pressed());
         else if (esp.mcp_ptr < sizeof esp.mcp) v = esp.mcp[esp.mcp_ptr];
         esp_poke8(buf + i, v);
-        esp.mcp_ptr++;
+        esp.mcp_ptr = (uint8_t)((esp.mcp_ptr + 1) % 0x16);
     }
     A(2) = 0;
 }
@@ -348,41 +374,106 @@ static void esp_install_hooks(void) {
     for (unsigned i = 0; i < sizeof t / sizeof t[0]; i++) esp_hook(t[i].n, t[i].f);
 }
 
-/* ---------------------------------------------------------------- écran ST7735 */
-static void lcd_pixel(uint16_t c) {
-    int x = esp.lcd_x - 2, y = esp.lcd_y - 3; /* fenêtre visible 128x128 de la mémoire 132x162 (assumé) */
-    if (esp.lcd_inv) c = (uint16_t)~c;
-    /* le panneau est BGR : les données sont lues dans l'ordre RVB seulement si MADCTL.BGR (bit 3) est à 1,
-     * ce que le firmware pose (0xC8) ; à 0, rouge et bleu sont échangés comme sur la puce */
-    if (!(esp.lcd_madctl & 8)) c = (uint16_t)(((c & 31u) << 11) | (c & 0x7e0u) | (c >> 11));
-    if ((unsigned)x < ESP_SCR_W && (unsigned)y < ESP_SCR_H) esp_fb[y * ESP_SCR_W + x] = c;
+/* ---------------------------------------------------------------- écran ST7735
+ * Modèle de la fiche du ST7735S (mémoire 132x162, 18 bits) et de ce que fait le
+ * panneau de l'ESPboy : adresses de colonne et de ligne sur leur octet bas
+ * seulement, panneau BGR (le bit BGR de MADCTL à 0 échange rouge et bleu quand
+ * l'image est balayée, donc aussi pour ce que la mémoire contient déjà),
+ * SWRESET qui garde MADCTL et COLMOD, écran blanc tant qu'il est endormi ou
+ * éteint.  Tel que posé par TFT_eSPI (MADCTL 0xC8, fenêtre colonne 2, ligne 3),
+ * le pixel (x, y) de la vitre est la case mémoire (129 - x, 128 - y).  Mode
+ * partiel, défilement et veille ne sont pas modélisés (le firmware ne s'en sert pas). */
+#define LCD_MAD_MY 0x80
+#define LCD_MAD_MX 0x40
+#define LCD_MAD_MV 0x20
+#define LCD_MAD_BGR 0x08
+static void lcd_common_reset(void) {
+    esp.lcd_cmd = 0; esp.lcd_argn = 0; esp.lcd_writing = 0; esp.lcd_npix = 0;
+    esp.lcd_sleeping = 1; esp.lcd_on = 0; esp.lcd_inv = 0;
+    esp.lcd_xs = 0; esp.lcd_xe = 131; esp.lcd_ys = 0; esp.lcd_ye = 131; esp.lcd_cx = esp.lcd_cy = 0;
+}
+static void lcd_power_on(void) {
+    uint32_t r = 0x12345678u;
+    for (int y = 0; y < 162; y++) for (int x = 0; x < 132; x++) { r = r * 1664525u + 1013904223u; esp_gram[y][x] = (r >> 14) & 0x3ffffu; }
+    esp.lcd_madctl = 0; esp.lcd_colmod = 6;
+    lcd_common_reset();
+}
+static void lcd_put(uint32_t c) {
+    int col = esp.lcd_cx, row = esp.lcd_cy;
+    if (esp.lcd_madctl & LCD_MAD_MV) { int t = col; col = row; row = t; }
+    if (esp.lcd_madctl & LCD_MAD_MX) col = 131 - col;
+    if (esp.lcd_madctl & LCD_MAD_MY) row = 131 - row;
+    if ((unsigned)col < 132 && (unsigned)row < 162) esp_gram[row][col] = c;
     esp.lcd_pixels++;
-    if (++esp.lcd_x > esp.lcd_x1) {
-        esp.lcd_x = esp.lcd_x0;
-        if (++esp.lcd_y > esp.lcd_y1) { esp.lcd_y = esp.lcd_y0; esp.lcd_frames++; }
+    if (++esp.lcd_cx > esp.lcd_xe) {
+        esp.lcd_cx = esp.lcd_xs;
+        if (++esp.lcd_cy > esp.lcd_ye) { esp.lcd_cy = esp.lcd_ys; esp.lcd_frames++; }
+    }
+}
+static uint32_t lcd_c5(unsigned v) { return v << 1 | (v == 31); }   /* 5 bits -> 6 : décalé, bit bas à 1 seulement à pleine intensité */
+static uint32_t lcd_c4(unsigned v) { return v << 2 | v >> 2; }
+static void lcd_pixel_byte(uint8_t b) {
+    esp.lcd_pix[esp.lcd_npix++] = b;
+    switch (esp.lcd_colmod & 7) {
+    case 5: /* 16 bits */
+        if (esp.lcd_npix == 2) {
+            unsigned c = (unsigned)esp.lcd_pix[0] << 8 | esp.lcd_pix[1];
+            lcd_put(lcd_c5(c >> 11) << 12 | ((c >> 5) & 63u) << 6 | lcd_c5(c & 31u));
+            esp.lcd_npix = 0;
+        }
+        break;
+    case 3: /* 12 bits : deux pixels en trois octets */
+        if (esp.lcd_npix == 2) lcd_put(lcd_c4(esp.lcd_pix[0] >> 4) << 12 | lcd_c4(esp.lcd_pix[0] & 15u) << 6 | lcd_c4(esp.lcd_pix[1] >> 4));
+        else if (esp.lcd_npix == 3) { lcd_put(lcd_c4(esp.lcd_pix[1] & 15u) << 12 | lcd_c4(esp.lcd_pix[2] >> 4) << 6 | lcd_c4(esp.lcd_pix[2] & 15u)); esp.lcd_npix = 0; }
+        break;
+    default: /* 18 bits */
+        if (esp.lcd_npix == 3) { lcd_put((uint32_t)(esp.lcd_pix[0] >> 2) << 12 | (uint32_t)(esp.lcd_pix[1] >> 2) << 6 | (uint32_t)(esp.lcd_pix[2] >> 2)); esp.lcd_npix = 0; }
+        break;
     }
 }
 static void lcd_byte(int dc, uint8_t b) {
-    if (!dc) {
-        esp.lcd_cmd = b; esp.lcd_argn = 0; esp.lcd_hi = 0;
-        if (b == 0x2c) { esp.lcd_x = esp.lcd_x0; esp.lcd_y = esp.lcd_y0; }
-        else if (b == 0x01) { esp.lcd_on = 0; esp.lcd_inv = 0; esp.lcd_madctl = 0; }
-        else if (b == 0x20) esp.lcd_inv = 0;
-        else if (b == 0x21) esp.lcd_inv = 1;
-        else if (b == 0x29) esp.lcd_on = 1;
+    if (!dc) { /* commande */
+        esp.lcd_cmd = b; esp.lcd_argn = 0; esp.lcd_writing = 0; esp.lcd_npix = 0;
+        switch (b) {
+        case 0x01: lcd_common_reset(); break;          /* SWRESET : garde MADCTL et COLMOD */
+        case 0x10: esp.lcd_sleeping = 1; break;
+        case 0x11: esp.lcd_sleeping = 0; break;
+        case 0x20: esp.lcd_inv = 0; break;
+        case 0x21: esp.lcd_inv = 1; break;
+        case 0x28: esp.lcd_on = 0; break;
+        case 0x29: esp.lcd_on = 1; break;
+        case 0x2c:
+            if (esp.lcd_ys <= esp.lcd_last_ys) esp.lcd_frames++;
+            esp.lcd_last_ys = (uint16_t)esp.lcd_ys;
+            esp.lcd_writing = 1; esp.lcd_cx = esp.lcd_xs; esp.lcd_cy = esp.lcd_ys;
+            break;
+        }
         return;
     }
-    if (esp.lcd_cmd == 0x2c) {
-        if (!esp.lcd_hi) { esp.lcd_hi_byte = b; esp.lcd_hi = 1; }
-        else { esp.lcd_hi = 0; lcd_pixel((uint16_t)(esp.lcd_hi_byte << 8 | b)); }
-        return;
+    if (esp.lcd_writing) { lcd_pixel_byte(b); return; }
+    int n = ++esp.lcd_argn;
+    if (n <= 16) esp.lcd_args[n - 1] = b;
+    switch (esp.lcd_cmd) {
+    case 0x2a: if (n == 2) esp.lcd_xs = esp.lcd_args[1]; if (n == 4) esp.lcd_xe = esp.lcd_args[3]; break;  /* octet bas seulement */
+    case 0x2b: if (n == 2) esp.lcd_ys = esp.lcd_args[1]; if (n == 4) esp.lcd_ye = esp.lcd_args[3]; break;
+    case 0x36: if (n == 1) esp.lcd_madctl = b; break;
+    case 0x3a: if (n == 1) esp.lcd_colmod = b; break;
     }
-    if (esp.lcd_argn < 16) esp.lcd_args[esp.lcd_argn] = b;
-    esp.lcd_argn++;
-    if (esp.lcd_cmd == 0x2a && esp.lcd_argn == 4) { esp.lcd_x0 = esp.lcd_args[0] << 8 | esp.lcd_args[1]; esp.lcd_x1 = esp.lcd_args[2] << 8 | esp.lcd_args[3]; esp.lcd_x = esp.lcd_x0; }
-    else if (esp.lcd_cmd == 0x2b && esp.lcd_argn == 4) { esp.lcd_y0 = esp.lcd_args[0] << 8 | esp.lcd_args[1]; esp.lcd_y1 = esp.lcd_args[2] << 8 | esp.lcd_args[3]; esp.lcd_y = esp.lcd_y0; }
-    else if (esp.lcd_cmd == 0x36 && esp.lcd_argn == 1) esp.lcd_madctl = b;
-    else if (esp.lcd_cmd == 0x3a && esp.lcd_argn == 1) esp.lcd_colmod = b;
+}
+/* la vitre telle qu'elle est maintenant, en RGB565 (R en haut), 128x128 */
+static void esp_lcd_render(uint16_t *out) {
+    if (!esp.lcd_on || esp.lcd_sleeping) { for (int i = 0; i < ESP_SCR_W * ESP_SCR_H; i++) out[i] = 0xffffu; return; }
+    const int swap = !(esp.lcd_madctl & LCD_MAD_BGR);
+    for (int y = 0; y < 128; y++) {
+        const uint32_t *src = esp_gram[128 - y];
+        for (int x = 0; x < 128; x++) {
+            uint32_t v = src[129 - x];
+            if (esp.lcd_inv) v ^= 0x3ffffu;
+            uint32_t r = v >> 12, g = (v >> 6) & 63u, b = v & 63u;
+            if (swap) { uint32_t t = r; r = b; b = t; }
+            out[y * 128 + x] = (uint16_t)((r >> 1) << 11 | g << 5 | (b >> 1));
+        }
+    }
 }
 
 /* ---------------------------------------------------------------- périphériques */
@@ -395,7 +486,10 @@ static double esp_spi_hz(void) {
 static void spi1_go(void) {
     uint32_t bits = ((esp.spi1[0x20 / 4] >> 17) & 0x1ffu) + 1u, bytes = (bits + 7u) / 8u;
     if (!(esp.spi1[0x1c / 4] & (1u << 27))) return;      /* pas de phase MOSI */
-    for (uint32_t i = 0; i < bytes && i < 64; i++) lcd_byte(esp.dc, (uint8_t)(esp.spi1[0x40 / 4 + i / 4] >> (8 * (i & 3))));
+    /* D/C est GPIO16 (bloc RTC) : haut = donnée, y compris tant que la broche n'est pas une sortie */
+    const int dc = (esp.rtc[(0x774 - 0x700) / 4] & 1) ? (int)(esp.rtc[(0x768 - 0x700) / 4] & 1) : 1;
+    const int selected = esp_lcd_selected();
+    for (uint32_t i = 0; selected && i < bytes && i < 64; i++) lcd_byte(dc, (uint8_t)(esp.spi1[0x40 / 4 + i / 4] >> (8 * (i & 3))));
     esp.spi_bytes += bytes;
     xt.cycles += (uint64_t)((double)bytes * 8.0 * esp.cpu_hz / esp_spi_hz());
 }
@@ -461,7 +555,6 @@ static void xt_periph_write(uint32_t a, uint32_t v) {
     }
     if (r >= 0x700 && r < 0x800) {
         esp.rtc[(r - 0x700) / 4] = v;
-        if (r == 0x768) esp.dc = (int)(v & 1u);  /* RTC_GPIO_OUT : GPIO16 */
         return;
     }
     if (r >= 0x800 && r < 0x900) { esp.iomux[(r - 0x800) / 4] = v; return; }
@@ -491,7 +584,8 @@ static void esp_isr_enter(unsigned bit) {
 }
 static void xt_events(void) {
     if (esp.t1_on && xt.cycles >= esp.t1_next) {
-        xt.sr[SR_INTERRUPT] |= 1u << 9; /* FRC1 : interruption de front */
+        uint32_t edge_enable; memcpy(&edge_enable, xt_dport + 4, 4);
+        if (edge_enable & 2u) xt.sr[SR_INTERRUPT] |= 1u << 9; /* FRC1 : interruption de front, si DPORT l'autorise */
         if (esp.t1_ctrl & 0x40) { /* recharge */
             static const uint32_t divs[4] = {1, 16, 256, 256};
             double per = (double)esp.t1_load * (esp.cpu_hz / 80e6 * divs[(esp.t1_ctrl >> 2) & 3]);
@@ -641,11 +735,11 @@ static void esp_machine_reset(void) {
     memset(esp.gpio, 0, sizeof esp.gpio); memset(esp.spi1, 0, sizeof esp.spi1);
     memset(esp.rtc, 0, sizeof esp.rtc); memset(esp.iomux, 0, sizeof esp.iomux); memset(esp.regs, 0, sizeof esp.regs);
     memset(esp.isr, 0, sizeof esp.isr);
-    esp.isr_depth = 0; esp.sleeping = 0; esp.t1_on = 0; esp.t1_load = esp.t1_ctrl = 0; esp.dc = 0;
-    esp.lcd_x0 = 0; esp.lcd_x1 = 127; esp.lcd_y0 = 0; esp.lcd_y1 = 127; esp.lcd_madctl = 0;
-    memset(esp.mcp, 0, sizeof esp.mcp); esp.mcp_ptr = 0;
+    esp.isr_depth = 0; esp.sleeping = 0; esp.t1_on = 0; esp.t1_load = esp.t1_ctrl = 0;
+    lcd_power_on();
+    memset(esp.mcp, 0, sizeof esp.mcp); esp.mcp[0] = esp.mcp[1] = 0xff; esp.mcp_ptr = 0; /* IODIR : tout en entrée */
     esp.sd_value = 128;
-    memset(esp_fb, 0, sizeof esp_fb);
+    esp_lcd_render(esp_fb);
 }
 
 /* Démarrage : ce que le SDK laisse après user_init/init_done, puis setup()/loop() */
@@ -685,7 +779,6 @@ static void esp_cpu_boot(void) {
     memset(xt_ctag, 0xff, sizeof xt_ctag);
     esp.cpu_hz = 80e6; esp.cycle_base = 0; esp.us_base = 0;
     esp_set_freq(80);
-    xt_miss_cycles = 32;
     esp_install_hooks();
     /* taille de cont_t : cont_init(c) commence par memset(c, 0, sizeof *c), on lit n */
     uint32_t size = 40u + 4096u;

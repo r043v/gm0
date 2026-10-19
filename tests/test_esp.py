@@ -61,4 +61,12 @@ with tempfile.TemporaryDirectory(prefix='gm0-esp-') as tmp:
     e = ppm(shot('e.ppm'))
     assert px(e, 100, 100) == bytes([0, 50 << 2, 25 << 3]), px(e, 100, 100).hex()
 
+# CS de l'écran (MCP23017 B0) haut : le panneau n'écoute pas, il reste éteint (blanc)
+    elf3 = tmp / 'fw3.elf'
+    run(gcc[0], '-O2', '-DCS_HIGH', '-mlongcalls', '-mtext-section-literals', '-ffreestanding', '-nostdlib', '-T', ld,
+        '-o', elf3, root / 'tests/esp/fw_test.c', '-Wl,--entry=setup')
+    run(gm0, elf3, '--frames', 30, '--shot', shot('f.ppm'))
+    f = ppm(shot('f.ppm'))
+    assert set(f) == {248, 252}, 'écran non sélectionné : blanc'
+
 print('machine ESPboy : écran, boutons, audio, timer1, sauvegarde de la flash : ok')

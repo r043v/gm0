@@ -157,15 +157,28 @@ ELF): `micros`, `delay`, `system_update_cpu_freq`, `twi_writeTo/readFrom`,
 calls.  Anything else of the ROM that is called and not emulated stops the run
 with its name.
 
-- Time is counted in CPU cycles at 80 or 160 MHz: 1 per instruction, +2 per
-  taken branch, flash cache misses (32 KiB direct-mapped, 32-byte lines, 64
-  cycles at 160 MHz), SPI bytes at the programmed clock, flash erase 45 ms and
-  program 0.7 ms per page.  **These are estimates, not measurements of the
-  chip**; the `[bench]` line and the speed printed by m0boy's tools follow them.
-- The display model takes the 128×128 window at (2, 3) of the ST7735 RAM
-  (`MADCTL` is otherwise ignored).  The panel is BGR: pixels are read as RGB565
-  only while `MADCTL.BGR` (bit 3) is set, as m0boy's firmware does (`0xC8`);
-  with the bit clear, red and blue are swapped as on the chip.
+- Time is counted in CPU cycles at 80 or 160 MHz with the costs that the
+  [ESPboy-edu/espboy_emulator](https://github.com/ESPboy-edu/espboy_emulator)
+  (MIT) measured on a console with warm loops: 1 per instruction, 2 for `MULL`,
+  +2 per taken branch or call (`RET` +3), +1 when the next instruction uses a
+  register a load has just filled, `MEMW` 4 after a store, +5 per load from
+  IRAM, ROM or the mapped flash (literals included), +15 per peripheral
+  register read and +10 per write (half in cycles at 80 MHz, bus time), none
+  from DRAM.  Not validated here, and not in that reference: the cost of an
+  instruction-cache miss (`GM0_ESP_FLASH_MISS=<cycles per 32-byte line>` turns
+  on a 32 KiB direct-mapped model, off by default), SPI bytes at the clock the
+  firmware programs, flash erase 45 ms and program 0.7 ms per page.  So these
+  are estimates built on measured instruction costs, not measurements of this
+  firmware on the chip.
+- The display is the ST7735S datasheet model (132×162 18-bit memory, `MADCTL`
+  mirroring, 12/16/18-bit pixels) with what the ESPboy's panel does:
+  column and row addresses keep only their low byte, `SWRESET` keeps `MADCTL`
+  and `COLMOD`, the panel is BGR (`MADCTL.BGR` clear swaps red and blue at scan
+  time, memory already written included), white while asleep or off, and it
+  listens only while MCP23017 B0 (chip select) is low.  With TFT_eSPI's setup
+  (`MADCTL` 0xC8, window column 2, row 3, as m0boy's firmware) the glass pixel
+  (x, y) is memory (129 − x, 128 − y).  Partial mode, scrolling and idle are not
+  modelled.
 - The firmware's flash saves (`0x3C0000-0x3FB000`) persist in `<name>.sav` next
   to the firmware (or the zip).
 - Tests: `tests/esp/run_tests.py` compares the Xtensa core and the ROM
