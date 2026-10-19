@@ -3553,6 +3553,13 @@ static uint32_t dmac_read(uint32_t r) {
                 return (n & 0xfu) | ((uint32_t)(dmacIntFlag[n] & 0x7u) << 8);
         }
         return 0;
+    case 0x24: { /* INTSTATUS : un bit par canal dont un drapeau activé est levé
+                  * (le DMAC_Handler de m0boy s'en sert pour aiguiller) */
+        uint32_t m = 0;
+        for (uint32_t n = 0; n < DMAC_CHANNELS; n++)
+            if (dmacIntFlag[n] & dmacIntEn[n] & 0x07u) m |= 1u << n;
+        return m;
+    }
     case 0x34: return dmac_baseAddr;                        /* BASEADDR */
     case 0x38: return dmac_wrbAddr;                         /* WRBADDR */
     case 0x3c: return dmac_chid << 24;                      /* CHID (octet 0x3F) */

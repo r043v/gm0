@@ -17,6 +17,7 @@ wasm/solotest/
 wasm/ziptest/
 
 # jeux, cartes SD et sauvegardes (contenu utilisateur, jamais dans le dépôt)
+/sg-1000-roms/
 *.bin
 *.zip
 *.img
