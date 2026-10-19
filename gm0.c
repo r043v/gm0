@@ -1488,8 +1488,16 @@ static int zip_load_card(const uint8_t *data, size_t len) {
         }
         if (efw >= 0) {
             reset_machine();
-            const char *zp = espZipPath[0] ? espZipPath : ents[efw].name;
-            char save[1200]; snprintf(save, sizeof save, "%s.sav", zp);
+            /* zip embarqué (pas de chemin) : la sauvegarde porte le nom du dossier du jeu, dans le dossier courant */
+            char zname[1100], save[1200];
+            if (espZipPath[0]) snprintf(zname, sizeof zname, "%s", espZipPath);
+            else {
+                snprintf(zname, sizeof zname, "%s", ents[efw].name);
+                char *sl = strrchr(zname, '/');
+                if (sl) *sl = 0; else snprintf(zname, sizeof zname, "espboy");
+            }
+            const char *zp = zname;
+            { const char *b = strrchr(zname, '/'); snprintf(save, sizeof save, "%s.sav", espZipPath[0] ? zname : (b ? b + 1 : zname)); }
             int r = esp_start(datas[efw], ents[efw].usize, erom >= 0 ? datas[erom] : NULL, erom >= 0 ? ents[erom].usize : 0,
                               esym >= 0 ? datas[esym] : NULL, esym >= 0 ? ents[esym].usize : 0, zp, save);
             for (int i = 0; i < n; i++) free(datas[i]);
