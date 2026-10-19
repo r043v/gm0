@@ -172,7 +172,8 @@ en donnant son nom.
   firmware, l'effacement de flash 45 ms et la programmation 0,7 ms par page.
   Ce sont donc des estimations bâties sur des coûts d'instruction mesurés, pas
   des mesures de ce firmware sur la puce.
-- L'écran est le modèle de la fiche du ST7735S (mémoire 132×162 en 18 bits,
+- L'écran est le modèle de la fiche du ST7735S (Sitronix V1.1, 2011-11-21 : 9.10,
+  9.11.2, 10.1.2, 10.1.20-21, 10.1.29, 10.1.33) (mémoire 132×162 en 18 bits,
   miroirs de `MADCTL`, pixels de 12/16/18 bits) avec ce que fait le panneau de
   l'ESPboy : adresses de colonne et de ligne sur leur octet bas seulement,
   `SWRESET` qui garde `MADCTL` et `COLMOD`, panneau BGR (`MADCTL.BGR` à 0

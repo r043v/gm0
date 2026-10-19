@@ -170,7 +170,8 @@ with its name.
   firmware programs, flash erase 45 ms and program 0.7 ms per page.  So these
   are estimates built on measured instruction costs, not measurements of this
   firmware on the chip.
-- The display is the ST7735S datasheet model (132×162 18-bit memory, `MADCTL`
+- The display is the ST7735S datasheet model (Sitronix V1.1, 2011-11-21: 9.10,
+  9.11.2, 10.1.2, 10.1.20-21, 10.1.29, 10.1.33) (132×162 18-bit memory, `MADCTL`
   mirroring, 12/16/18-bit pixels) with what the ESPboy's panel does:
   column and row addresses keep only their low byte, `SWRESET` keeps `MADCTL`
   and `COLMOD`, the panel is BGR (`MADCTL.BGR` clear swaps red and blue at scan
