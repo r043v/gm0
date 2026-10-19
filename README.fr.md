@@ -120,6 +120,7 @@ gm0 [firmware] [carte] [options]
 | `firmware` | `.bin`, ou `.pop` (Pokitto) |
 | `carte` | image brute `.img`, `.zip` (carte complète), ou dossier (FAT16 construit à la volée). Sur META, la carte est par défaut le dossier du firmware. |
 | `--target meta\|pokitto` | force la cible |
+| `--rom fichier`, `--sym fichier` | ESPboy : image de ROM (`rom.bin`, flash `0x100000`) et fichier de symboles d'un `.bin` (défaut : `rom.bin` et `<nom>.sym` / `firmware.sym` à côté) |
 | `--frames N` | exécute N frames puis quitte |
 | `--shot fichier.ppm` | capture d'écran en fin d'exécution |
 | `--wav fichier.wav` | enregistre l'audio de la session (48 kHz, rendu depuis le temps émulé) |
@@ -199,6 +200,10 @@ en donnant son nom.
 | MENU / C | Entrée ou U | Entrée, D ou C |
 | HOME / éclairage | `*` ou I (maintenu 3 s : reset du jeu) | F |
 
+ESPboy (touches META) : croix comme la META, A = ACT (J), B = ESC (K),
+MENU (U) = bouton auxiliaire droit (Start), HOME (I) = bouton auxiliaire
+gauche (Select ; maintenu pour le menu du frontal Game Boy).
+
 | Touche | Action |
 |---|---|
 | F5 | reset |
@@ -262,6 +267,7 @@ vitesse brute sans régulation de frame, en multiple du temps réel :
 | Cats & Coins | META | 5,5× |
 | firmware Game Boy converti (sml) | META | 5,0× |
 | Pandemic | Pokitto | 4,1× |
+| firmware Game Boy converti (sml) | ESPboy | 1,6× |
 
 Les chiffres dépendent de l'hôte et de sa charge.  Le build WebAssembly tourne
 à pleine vitesse dans les navigateurs actuels.
@@ -279,7 +285,7 @@ Les diagnostics s'activent par variables d'environnement ; les plus utiles :
 | `EMU_PROF=fichier` | profil de cycles par adresse écrit en fin d'exécution |
 | `EMU_AUDIO_STATS=1` | statistiques producteur/consommateur audio |
 | `EMU_FIXED_RTC=t`, `ADC_FIXED=1` | RTC et ADC déterministes |
-| `EMU_DEBUG=1`, `SD_DEBUG=1`, `NVM_DEBUG=1`, `EMU_DMA_DEBUG=1`, `EMU_LCD_DEBUG=1` | traces des périphériques |
+| `EMU_DEBUG=1`, `SD_DEBUG=1`, `NVM_DEBUG=1`, `EMU_DMA_DEBUG=1`, `EMU_LCD_DEBUG=1`, `EMU_SYSCTRL_DEBUG=1` | traces des périphériques |
 | `FAT_DUMP=fichier`, `FAT_DUMP_EXIT=fichier` | écrit l'image FAT telle que construite au montage, ou la carte en sortie |
 | `FLASH_DUMP=fichier` | écrit la flash META en sortie (après une éventuelle auto-programmation) |
 
