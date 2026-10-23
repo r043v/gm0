@@ -89,6 +89,10 @@ static const char *em_save_key(const char *path) {
 
 static uint8_t  flash[FLASH_SIZE];
 static uint8_t  sram[SRAM_SIZE];
+/* --play-guest : écritures du firmware surveillées dans sram[] (compteur
+ * d'images et boutons du jeu émulé, descripteur m0input) ; span 0 : rien */
+static uint32_t guestWatchLo, guestWatchSpan;
+static void guest_store(uint32_t o, int n);
 static uint32_t regs[16];
 static int fN, fZ, fC, fV;
 static uint32_t tickCount;
@@ -225,6 +229,8 @@ static int audioDevStandard; /* le device courant lit audio_cb (file aq) ;
                               * pk_audio_reopen (HLE) le met à 0 */
 static int devRate = 48000;      /* taux du périphérique hôte : fixe, ouvert une seule fois */
 static char wavPathStr[512];
+static char recPathStr[512];     /* --record-input */
+static char ramDumpPath[512];    /* --dump-ram : la RAM principale en fin de run */
 static char shotPath[512];
 static uint32_t maxFrames;
 
@@ -4008,10 +4014,15 @@ static ALWAYS_INLINE uint32_t ld_t(const int T, uint32_t a, const int n, uint32_
 static ALWAYS_INLINE void st_t(const int T, uint32_t a, uint32_t v, const int n) {
     if (T == TGT_POKITTO) {
         if (n == 4) pk_write_word(a, v); else if (n == 2) pk_write_half(a, (uint16_t)v); else pk_write_byte(a, (uint8_t)v);
+        if (__builtin_expect(a - 0x10000000u - guestWatchLo < guestWatchSpan, 0)) guest_store(a - 0x10000000u, n);
         return;
     }
     uint32_t o = a - 0x20000000u;
-    if (o <= SRAM_SIZE - n) { memcpy(sram + o, &v, n); return; }
+    if (o <= SRAM_SIZE - n) {
+        memcpy(sram + o, &v, n);
+        if (__builtin_expect(o - guestWatchLo < guestWatchSpan, 0)) guest_store(o, n);
+        return;
+    }
     bus_write(a, v & NMASK(n), n);
 }
 
@@ -5137,7 +5148,12 @@ static uint8_t esp_key_bits(uint8_t m) {
     return (uint8_t)(((m & BTN_LEFT) ? 1u : 0u) | ((m & BTN_UP) ? 2u : 0u) | ((m & BTN_DOWN) ? 4u : 0u) | ((m & BTN_RIGHT) ? 8u : 0u) |
                      ((m & BTN_B) ? 16u : 0u) | ((m & BTN_A) ? 32u : 0u) | ((m & BTN_HOME) ? 64u : 0u) | ((m & BTN_MENU) ? 128u : 0u));
 }
+static uint8_t heldKeys; /* touches tenues (BTN_*), toutes cibles : --record-input */
+static int ffActive, ffReplaying; /* avance rapide d'un instantané : seules les touches rejouées comptent */
+static int snapRequest;           /* F2 : 1, prendre un instantané ; F4 : 2, y revenir */
 static void btn_press(uint8_t mask) {
+    if (ffActive && !ffReplaying) return;
+    heldKeys |= mask;
     if (emuTarget == TGT_ESPBOY) { espKeys |= esp_key_bits(mask); return; }
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 1); return; }
     /* buttonData reste toujours en ordre lib ; la conversion (pad lu à
@@ -5148,6 +5164,8 @@ static void btn_press(uint8_t mask) {
 }
 
 static void btn_release(uint8_t mask) {
+    if (ffActive && !ffReplaying) return;
+    heldKeys &= (uint8_t)~mask;
     if (emuTarget == TGT_ESPBOY) { espKeys &= (uint8_t)~esp_key_bits(mask); return; }
     if (emuTarget == TGT_POKITTO) { pk_btn_gpio(mask, 0); return; }
     buttonData |= mask;
@@ -5690,6 +5708,10 @@ static int poll_events(void) {
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F5) {
             if (fwLoaded) { fw_restart(); printf(TR("redémarrage\n", "restart\n")); osd_push(TR("REDEMARRAGE", "RESTART")); }
         }
+#if !defined(EMU_NODE_HEADLESS) && !defined(__EMSCRIPTEN__)
+        else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F2) snapRequest = 1;
+        else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F4) snapRequest = 2;
+#endif
         else if (ev.type == SDL_KEYUP && ev.key.keysym.sym == SDLK_F8) {
             dispFilter = (dispFilter + 1) % FILT_COUNT;
             scale_apply();
@@ -5953,6 +5975,304 @@ static void screen_write_ppm(const char *path) {
     fclose(f);
 }
 
+#if !defined(EMU_NODE_HEADLESS) && !defined(__EMSCRIPTEN__)
+/* --record-input / --play-input : sessions de jeu enregistrées, pour les
+ * rejouer (dans gm0, ou dans le harnais PC de m0boy qui en tire le code
+ * exécuté).  Fichier texte, une ligne par changement :
+ *   k <image gm0> <touches>            touches tenues (BTN_*, hexa) ;
+ *                                       --play-input les rejoue
+ *   g <image gm0> <image jeu> <état>   boutons que reçoit le jeu émulé d'un
+ *                                       firmware m0boy, à partir de cette
+ *                                       image du jeu (hexa : octet des
+ *                                       boutons, octet extra << 8)
+ *   r <image gm0>                      machine redémarrée (F5, firmware déposé)
+ *   e <image gm0> <image jeu>          fin de session
+ * Les firmwares m0boy portent en flash (ou en DRAM sur l'ESPboy) un
+ * descripteur : « m0input\0 », version 1, adresses du compteur d'images du
+ * jeu (32 bits), de ses boutons (8 bits) et d'un octet extra (pause du
+ * SG-1000) ou 0.  L'état est lu entre deux images gm0 ; le jeu le reçoit
+ * au premier rappel d'image de la tranche, qui suit l'incrément du
+ * compteur : image du jeu = compteur au début de la tranche + 1. */
+static FILE *recFile;
+static unsigned recEpoch = ~0u;
+static uint8_t recKeys;
+static int recProbe;               /* descripteur trouvé pour cette machine */
+static uint32_t recFrameAddr, recButtonsAddr, recExtraAddr;
+static uint32_t recGuestStart, recGuestNow, recState = ~0u;
+
+static int rec_peek(uint32_t a, unsigned n, uint32_t *v) {
+    const uint8_t *p = NULL;
+    uint32_t o;
+    if (emuTarget == TGT_ESPBOY) { o = a - XT_DRAM_BASE; if (o <= XT_DRAM_SIZE - n) p = xt_dram + o; }
+    else if (emuTarget == TGT_POKITTO) { o = a - 0x10000000u; if (o <= SRAM_SIZE - n) p = sram + o; }
+    else { o = a - 0x20000000u; if (o <= SRAM_SIZE - n) p = sram + o; }
+    if (!p) return 0;
+    *v = 0;
+    for (unsigned i = 0; i < n; i++) *v |= (uint32_t)p[i] << (8 * i);
+    return 1;
+}
+static uint32_t rec_le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
+static int rec_scan(const uint8_t *base, uint32_t size) {
+    static const char tag[8] = "m0input";
+    uint32_t v;
+    for (uint32_t o = 0; o + 24 <= size; o += 4) {
+        if (memcmp(base + o, tag, 8) || rec_le32(base + o + 8) != 1) continue;
+        recFrameAddr = rec_le32(base + o + 12);
+        recButtonsAddr = rec_le32(base + o + 16);
+        recExtraAddr = rec_le32(base + o + 20);
+        if (rec_peek(recFrameAddr, 4, &v) && rec_peek(recButtonsAddr, 1, &v) &&
+            (!recExtraAddr || rec_peek(recExtraAddr, 1, &v))) return 1;
+    }
+    return 0;
+}
+static uint32_t rec_state(void) {
+    uint32_t b = 0, x = 0;
+    rec_peek(recButtonsAddr, 1, &b);
+    if (recExtraAddr) rec_peek(recExtraAddr, 1, &x);
+    return b | x << 8;
+}
+static void input_rec_open(const char *path) {
+    recFile = fopen(path, "w");
+    if (!recFile) { perror(path); return; }
+    fprintf(recFile, "# gm0 input v1 target=%s\n",
+            emuTarget == TGT_POKITTO ? "pokitto" : emuTarget == TGT_ESPBOY ? "espboy" : "meta");
+}
+/* avant l'image gm0 f, touches de cette image déjà appliquées */
+static void input_rec_before(uint32_t f) {
+    if (!recFile) return;
+    if (recEpoch != machineEpoch) {
+        if (recEpoch != ~0u) fprintf(recFile, "r %u\n", f);
+        recEpoch = machineEpoch;
+        recProbe = emuTarget == TGT_ESPBOY ? rec_scan(xt_dram, XT_DRAM_SIZE) || rec_scan(xt_flash, XT_MAPPED_SIZE)
+                                           : rec_scan(flash, FLASH_SIZE);
+        if (!recProbe)
+            fprintf(stderr, TR("--record-input : pas de descripteur m0input dans ce firmware, touches seules\n",
+                               "--record-input: no m0input descriptor in this firmware, keys only\n"));
+        recState = ~0u;
+        recKeys = (uint8_t)~heldKeys; /* première ligne k forcée */
+    }
+    if (heldKeys != recKeys) { recKeys = heldKeys; fprintf(recFile, "k %u %02x\n", f, recKeys); }
+    if (f % 60 == 0) fflush(recFile); /* une partie interrompue garde tout sauf la dernière seconde */
+    if (recProbe) rec_peek(recFrameAddr, 4, &recGuestStart);
+}
+static void input_rec_after(uint32_t f) {
+    if (!recFile || !recProbe) return;
+    rec_peek(recFrameAddr, 4, &recGuestNow);
+    uint32_t st = rec_state();
+    if (st != recState) {
+        recState = st;
+        fprintf(recFile, "g %u %u %04x\n", f, recGuestNow == recGuestStart ? recGuestNow : recGuestStart + 1, st);
+    }
+}
+static void input_rec_close(uint32_t f) {
+    if (!recFile) return;
+    fprintf(recFile, "e %u %u\n", f, recProbe ? recGuestNow : 0u);
+    fclose(recFile);
+    recFile = NULL;
+}
+
+static uint32_t *playFrames;
+static uint16_t *playKeys;  /* touches, ou 0x100 : redémarrage */
+static size_t playCount, playPos;
+static int input_play_open(const char *path) {
+    FILE *in = fopen(path, "r");
+    if (!in) { perror(path); return 0; }
+    char line[128], kind;
+    unsigned f, k;
+    size_t cap = 0;
+    while (fgets(line, sizeof line, in)) {
+        if (sscanf(line, "%c %u %x", &kind, &f, &k) == 3 && kind == 'k') {}
+        else if (sscanf(line, "%c %u", &kind, &f) == 2 && kind == 'r') k = 0x100;
+        else continue;
+        if (playCount == cap) {
+            cap = cap ? cap * 2 : 256;
+            playFrames = realloc(playFrames, cap * sizeof *playFrames);
+            playKeys = realloc(playKeys, cap * sizeof *playKeys);
+            if (!playFrames || !playKeys) { fclose(in); return 0; }
+        }
+        playFrames[playCount] = f;
+        playKeys[playCount++] = (uint16_t)k;
+    }
+    fclose(in);
+    return 1;
+}
+/* --play-guest journal : les lignes g d'une session rejouées par image du
+ * JEU, pas par image gm0 : chaque fois que le firmware écrit l'octet des
+ * boutons du jeu (ou l'extra), gm0 le remplace par l'état enregistré pour
+ * l'image du jeu en cours (le compteur, déjà incrémenté quand le rappel
+ * d'image écrit les boutons).  Un firmware plus rapide ou plus lent joue
+ * donc la même partie, image du jeu pour image du jeu : comparaisons de
+ * firmwares.  --until-guest N : à l'écriture du compteur qui l'amène à N,
+ * la SRAM est figée pour --dump-ram et le run s'arrête à la fin de
+ * l'image gm0.  META et Pokitto. */
+static uint32_t *guestFrames, *guestStates;
+static size_t guestCount, guestPos;
+static unsigned guestEpoch = ~0u;
+static uint32_t guestFrameOff, guestButtonsOff, guestExtraOff = ~0u, guestUntil;
+static int guestStopped;
+static uint8_t *guestStopRam;
+static int guest_play_open(const char *path) {
+    FILE *in = fopen(path, "r");
+    if (!in) { perror(path); return 0; }
+    char line[128];
+    unsigned f, g, st;
+    size_t cap = 0;
+    while (fgets(line, sizeof line, in)) {
+        if (line[0] != 'g' || sscanf(line + 1, "%u %u %x", &f, &g, &st) != 3) continue;
+        if (guestCount == cap) {
+            cap = cap ? cap * 2 : 256;
+            guestFrames = realloc(guestFrames, cap * sizeof *guestFrames);
+            guestStates = realloc(guestStates, cap * sizeof *guestStates);
+            if (!guestFrames || !guestStates) { fclose(in); return 0; }
+        }
+        guestFrames[guestCount] = g;
+        guestStates[guestCount++] = st;
+    }
+    fclose(in);
+    if (!guestCount) fprintf(stderr, "--play-guest : aucune ligne g dans %s\n", path);
+    return guestCount != 0;
+}
+static uint32_t guest_state(uint32_t c) {
+    if (guestPos && guestFrames[guestPos - 1] > c) guestPos = 0; /* le jeu est reparti en arrière */
+    while (guestPos < guestCount && guestFrames[guestPos] <= c) guestPos++;
+    return guestPos ? guestStates[guestPos - 1] : 0;
+}
+static void guest_store(uint32_t o, int n) {
+    uint32_t c;
+    if (n == 1 && (o == guestButtonsOff || o == guestExtraOff)) {
+        memcpy(&c, sram + guestFrameOff, 4);
+        const uint32_t st = guest_state(c);
+        sram[o] = (uint8_t)(o == guestButtonsOff ? st : st >> 8);
+    } else if (n == 4 && o == guestFrameOff && guestUntil && !guestStopped) {
+        memcpy(&c, sram + o, 4);
+        if (c >= guestUntil) {
+            guestStopped = 1;
+            guestStopRam = malloc(SRAM_SIZE);
+            if (guestStopRam) memcpy(guestStopRam, sram, SRAM_SIZE);
+        }
+    }
+}
+/* le descripteur du firmware chargé, à chaque nouvelle machine */
+static void guest_play_sync(void) {
+    if ((!guestCount && !guestUntil) || guestEpoch == machineEpoch || emuTarget == TGT_ESPBOY) return;
+    guestEpoch = machineEpoch;
+    guestWatchSpan = 0;
+    if (!rec_scan(flash, FLASH_SIZE)) {
+        fprintf(stderr, "--play-guest : pas de descripteur m0input dans ce firmware\n");
+        return;
+    }
+    const uint32_t base = emuTarget == TGT_POKITTO ? 0x10000000u : 0x20000000u;
+    guestFrameOff = recFrameAddr - base;
+    guestButtonsOff = guestCount ? recButtonsAddr - base : ~0u;
+    guestExtraOff = guestCount && recExtraAddr ? recExtraAddr - base : ~0u;
+    uint32_t lo = guestFrameOff, hi = guestFrameOff + 4;
+    if (guestButtonsOff != ~0u) { if (guestButtonsOff < lo) lo = guestButtonsOff; if (guestButtonsOff + 1 > hi) hi = guestButtonsOff + 1; }
+    if (guestExtraOff != ~0u) { if (guestExtraOff < lo) lo = guestExtraOff; if (guestExtraOff + 1 > hi) hi = guestExtraOff + 1; }
+    guestWatchLo = lo;
+    guestWatchSpan = hi - lo;
+    guestPos = 0;
+}
+static void input_play(uint32_t f) {
+    ffReplaying = 1;
+    while (playPos < playCount && playFrames[playPos] <= f) {
+        uint16_t k = playKeys[playPos++];
+        if (k == 0x100) { fw_restart(); continue; }
+        btn_release(heldKeys & (uint8_t)~k);
+        btn_press((uint8_t)k & (uint8_t)~heldKeys);
+    }
+    ffReplaying = 0;
+}
+
+/* Instantanés (F2 : prendre, F4 : y revenir ; --resume-at N : reprendre une
+ * session enregistrée).  gm0 est déterministe depuis un démarrage à froid :
+ * un instantané est l'image gm0 où il a été pris.  Y revenir, c'est écrire
+ * le journal des touches tenues jusque-là et relancer gm0 lui-même (execv :
+ * même processus pour qui l'attend, machine neuve, carte relue du disque)
+ * avec --play-input journal --resume-at image : l'avance rapide y ramène et
+ * l'enregistrement, réécrit depuis l'allumage, continue.  La partie reste
+ * rejouable sans état machine à sérialiser ; le retour prend le temps de
+ * l'avance rapide.  Pas sur l'ESPboy : sa flash de sauvegarde vit sur le
+ * disque (elle ne serait pas celle du début). */
+static uint32_t *logFrames;
+static uint16_t *logKeys;   /* touches tenues, ou 0x100 : redémarrage */
+static size_t logCount, logCap, snapLog;
+static uint8_t logHeld;
+static unsigned logEpoch = ~0u;
+static uint32_t snapFrame = ~0u, ffTarget;
+static int gm0Argc;
+static char **gm0Argv;
+static void log_push(uint32_t f, uint16_t k) {
+    if (logCount == logCap) {
+        logCap = logCap ? logCap * 2 : 1024;
+        logFrames = realloc(logFrames, logCap * sizeof *logFrames);
+        logKeys = realloc(logKeys, logCap * sizeof *logKeys);
+        if (!logFrames || !logKeys) { logCount = logCap = 0; return; }
+    }
+    logFrames[logCount] = f;
+    logKeys[logCount++] = k;
+}
+/* touches de l'image gm0 f appliquées : le journal du retour */
+static void keylog_note(uint32_t f) {
+    if (logEpoch != machineEpoch) {
+        if (logEpoch != ~0u) log_push(f, 0x100);
+        logEpoch = machineEpoch;
+        logHeld = (uint8_t)~heldKeys;
+    }
+    if (heldKeys != logHeld) { logHeld = heldKeys; log_push(f, heldKeys); }
+}
+static void snapshot_take(uint32_t f) {
+    if (emuTarget == TGT_ESPBOY) { osd_push("%s", TR("INSTANTANE : PAS SUR ESPBOY", "SNAPSHOT: NOT ON ESPBOY")); return; }
+    snapFrame = f;
+    snapLog = logCount;
+    if (recFile) { fprintf(recFile, "s %u\n", f); fflush(recFile); }
+    printf(TR("instantané : image %u\n", "snapshot: frame %u\n"), f);
+    osd_push("%s", TR("INSTANTANE", "SNAPSHOT"));
+}
+/* ne revient qu'en cas d'échec */
+static void snapshot_rewind(void) {
+    if (snapFrame == ~0u) { osd_push("%s", TR("PAS D'INSTANTANE (F2)", "NO SNAPSHOT (F2)")); return; }
+    char journal[600];
+    snprintf(journal, sizeof journal, "%s.snapshot", recPathStr[0] ? recPathStr : "/tmp/gm0-input");
+    FILE *f = fopen(journal, "w");
+    if (!f) { perror(journal); return; }
+    for (size_t i = 0; i < snapLog; i++) {
+        if (logKeys[i] == 0x100) fprintf(f, "r %u\n", logFrames[i]);
+        else fprintf(f, "k %u %02x\n", logFrames[i], logKeys[i]);
+    }
+    if (fclose(f)) { perror(journal); return; }
+    if (recFile) fflush(recFile);
+    /* mêmes arguments, sans les --play-input / --resume-at d'une reprise */
+    char **argv = calloc((size_t)gm0Argc + 6, sizeof *argv);
+    char at[16];
+    if (!argv) return;
+    int n = 0;
+    for (int i = 0; i < gm0Argc; i++) {
+        if ((!strcmp(gm0Argv[i], "--play-input") || !strcmp(gm0Argv[i], "--resume-at")) && i + 1 < gm0Argc) { i++; continue; }
+        argv[n++] = gm0Argv[i];
+    }
+    snprintf(at, sizeof at, "%u", snapFrame);
+    argv[n++] = "--play-input"; argv[n++] = journal;
+    argv[n++] = "--resume-at"; argv[n++] = at;
+    argv[n] = NULL;
+    printf(TR("retour à l'instantané : image %u (avance rapide)\n", "back to snapshot: frame %u (fast forward)\n"), snapFrame);
+    fflush(stdout);
+    unsetenv("EMU_SNAP"); /* ses événements ont eu lieu */
+    SDL_Quit();
+    execv("/proc/self/exe", argv);
+    perror("execv");
+    free(argv);
+}
+/* l'image gm0 f est atteinte : fin de l'avance rapide d'une reprise */
+static void fast_forward_check(uint32_t f) {
+    if (!ffActive || f < ffTarget) return;
+    ffActive = 0;
+    playCount = playPos; /* la main au joueur */
+    logHeld = heldKeys;
+    snapshot_take(f);   /* le point de reprise reste un instantané */
+    osd_push("%s", TR("INSTANTANE REPRIS", "SNAPSHOT RESUMED"));
+}
+#endif
+
 #if defined(EMU_NODE_HEADLESS)
 /* ------------------------------------------- node headless (debug) --- */
 /* prog firmware.bin carte_dir|.zip [frames] [capture.ppm] — la capture
@@ -5993,6 +6313,7 @@ int main(int argc, char **argv) {
 /* ------------------------------------------------------------ natif --- */
 
 int main(int argc, char **argv) {
+    gm0Argc = argc; gm0Argv = argv; /* F4 : relance de gm0 lui-même */
 #ifndef GM0_EMBEDDED_GAME
     if (argc < 2)
         fprintf(stderr, TR("gm0 : lancé sans firmware — déposez un .bin "
@@ -6046,6 +6367,19 @@ int main(int argc, char **argv) {
             snprintf(espRomPathOpt, sizeof espRomPathOpt, "%s", argv[++i]);
         } else if (strcmp(argv[i], "--sym") == 0 && i + 1 < argc) {
             snprintf(espSymPathOpt, sizeof espSymPathOpt, "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--record-input") == 0 && i + 1 < argc) {
+            snprintf(recPathStr, sizeof recPathStr, "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--resume-at") == 0 && i + 1 < argc) {
+            ffTarget = (uint32_t)strtoul(argv[++i], NULL, 10);
+            ffActive = ffTarget > 0;
+        } else if (strcmp(argv[i], "--dump-ram") == 0 && i + 1 < argc) {
+            snprintf(ramDumpPath, sizeof ramDumpPath, "%s", argv[++i]);
+        } else if (strcmp(argv[i], "--play-input") == 0 && i + 1 < argc) {
+            if (!input_play_open(argv[++i])) return 1;
+        } else if (strcmp(argv[i], "--play-guest") == 0 && i + 1 < argc) {
+            if (!guest_play_open(argv[++i])) return 1;
+        } else if (strcmp(argv[i], "--until-guest") == 0 && i + 1 < argc) {
+            guestUntil = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--eeprom-ro") == 0) {
             pk_eepromRO = 1;
         } else if (strcmp(argv[i], "-W") == 0) {
@@ -6091,11 +6425,13 @@ int main(int argc, char **argv) {
     if (audioOk && fwLoaded) audio_start(); /* lancé au boot */
 
     if (wavPathStr[0]) wav_open(wavPathStr);
+    if (recPathStr[0]) input_rec_open(recPathStr);
     while (running) {
         running = poll_events();
         update_diagnostics(frame);
         frame_epoch_sync();
         if (maxFrames && frame >= maxFrames) break;
+        if (guestStopped) break;
         { /* EMU_INPUT="frame:touches:durée,..." — touches parmi U D L R A B
            * M(enu) H(ome), ex. "200:H:45,260:A:3,280:B:3" (menu d'options) */
             static const char *in = (const char *)1;
@@ -6115,18 +6451,42 @@ int main(int argc, char **argv) {
             }
         }
 
+        { /* EMU_SNAP="image:s,image:r" : instantané (s) ou retour (r) à ces
+           * images gm0, une fois chacun (tests sans clavier) */
+            static const char *sn = (const char *)1;
+            static uint32_t snDone;
+            if (sn == (const char *)1) sn = getenv("EMU_SNAP");
+            unsigned n = 0;
+            for (const char *q = sn; q && *q; n++) {
+                unsigned f0; char what;
+                if (n < 32 && !(snDone >> n & 1) && sscanf(q, "%u:%c", &f0, &what) == 2 && frame == f0 && !ffActive) {
+                    snDone |= 1u << n;
+                    snapRequest = what == 'r' ? 2 : 1;
+                }
+                q = strchr(q, ','); if (q) q++;
+            }
+        }
+        if (snapRequest == 1) snapshot_take(frame);
+        else if (snapRequest == 2) snapshot_rewind();
+        snapRequest = 0;
+        input_play(frame);
+        guest_play_sync();
+        keylog_note(frame);
+        input_rec_before(frame);
         emulate_frames(1);
+        input_rec_after(frame);
         frame++;
         frame_end();
+        fast_forward_check(frame);
 
-        blit(emuRen);
+        if (!ffActive || frame % 30 == 0) blit(emuRen); /* avance rapide : un écran sur trente */
         if (trace) trace_frame(frame);
         /* temps réel : une frame = 1/59,7 s, jamais plus vite.  Échéance
          * sans dette : en retard de plus de 4 frames (stall, drag de
          * fenêtre, drop), on repart de maintenant au lieu de rattraper. */
         static int noPace = -1; /* EMU_NOPACE=1 : vitesse brute (mesure) */
         if (noPace < 0) noPace = getenv("EMU_NOPACE") ? 1 : 0;
-        if (!noPace) {
+        if (!noPace && !ffActive) {
             uint64_t now = SDL_GetPerformanceCounter();
             if (nextPace == 0) nextPace = now + frameDur;
             nextPace += frameDur;
@@ -6145,6 +6505,15 @@ int main(int argc, char **argv) {
         printf(TR("capture : %s\n", "shot: %s\n"), shotPath);
     }
     wav_finish();
+    input_rec_close(frame);
+    if (ramDumpPath[0]) { /* SRAM 0x20000000 (META), 0x10000000 (Pokitto), DRAM 0x3FFE8000 (ESPboy) */
+        FILE *f = fopen(ramDumpPath, "wb");
+        if (f) {
+            if (emuTarget == TGT_ESPBOY) fwrite(xt_dram, 1, XT_DRAM_SIZE, f);
+            else fwrite(guestStopRam ? guestStopRam : sram, 1, SRAM_SIZE, f); /* --until-guest : à l'image N du jeu */
+            fclose(f);
+        } else perror(ramDumpPath);
+    }
     prof_write();
     pk_debug_dump();
     pk_eeprom_save();

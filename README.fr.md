@@ -126,6 +126,12 @@ gm0 [firmware] [carte] [options]
 | `--wav fichier.wav` | enregistre l'audio de la session (48 kHz, rendu depuis le temps émulé) |
 | `--out-img fichier.img` | exporte la carte en sortie si elle a été modifiée |
 | `--eeprom-ro` | Pokitto : charge le `.eeprom` à côté du firmware sans jamais le réécrire (exécutions reproductibles) |
+| `--record-input fichier` | enregistre la session : touches tenues à chaque image gm0 (lignes `k`) et, pour un firmware m0boy, les boutons que reçoit le jeu émulé avec le numéro d'image du jeu (lignes `g`), lus par le descripteur `m0input` du firmware ; `r` marque un redémarrage, `e` la fin |
+| `--play-input fichier` | rejoue les touches (lignes `k`) d'une session enregistrée, image pour image |
+| `--play-guest fichier` | rejoue une session par image du jeu (ses lignes `g`, firmwares m0boy) : chaque fois que le firmware écrit les boutons du jeu émulé, ils deviennent l'état enregistré pour l'image du jeu en cours ; un firmware plus rapide ou plus lent joue exactement la même partie (comparaisons de firmwares ; META et Pokitto) |
+| `--until-guest N` | s'arrête quand le compteur d'images du jeu atteint N ; `--dump-ram` garde alors la RAM de cet instant |
+| `--resume-at N` | avec `--play-input` : avance rapide (sans rythme, un écran sur trente) jusqu'à l'image gm0 N, puis la main au joueur ; N devient un instantané |
+| `--dump-ram fichier` | écrit la RAM principale en fin de run (SRAM META depuis 0x20000000, Pokitto depuis 0x10000000, DRAM ESPboy depuis 0x3FFE8000) : compteurs du firmware, lus par symbole |
 | `-w [n]`, `-W` | Pokitto : ignore les *n* (ou toutes les) prochaines écritures flash fautives au lieu de lever une HardFault |
 
 Lancée sans argument, la fenêtre s'ouvre vide ; on y dépose un jeu (`.bin`,
@@ -206,6 +212,8 @@ gauche (Select ; maintenu pour le menu du frontal Game Boy).
 
 | Touche | Action |
 |---|---|
+| F2 | instantané : l'image gm0, notée (ligne `s`) dans l'enregistrement de `--record-input` |
+| F4 | retour au dernier instantané : gm0 repart à froid (même processus) et rejoue en avance rapide les touches tenues jusque-là ; l'enregistrement, réécrit depuis l'allumage, continue (META, Pokitto) |
 | F5 | reset |
 | F8 | filtre d'affichage, en cycle : pixel (défaut), vert Game Boy (DMG), LCD RGB, scanlignes, grille, aucun |
 | F10 | mode d'échelle : entière, ajustée, étirée |

@@ -123,6 +123,12 @@ gm0 [firmware] [card] [options]
 | `--wav file.wav` | record the session audio (48 kHz, rendered from emulated time) |
 | `--out-img file.img` | export the card on exit if it was modified |
 | `--eeprom-ro` | Pokitto: load the `.eeprom` next to the firmware but never write it back (reproducible runs) |
+| `--record-input file` | record the session: held keys per gm0 frame (`k` lines) and, for an m0boy firmware, the buttons the emulated game receives with the game's frame number (`g` lines), read through the firmware's `m0input` descriptor; `r` marks a restart, `e` the end |
+| `--play-input file` | replay the keys (`k` lines) of a recorded session, frame for frame |
+| `--play-guest file` | replay a session by game frame (its `g` lines, m0boy firmwares): each time the firmware writes the emulated game's buttons, they become the recorded state for the game's current frame, so a faster or slower firmware plays the very same game (firmware comparisons; META and Pokitto) |
+| `--until-guest N` | stop when the game's frame counter reaches N; `--dump-ram` then holds the RAM of that instant |
+| `--resume-at N` | with `--play-input`: fast forward (no pacing, one screen in thirty) to gm0 frame N, then hand over to the player; N is a snapshot |
+| `--dump-ram file` | write the main RAM at exit (META SRAM from 0x20000000, Pokitto from 0x10000000, ESPboy DRAM from 0x3FFE8000): counters of the firmware, read by symbol |
 | `-w [n]`, `-W` | Pokitto: ignore the next *n* (or all) faulting flash writes instead of raising a HardFault |
 
 Started without arguments, the window opens empty; games can be dropped onto
@@ -203,6 +209,8 @@ Game Boy frontend's menu).
 
 | Key | Action |
 |---|---|
+| F2 | snapshot: the gm0 frame, noted (`s` line) in the `--record-input` recording |
+| F4 | back to the last snapshot: gm0 starts again cold (same process) and fast-forwards the keys held until then; the recording, rewritten from power-on, goes on (META, Pokitto) |
 | F5 | reset |
 | F8 | display filter, cycled: pixel (default), Game Boy green (DMG), LCD RGB, scanlines, grid, none |
 | F10 | scaling mode: integer, fitted, stretched |
