@@ -278,7 +278,7 @@ Diagnostics are enabled through environment variables; the most useful:
 
 | Variable | Effect |
 |---|---|
-| `EMU_INPUT="frame:keys:len,..."` | scripted input (keys among `UDLRABMH`), e.g. `200:A:5,300:R:40` |
+| `EMU_INPUT="frame:keys:len,..."` | scripted input (keys among `UDLRABMH`), e.g. `200:A:5,300:R:40`; H is the m0boy menu key on every console (the META's HOME, the Pokitto's C) |
 | `EMU_NOPACE=1` | run as fast as possible (benchmarks) |
 | `EMU_TRACE=1` | screen hash every 60 frames, periodic CPU trace |
 | `TRACE_TAIL=N` | keep the last N executed instructions, dumped on a wild PC |

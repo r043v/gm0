@@ -1559,7 +1559,9 @@ static int zip_load_card(const uint8_t *data, size_t len) {
 /* boutons : bit0 bas, 1 gauche, 2 droite, 3 haut, 4 A, 5 B, 6 MENU, 7 HOME
  * (actifs bas : 0 = enfoncé).  Ordre du fork TS de référence et de la
  * lib officielle (Buttons.h : down=0, left, right, up, a, b, menu, home),
- * c'est lui qui fait répondre les jeux lib (Celeste, Reuben...) ;
+ * c'est lui qui fait répondre les jeux lib (Celeste, Reuben...) — ce sont
+ * les valeurs de META_MB_* côté m0boy (meta_menu.h, décodées par META_PAD,
+ * meta_pad.h) ;
  * lapinou (homebrew) lit un ordre propre, cf. EMU_BTN_ORDER plus bas. */
 #define BTN_DOWN   (1u << 0)
 #define BTN_LEFT   (1u << 1)
@@ -1572,7 +1574,8 @@ static int zip_load_card(const uint8_t *data, size_t len) {
 #define BTN_DIRMASK (BTN_DOWN | BTN_LEFT | BTN_RIGHT | BTN_UP)
 
 /* octet boutons réordonné pour un pad lu à 24 MHz (ordre historique des
- * jeux maison : left,right,up,a,b,menu,down,home) ; l'entrée b = ordre lib
+ * jeux maison : left,right,up,a,b,menu,down,home — celui que m0boy décode
+ * sous META_BUTTONS_LAPINOU_ORDER, gbl_board.h) ; l'entrée b = ordre lib
  * (down,left,right,up,a,b,menu,home) */
 static uint8_t pad_byte_24(uint8_t b) {
     /* down (bit 0) -> 6 ; left, right, up, a, b, menu (1-6) -> 0-5 ; home reste en 7 */
@@ -2712,7 +2715,8 @@ static inline void pk_write_byte(uint32_t a, uint8_t v) {
 }
 
 /* --- boutons -> GPIO (A=1_9, B=1_4, C=1_10, haut=1_13, bas=1_3,
- *     gauche=1_25, droite=1_7, D/éclairage=0_1) */
+ *     gauche=1_25, droite=1_7, D/éclairage=0_1 — les broches que
+ *     pokitto_buttons lit, décodées par META_PAD côté m0boy) */
 static void pk_btn_gpio(uint8_t mask, int pressed) {
     static const struct { uint8_t m; uint32_t port, bit; } map[] = {
         { BTN_DOWN, 1, 3 }, { BTN_LEFT, 1, 25 }, { BTN_RIGHT, 1, 7 }, { BTN_UP, 1, 13 },
@@ -6433,7 +6437,10 @@ int main(int argc, char **argv) {
         if (maxFrames && frame >= maxFrames) break;
         if (guestStopped) break;
         { /* EMU_INPUT="frame:touches:durée,..." — touches parmi U D L R A B
-           * M(enu) H(ome), ex. "200:H:45,260:A:3,280:B:3" (menu d'options) */
+           * M(enu) H(ome), ex. "200:H:45,260:A:3,280:B:3" (menu d'options).
+           * Mêmes rôles sur toutes les consoles : H pilote la touche de menu
+           * des firmwares m0boy (meta_pad.h : la HOME de la META, le C de la
+           * Pokitto — BTN_MENU ici), M la touche MENU de la console. */
             static const char *in = (const char *)1;
             if (in == (const char *)1) in = getenv("EMU_INPUT");
             for (const char *q = in; q && *q;) {
@@ -6444,6 +6451,7 @@ int main(int argc, char **argv) {
                         m |= *k == 'U' ? BTN_UP : *k == 'D' ? BTN_DOWN : *k == 'L' ? BTN_LEFT :
                              *k == 'R' ? BTN_RIGHT : *k == 'A' ? BTN_A : *k == 'B' ? BTN_B :
                              *k == 'M' ? BTN_MENU : BTN_HOME;
+                    if (emuTarget == TGT_POKITTO && strchr(keys, 'H')) m |= BTN_MENU;
                     if (frame == f0) btn_press(m);
                     if (frame == f0 + len) btn_release(m);
                 }

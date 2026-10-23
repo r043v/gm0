@@ -286,7 +286,7 @@ Les diagnostics s'activent par variables d'environnement ; les plus utiles :
 
 | Variable | Effet |
 |---|---|
-| `EMU_INPUT="frame:touches:durée,..."` | entrées scriptées (touches parmi `UDLRABMH`), ex. `200:A:5,300:R:40` |
+| `EMU_INPUT="frame:touches:durée,..."` | entrées scriptées (touches parmi `UDLRABMH`), ex. `200:A:5,300:R:40` ; H est la touche de menu des firmwares m0boy sur toutes les consoles (HOME de la META, C de la Pokitto) |
 | `EMU_NOPACE=1` | exécution aussi rapide que possible (mesures) |
 | `EMU_TRACE=1` | empreinte de l'écran toutes les 60 frames, trace CPU périodique |
 | `TRACE_TAIL=N` | conserve les N dernières instructions, vidées sur un PC hors mémoire |
