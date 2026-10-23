@@ -1560,8 +1560,8 @@ static int zip_load_card(const uint8_t *data, size_t len) {
  * (actifs bas : 0 = enfoncé).  Ordre du fork TS de référence et de la
  * lib officielle (Buttons.h : down=0, left, right, up, a, b, menu, home),
  * c'est lui qui fait répondre les jeux lib (Celeste, Reuben...) — ce sont
- * les valeurs de META_MB_* côté m0boy (meta_menu.h, décodées par META_PAD,
- * meta_pad.h) ;
+ * les valeurs de M0_MB_* côté m0boy (m0_menu.h, décodées par M0_PAD,
+ * m0_pad.h) ;
  * lapinou (homebrew) lit un ordre propre, cf. EMU_BTN_ORDER plus bas. */
 #define BTN_DOWN   (1u << 0)
 #define BTN_LEFT   (1u << 1)
@@ -5122,28 +5122,21 @@ static unsigned machineEpoch; /* incrémenté quand un drop réinitialise la mac
  * gauche du ZQSD/WASD META mais le bouton A de la référence Pokitto) ;
  * Espace = A, Ctrl = B, Entrée = C/menu sur les deux */
 struct keymap { SDL_Keycode sym; uint8_t mask; };
-static const struct keymap keysMeta[] = {
-    { SDLK_DOWN, BTN_DOWN }, { SDLK_s, BTN_DOWN },
-    { SDLK_LEFT, BTN_LEFT }, { SDLK_q, BTN_LEFT }, { SDLK_a, BTN_LEFT },
-    { SDLK_RIGHT, BTN_RIGHT }, { SDLK_d, BTN_RIGHT },
-    { SDLK_UP, BTN_UP }, { SDLK_z, BTN_UP }, { SDLK_w, BTN_UP },
-    { SDLK_j, BTN_A }, { SDLK_SPACE, BTN_A },
-    { SDLK_k, BTN_B }, { SDLK_LCTRL, BTN_B }, { SDLK_RCTRL, BTN_B },
-    { SDLK_u, BTN_MENU }, { SDLK_RETURN, BTN_MENU }, { SDLK_KP_ENTER, BTN_MENU },
-    { SDLK_i, BTN_HOME }, { SDLK_ASTERISK, BTN_HOME }, { SDLK_KP_MULTIPLY, BTN_HOME },
-};
-static const struct keymap keysPokitto[] = { /* A/B/C/D de la référence C++ */
-    { SDLK_UP, BTN_UP }, { SDLK_i, BTN_UP }, { SDLK_DOWN, BTN_DOWN }, { SDLK_k, BTN_DOWN },
-    { SDLK_LEFT, BTN_LEFT }, { SDLK_j, BTN_LEFT }, { SDLK_RIGHT, BTN_RIGHT }, { SDLK_l, BTN_RIGHT },
-    { SDLK_a, BTN_A }, { SDLK_SPACE, BTN_A },
-    { SDLK_s, BTN_B }, { SDLK_b, BTN_B }, { SDLK_LCTRL, BTN_B }, { SDLK_RCTRL, BTN_B },
-    { SDLK_d, BTN_MENU }, { SDLK_c, BTN_MENU }, { SDLK_RETURN, BTN_MENU }, { SDLK_KP_ENTER, BTN_MENU },
-    { SDLK_f, BTN_HOME },                                  /* D (éclairage) */
+/* Les touches, les mêmes sur les deux consoles : flèches, espace (A),
+ * ctrl gauche ou droit (B), entrée (MENU).  H est la touche de menu des
+ * firmwares m0boy (la HOME de la META, le C de la Pokitto — le même rôle
+ * que la lettre H de EMU_INPUT) ; la manette passe par pad_button_mask. */
+static const struct keymap keys[] = {
+    { SDLK_DOWN, BTN_DOWN }, { SDLK_LEFT, BTN_LEFT }, { SDLK_RIGHT, BTN_RIGHT }, { SDLK_UP, BTN_UP },
+    { SDLK_SPACE, BTN_A },
+    { SDLK_LCTRL, BTN_B }, { SDLK_RCTRL, BTN_B },
+    { SDLK_RETURN, BTN_MENU }, { SDLK_KP_ENTER, BTN_MENU },
 };
 static uint8_t key_bit(SDL_Keycode sym) {
-    const struct keymap *m = emuTarget == TGT_POKITTO ? keysPokitto : keysMeta;
-    size_t n = emuTarget == TGT_POKITTO ? sizeof keysPokitto / sizeof *m : sizeof keysMeta / sizeof *m;
+    const struct keymap *m = keys;
+    size_t n = sizeof keys / sizeof *m;
     for (size_t i = 0; i < n; i++) if (m[i].sym == sym) return m[i].mask;
+    if (sym == SDLK_h) return emuTarget == TGT_POKITTO ? BTN_MENU : BTN_HOME;
     return 0;
 }
 
@@ -6439,7 +6432,7 @@ int main(int argc, char **argv) {
         { /* EMU_INPUT="frame:touches:durée,..." — touches parmi U D L R A B
            * M(enu) H(ome), ex. "200:H:45,260:A:3,280:B:3" (menu d'options).
            * Mêmes rôles sur toutes les consoles : H pilote la touche de menu
-           * des firmwares m0boy (meta_pad.h : la HOME de la META, le C de la
+           * des firmwares m0boy (m0_pad.h : la HOME de la META, le C de la
            * Pokitto — BTN_MENU ici), M la touche MENU de la console. */
             static const char *in = (const char *)1;
             if (in == (const char *)1) in = getenv("EMU_INPUT");
