@@ -201,9 +201,9 @@ en donnant son nom.
 
 | | META | Pokitto |
 |---|---|---|
-| Croix | flèches, ZQSD/WASD | flèches, IJKL |
-| A / B | Espace ou J / Ctrl ou K | Espace ou A / Ctrl, S ou B |
-| MENU / C | Entrée ou U | Entrée, D ou C |
+| Croix | flèches | flèches |
+| A / B | Espace / Ctrl | Espace / Ctrl |
+| MENU / touche de menu (m0boy) | Entrée / H (HOME) | Entrée / H (C) |
 | HOME / éclairage | `*` ou I (maintenu 3 s : reset du jeu) | F |
 
 ESPboy (touches META) : croix comme la META, A = ACT (J), B = ESC (K),

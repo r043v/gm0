@@ -198,9 +198,9 @@ with its name.
 
 | | META | Pokitto |
 |---|---|---|
-| D-pad | arrows, ZQSD/WASD | arrows, IJKL |
-| A / B | Space or J / Ctrl or K | Space or A / Ctrl, S or B |
-| MENU / C | Enter or U | Enter, D or C |
+| D-pad | arrows | arrows |
+| A / B | Space / Ctrl | Space / Ctrl |
+| MENU / menu key (m0boy) | Enter / H (HOME) | Enter / H (C) |
 | HOME / backlight | `*` or I (hold 3 s to reset the game) | F |
 
 ESPboy (META keys): D-pad as the META, A = ACT (J), B = ESC (K), MENU (U) = right
