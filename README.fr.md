@@ -393,3 +393,7 @@ avis sont reproduits dans [LICENSE](LICENSE) :
 datasheets des constructeurs (Microchip, NXP, Sitronix, Arm) ne crée pas
 d'œuvre dérivée de ces documents, et aucun code n'a été repris du source de
 lapinou, des binaires META ni de la lib officielle.
+
+## Gamebuino AKA
+
+Experimental ESP32-S3 application emulation: [usage, services and limits](docs-AKA.md).

@@ -19,6 +19,7 @@
  * .pop du loader géré.  --target force la cible.
  */
 #include <SDL.h>
+#include "aka.h"
 #include <zlib.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,8 +85,8 @@ static const char *em_save_key(const char *path) {
 
 /* Le tampon d'écran doit contenir la plus grande des deux cibles
  * (160x128 META, 220x176 Pokitto) ; SCR_W/SCR_H suivent la cible. */
-#define MAX_SCREEN_W 220u
-#define MAX_SCREEN_H 176u
+#define MAX_SCREEN_W 320u
+#define MAX_SCREEN_H 240u
 
 static uint8_t  flash[FLASH_SIZE];
 static uint8_t  sram[SRAM_SIZE];
@@ -253,6 +254,8 @@ static uint32_t maxFrames;
 #define TGT_META    0
 #define TGT_POKITTO 1
 #define TGT_ESPBOY  2
+#define TGT_AKA 3
+static int aka_failed;
 static int emuTarget = TGT_META;   /* fixé par --target ou détection */
 static int targetForced;           /* --target explicite */
 
@@ -285,7 +288,7 @@ static inline void nvm_access(uint32_t a) { flashWaits += nvm_miss(a); }
 static double pk_core_hz(void); /* fréquence du cœur telle que configurée */
 static double esp_cpu_hz(void);  /* ESPboy : 80 ou 160 MHz */
 static double ticks_per_sec(void) {
-    return emuTarget == TGT_POKITTO ? pk_core_hz() : emuTarget == TGT_ESPBOY ? esp_cpu_hz() : emuTicksPerSec;
+    return emuTarget == TGT_POKITTO ? pk_core_hz() : emuTarget == TGT_ESPBOY ? esp_cpu_hz() : emuTarget == TGT_AKA ? 240e6 : emuTicksPerSec;
 }
 static uint32_t frame_ticks(void) {
     return (uint32_t)(ticks_per_sec() / 59.7275 + 0.5);
@@ -648,6 +651,18 @@ static uint8_t *sd_card_data(void) {
 }
 static size_t sd_card_size(void) {
     return sd_image ? sd_size : (fatImage ? fatImageSize : 0);
+}
+
+static int sdDirty; /* card writes, including direct SDMMC sectors */
+static void sd_write_persist(uint32_t lba, const uint8_t *data);
+void aka_audio_sample(int16_t sample,uint64_t cycles) { tickCount=(uint32_t)cycles;audio_level(sample); }
+int aka_sd_read(uint32_t lba, uint8_t *dst) {
+    uint8_t *p=sd_card_data();size_t n=sd_card_size(),off=(size_t)lba*512;
+    if(!p||off>n||n-off<512)return 0;memcpy(dst,p+off,512);return 1;
+}
+int aka_sd_write(uint32_t lba, const uint8_t *src) {
+    uint8_t *p=sd_card_data();size_t n=sd_card_size(),off=(size_t)lba*512;
+    if(!p||off>n||n-off<512)return 0;memcpy(p+off,src,512);sd_write_persist(lba,src);return 1;
 }
 
 /* CMD18 (READ_MULTIPLE_BLOCK) : la carte enchaîne les blocs (jeton 0xFE +
@@ -1335,7 +1350,7 @@ static void fat_build_from_vfiles(void) {
 
 /* écriture CMD24 : répercute dans le fichier local si le secteur appartient
  * à un fichier du répertoire */
-static int sdDirty; /* carte écrite depuis le montage (--out-img) */
+/* sdDirty is shared with the AKA sector bridge above. */
 static char outImgPath[512];
 static void sd_write_persist(uint32_t lba, const uint8_t *data) {
     sdDirty = 1;
@@ -1504,8 +1519,11 @@ static int zip_load_card(const uint8_t *data, size_t len) {
             }
             const char *zp = zname;
             { const char *b = strrchr(zname, '/'); snprintf(save, sizeof save, "%s.sav", espZipPath[0] ? zname : (b ? b + 1 : zname)); }
+            size_t external_len=0;
+            uint8_t *external_sym=esym<0&&espSymPathOpt[0]?file_slurp(espSymPathOpt,&external_len):NULL;
             int r = esp_start(datas[efw], ents[efw].usize, erom >= 0 ? datas[erom] : NULL, erom >= 0 ? ents[erom].usize : 0,
-                              esym >= 0 ? datas[esym] : NULL, esym >= 0 ? ents[esym].usize : 0, zp, save);
+                              esym >= 0 ? datas[esym] : external_sym, esym >= 0 ? ents[esym].usize : external_len, zp, save);
+            free(external_sym);
             for (int i = 0; i < n; i++) free(datas[i]);
             return r == 0 ? 2 : 0;
         }
@@ -4736,7 +4754,7 @@ static const char *filter_name(int f) {
 static inline uint32_t rgb565_argb(uint16_t p) {
     uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
     /* Pokitto et ESPboy : RGB565 natif ; la META garde le sien permuté (voir plus haut) */
-    if (emuTarget == TGT_POKITTO || emuTarget == TGT_ESPBOY) { uint32_t t = r; r = b; b = t; }
+    if (emuTarget == TGT_POKITTO || emuTarget == TGT_ESPBOY || emuTarget == TGT_AKA) { uint32_t t = r; r = b; b = t; }
     return 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
 }
 /* la même couleur à k % d'intensité, canal par canal */
@@ -5364,6 +5382,14 @@ static int esp_start(const uint8_t *fw, size_t fwlen, const uint8_t *rom, size_t
     espSym = sym ? malloc(symlen + 1) : NULL; if (espSym) { memcpy(espSym, sym, symlen); espSym[symlen] = 0; } espSymLen = sym ? symlen : 0;
     audio_rebase();
     tickCount = 0;
+    if (aka_is_image(espFw, espFwLen)) {
+        int r = aka_load(espFw, espFwLen, espSym, espSymLen);
+        if (r) { aka_failed=1;fprintf(stderr,"AKA: cannot load firmware (%d): %s\n",r,aka_error()?aka_error():"invalid image or missing symbols");return -1; }
+        emuTarget=TGT_AKA;pk_screen_reconfig();
+        snprintf(fwPath,sizeof fwPath,"%s",name);fwName=fwPath;fwLoaded=1;
+        printf("AKA firmware: %s (%zu KB), Xtensa + platform HLE, timing estimated\n",name,fwlen/1024);
+        return 0;
+    }
     { const char *m = getenv("GM0_ESP_FLASH_MISS"); esp_miss_opt = m ? (uint32_t)atoi(m) : 0; }
     int r = esp_power_on(espFw, espFwLen, espRom, espRomLen, espSym, espSymLen);
     if (r) {
@@ -5403,6 +5429,14 @@ static void esp_load_firmware(const uint8_t *data, size_t len, const char *path)
     free(rom); free(sym);
 }
 
+static void aka_frame(void) {
+    aka_set_keys((uint8_t)~buttonData);
+    aka_run(4000000);
+    tickCount = (uint32_t)aka_cycles();
+    aka_render(pix);
+    const char *err = aka_error();
+    if (err && !aka_failed) { fprintf(stderr, "AKA: %s\n", err); aka_failed=1; }
+}
 static void esp_frame(void) {
     esp_run((uint64_t)(esp.cpu_hz / 59.7275 + 0.5));
     tickCount = (uint32_t)xt.cycles;
@@ -5461,6 +5495,11 @@ static void load_firmware_data(const uint8_t *data, size_t len, const char *disp
 /* F5 : redémarre le firmware courant (la Pokitto garde sa carte et son
  * EEPROM, comme la référence) */
 static void fw_restart(void) {
+    if(emuTarget==TGT_AKA&&espFw) {
+        audio_rebase();tickCount=0;aka_failed=0;
+        if(aka_load(espFw,espFwLen,espSym,espSymLen))aka_failed=1;
+        audio_start();machineEpoch++;refresh_title();return;
+    }
     if (emuTarget == TGT_ESPBOY && espFw) { esp_restart_game(); audio_start(); machineEpoch++; refresh_title(); return; }
     if (!fwData) return;
     char name[sizeof(fwPath)];snprintf(name,sizeof(name),"%s",fwPath);
@@ -5524,6 +5563,7 @@ static void load_sd_from_path(const char *p) {
 }
 
 static void boot_vectors(void) {
+    if (emuTarget == TGT_AKA) return;
     if (emuTarget == TGT_ESPBOY) return; /* esp_power_on a déjà préparé le démarrage */
     if (emuTarget == TGT_POKITTO) {
         /* vecteurs déjà chargés par pk_reset_core */
@@ -5563,8 +5603,8 @@ static void audio_start(void) {
 
 /* dimensions SDL selon la cible (appelé aussi au changement de cible) */
 static void pk_screen_reconfig(void) {
-    SCR_W = emuTarget == TGT_POKITTO ? 220 : emuTarget == TGT_ESPBOY ? 128 : 160;
-    SCR_H = emuTarget == TGT_POKITTO ? 176 : 128;
+    SCR_W = emuTarget == TGT_AKA ? 320 : emuTarget == TGT_POKITTO ? 220 : emuTarget == TGT_ESPBOY ? 128 : 160;
+    SCR_H = emuTarget == TGT_AKA ? 240 : emuTarget == TGT_POKITTO ? 176 : 128;
     if (!emuRen) return;
     SDL_SetWindowSize(emuWin, (int)(SCR_W * 2), (int)(SCR_H * 2));
     scale_apply();
@@ -5898,6 +5938,7 @@ static void step_batch(uint32_t target) {
 }
 
 static void run_emulated_frame(void) {
+    if (emuTarget == TGT_AKA) { aka_frame(); audio_frame(); return; }
     if (emuTarget == TGT_ESPBOY) { esp_frame(); audio_frame(); return; }
     uint32_t target = emu_nextFrameTick;
     step_batch(target);
@@ -6032,7 +6073,7 @@ static void input_rec_open(const char *path) {
     recFile = fopen(path, "w");
     if (!recFile) { perror(path); return; }
     fprintf(recFile, "# gm0 input v1 target=%s\n",
-            emuTarget == TGT_POKITTO ? "pokitto" : emuTarget == TGT_ESPBOY ? "espboy" : "meta");
+            emuTarget == TGT_POKITTO ? "pokitto" : emuTarget == TGT_ESPBOY ? "espboy" : emuTarget == TGT_AKA ? "aka" : "meta");
 }
 /* avant l'image gm0 f, touches de cette image déjà appliquées */
 static void input_rec_before(uint32_t f) {
@@ -6218,7 +6259,7 @@ static void keylog_note(uint32_t f) {
     if (heldKeys != logHeld) { logHeld = heldKeys; log_push(f, heldKeys); }
 }
 static void snapshot_take(uint32_t f) {
-    if (emuTarget == TGT_ESPBOY) { osd_push("%s", TR("INSTANTANE : PAS SUR ESPBOY", "SNAPSHOT: NOT ON ESPBOY")); return; }
+    if (emuTarget == TGT_ESPBOY || emuTarget == TGT_AKA) { osd_push("%s", TR("INSTANTANE : INDISPONIBLE SUR CETTE CIBLE", "SNAPSHOT: UNAVAILABLE ON THIS TARGET")); return; }
     snapFrame = f;
     snapLog = logCount;
     if (recFile) { fprintf(recFile, "s %u\n", f); fflush(recFile); }
@@ -6322,6 +6363,7 @@ int main(int argc, char **argv) {
     if (getenv("EMU_TARGET")) {
         if (strcasecmp(getenv("EMU_TARGET"), "pokitto") == 0) emuTarget = TGT_POKITTO;
         if (strcasecmp(getenv("EMU_TARGET"), "meta") == 0) emuTarget = TGT_META;
+        if (strcasecmp(getenv("EMU_TARGET"), "aka") == 0) emuTarget = TGT_AKA;
     }
 
     for (int i = 1; i + 1 < argc; i++) { /* ESPboy : --rom / --sym valent quel que soit leur rang */
@@ -6356,7 +6398,8 @@ int main(int argc, char **argv) {
             ++i;
             if (strcasecmp(argv[i], "pokitto") == 0) emuTarget = TGT_POKITTO;
             else if (strcasecmp(argv[i], "meta") == 0) emuTarget = TGT_META;
-            else { fprintf(stderr, TR("cible inconnue : %s (meta|pokitto)\n", "unknown target: %s (meta|pokitto)\n"), argv[i]); return 1; }
+            else if (strcasecmp(argv[i], "aka") == 0) emuTarget = TGT_AKA;
+            else { fprintf(stderr, TR("cible inconnue : %s (meta|pokitto|aka)\n", "unknown target: %s (meta|pokitto|aka)\n"), argv[i]); return 1; }
             targetForced = 1;
         } else if (strcmp(argv[i], "--out-img") == 0 && i + 1 < argc) {
             snprintf(outImgPath, sizeof(outImgPath), "%s", argv[++i]);
@@ -6540,7 +6583,7 @@ int main(int argc, char **argv) {
     if (audioDev) SDL_CloseAudioDevice(audioDev);
     SDL_DestroyRenderer(emuRen); SDL_DestroyTexture(tex); SDL_DestroyWindow(emuWin);
     SDL_Quit();
-    return 0;
+    return aka_failed ? 1 : 0;
 }
 
 #else

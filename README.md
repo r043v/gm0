@@ -380,3 +380,7 @@ notices are reproduced in [LICENSE](LICENSE):
 datasheets (Microchip, NXP, Sitronix, Arm) does not create a derivative of
 those documents, and no code was taken from the lapinou source, META
 binaries, or the official library.
+
+## Gamebuino AKA
+
+Experimental ESP32-S3 application emulation: [usage, services and limits](docs-AKA.md).

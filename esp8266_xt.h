@@ -32,6 +32,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+#ifndef XT_EXTERNAL_MEMORY
 #define XT_DRAM_BASE   0x3FFE8000u
 #define XT_DRAM_SIZE   0x18000u
 #define XT_IRAM_BASE   0x40100000u
@@ -46,6 +47,8 @@ static uint8_t xt_dram[XT_DRAM_SIZE + 8];
 static uint8_t xt_iram[XT_IRAM_SIZE + 8];
 static uint8_t xt_flash[XT_FLASH_SIZE + 8];
 static uint8_t xt_dport[0x1000];
+
+#endif /* XT_EXTERNAL_MEMORY */
 
 /* ---- état */
 static struct {
@@ -115,6 +118,7 @@ static inline void xt_flash_touch(uint32_t off) {
 }
 
 /* ---- accès mémoire.  size 4 : le cas courant en premier. */
+#ifndef XT_EXTERNAL_MEMORY
 static uint32_t xt_load(uint32_t a, unsigned size) {
     uint32_t off;
     if ((off = a - XT_DRAM_BASE) < XT_DRAM_SIZE) {
@@ -194,6 +198,19 @@ static inline const uint8_t *xt_code(uint32_t pc, uint32_t *base, uint32_t *end)
     *base = *end = 0;
     return NULL;
 }
+
+#else
+static uint32_t xt_load(uint32_t a, unsigned size);
+static void xt_store(uint32_t a, uint32_t v, unsigned size);
+static const uint8_t *xt_code(uint32_t pc, uint32_t *base, uint32_t *end);
+#endif
+
+#ifdef XT_WINDOWED
+static int xt_fp(unsigned op1,unsigned op2,unsigned r,unsigned s,unsigned t);
+static uint32_t xt_fp_mem(unsigned r,unsigned s,unsigned t,unsigned offset);
+static void xt_entry(unsigned s, unsigned bytes);
+static uint32_t xt_retw(uint32_t pc);
+#endif
 
 /* ---- registres spéciaux */
 static uint32_t xt_ccount(void) { return (uint32_t)xt.cycles; }
@@ -348,6 +365,9 @@ static void xt_run(uint64_t until) {
                 if (r == 0) a[t] = a[s]; /* MOV.N */
                 else if (r == 15) {
                     if (t == 0) { next = a[0]; cost += 3; } /* RET.N */
+#ifdef XT_WINDOWED
+                    else if (t == 1) { next = xt_retw(pc); cost += 3; }
+#endif
                     else if (t == 3) { /* NOP.N */ }
                     else if (t == 2) { xt.halted = 2; snprintf(xt.msg, sizeof xt.msg, "BREAK.N %u en %08x", s, pc); goto out; }
                     else { xt_fault("instruction narrow %02x%02x illégale en %08x", b1, b0, pc); goto out; }
@@ -367,7 +387,15 @@ static void xt_run(uint64_t until) {
                     case 0: /* ST0 */
                         switch (r) {
                         case 0: /* SNM0 : CALLX/JX/RET */
-                            if (t == 0xC) { const uint32_t tgt = a[s]; a[0] = pc + 3; next = tgt; cost += 2; } /* CALLX0 */
+                            if (t == 0xC) { const uint32_t tgt = a[s]; a[0] = pc + 3;
+#ifdef XT_WINDOWED
+                                xt.ps &= ~(3u<<16);
+#endif
+                                next = tgt; cost += 2; } /* CALLX0 */
+                            #ifdef XT_WINDOWED
+                            else if (t >= 0xD) { unsigned n = t & 3; uint32_t dest = a[s]; a[n*4] = ((pc+3)&0x3fffffff) | (n<<30); xt.ps = (xt.ps & ~(3u<<16)) | (n<<16); next = dest; cost += 2; }
+                            else if (t == 9) { next = xt_retw(pc); cost += 3; }
+#endif
                             else if (t == 0xA) { next = a[s]; cost += 2; }                  /* JX */
                             else if (t == 8) { next = a[0]; cost += 3; }                    /* RET */
                             else if (t == 0 && s == 0) { /* ILL : fonction émulée (ROM, accrochée) ou vraie faute */
@@ -454,6 +482,10 @@ static void xt_run(uint64_t until) {
                     break;
                 case 2: /* RST2 */
                     switch (op2) {
+                    #ifdef XT_WINDOWED
+                    case 6: a[r] = a[s] < a[t]; break;
+                    case 7: a[r] = (int32_t)a[s] < (int32_t)a[t]; break;
+#endif
                     case 8: a[r] = a[s] * a[t]; cost = 2; break; /* MULL */
                     case 10: a[r] = (uint32_t)(((uint64_t)a[s] * a[t]) >> 32); break; /* MULUH */
                     case 11: a[r] = (uint32_t)(((int64_t)(int32_t)a[s] * (int32_t)a[t]) >> 32); break; /* MULSH */
@@ -488,6 +520,10 @@ static void xt_run(uint64_t until) {
                     default: xt_fault("RST3 op2=%u illégal en %08x", op2, pc); goto out;
                     }
                     break;
+                #ifdef XT_WINDOWED
+                case 10: case 11:
+                    if(!xt_fp(op1,op2,r,s,t)) { xt_fault("AKA FP opcode %06x pc=%08x",b0|(b1<<8)|(b2<<16),pc);goto out; }break;
+#endif
                 case 4: case 5: { /* EXTUI */
                     uint32_t shift = s | ((op1 & 1u) << 4), mask = (1u << (op2 + 1u)) - 1u;
                     if (op2 == 15) mask = 0xffffu;
@@ -525,11 +561,21 @@ static void xt_run(uint64_t until) {
                 default: xt_fault("LSAI r=%u illégal en %08x", r, pc); goto out;
                 }
                 break; }
+            #ifdef XT_WINDOWED
+            case 3: xt_fp_mem(r,s,t,b2);break;
+#endif
             case 5: { /* CALLN */
                 const uint32_t n = (b0 >> 4) & 3u;
+                #ifndef XT_WINDOWED
                 if (n) { xt_fault("CALL%u (fenêtres) en %08x", 4 * n, pc); goto out; }
+#endif
                 int32_t off = xt_sext((b0 >> 6) | (b1 << 2) | (b2 << 10), 18);
+                #ifdef XT_WINDOWED
+                a[n*4] = ((pc+3)&0x3fffffff) | (n<<30);
+                xt.ps = (xt.ps & ~(3u<<16)) | (n<<16);
+#else
                 a[0] = pc + 3;
+#endif
                 next = ((pc & ~3u) + 4u) + ((uint32_t)off << 2);
                 cost += 2;
                 break; }
@@ -546,7 +592,13 @@ static void xt_run(uint64_t until) {
                     int32_t v = (int32_t)a[s], c = xt_b4const[r];
                     int taken = m == 0 ? v == c : m == 1 ? v != c : m == 2 ? v < c : v >= c;
                     if (taken) { next = pc + 4u + (uint32_t)xt_sext(b2, 8); cost += 2; }
-                } else if (m == 0) { xt_fault("ENTRY (fenêtres) en %08x", pc); goto out; }
+                } else if (m == 0) {
+#ifdef XT_WINDOWED
+                    xt_entry(s, ((b2<<4)|r)*8);
+#else
+                    xt_fault("ENTRY (fenêtres) en %08x", pc); goto out;
+#endif
+                }
                 else if (m == 1) { /* B1 : BF/BT (booléens), LOOP */
                     if (r >= 8 && r <= 10) {
                         const uint32_t cnt = a[s];
@@ -554,7 +606,15 @@ static void xt_run(uint64_t until) {
                         xt.lbeg = pc + 3;
                         xt.lend = pc + 4u + b2;
                         if ((r == 9 && cnt == 0) || (r == 10 && (int32_t)cnt <= 0)) next = xt.lend;
-                    } else { xt_fault("BF/BT (booléens) en %08x", pc); goto out; }
+                    } else {
+#ifdef XT_WINDOWED
+                        if(r>1){xt_fault("AKA invalid boolean branch");goto out;}
+                        int taken=((xt.sr[4]>>s)&1)==r;
+                        if(taken){next=pc+4u+(uint32_t)xt_sext(b2,8);cost+=2;}
+#else
+                        xt_fault("BF/BT (booléens) en %08x", pc); goto out;
+#endif
+                    }
                 } else { /* BLTUI / BGEUI */
                     uint32_t c = xt_b4constu[r];
                     int taken = m == 2 ? a[s] < c : a[s] >= c;

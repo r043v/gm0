@@ -8,11 +8,11 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
 gm0 = Path(sys.argv[1]) if len(sys.argv) > 1 else root / 'build/bin/gm0'
-gcc = glob.glob(os.path.expanduser('~/.platformio/packages/toolchain-xtensa/bin/xtensa-lx106-elf-gcc'))
+gcc = glob.glob(str(Path(os.environ.get('PLATFORMIO_CORE_DIR', Path.home()/'.platformio'))/'packages/toolchain-xtensa/bin/xtensa-lx106-elf-gcc'))
 if not gcc:
     print('SKIP : toolchain xtensa-lx106 absent'); sys.exit(0)
 env = dict(os.environ, SDL_VIDEODRIVER='dummy', SDL_AUDIODRIVER='dummy', EMU_NOPACE='1')
-rom_ld = os.path.expanduser('~/.platformio/packages/framework-arduinoespressif8266/tools/sdk/ld/eagle.rom.addr.v6.ld')
+rom_ld = str(Path(os.environ.get('PLATFORMIO_CORE_DIR', Path.home()/'.platformio'))/'packages/framework-arduinoespressif8266/tools/sdk/ld/eagle.rom.addr.v6.ld')
 
 def run(*a, **kw):
     return subprocess.run(list(map(str, a)), check=True, capture_output=True, text=True, env=env, **kw)

@@ -14,8 +14,8 @@ EMFLAGS := -O3 -flto -sUSE_SDL=2 -sUSE_ZLIB=1 -sALLOW_MEMORY_GROWTH=1 -sENVIRONM
 #   make wasm EXTRA_EMFLAGS=-DGM0_NO_OSD
 EMFLAGS += $(EXTRA_EMFLAGS)
 
-wasm: gm0.c wasm/index.html wasm/games.js wasm/make_single.py
-	$(EMCC) $(EMFLAGS) -sSINGLE_FILE=1 -o wasm/gm0_single.js gm0.c -lm
+wasm: gm0.c aka.c aka.h esp8266_xt.h wasm/index.html wasm/games.js wasm/make_single.py
+	$(EMCC) $(EMFLAGS) -sSINGLE_FILE=1 -o wasm/gm0_single.js gm0.c aka.c -lm
 	python3 wasm/make_single.py
 	@echo "wasm : ouvrir wasm/gm0.html (file:// ou http)"
 

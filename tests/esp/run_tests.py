@@ -3,13 +3,14 @@
 esp8266_xt.h, comparés au même code exécuté sur l'hôte.  Nécessite le
 toolchain PlatformIO (toolchain-xtensa)."""
 import glob, os, subprocess, sys, tempfile
+from pathlib import Path
 here = os.path.dirname(os.path.abspath(__file__))
-tc = glob.glob(os.path.expanduser('~/.platformio/packages/toolchain-xtensa/bin/xtensa-lx106-elf-gcc'))
+tc = glob.glob(str(Path(os.environ.get('PLATFORMIO_CORE_DIR', Path.home()/'.platformio'))/'packages/toolchain-xtensa/bin/xtensa-lx106-elf-gcc'))
 if not tc:
     print('SKIP : toolchain xtensa-lx106 absent'); sys.exit(0)
 gcc = tc[0]
 def run(*a): return subprocess.run(a, check=True, capture_output=True, text=True).stdout
-rom_ld = os.path.expanduser('~/.platformio/packages/framework-arduinoespressif8266/tools/sdk/ld/eagle.rom.addr.v6.ld')
+rom_ld = str(Path(os.environ.get('PLATFORMIO_CORE_DIR', Path.home()/'.platformio'))/'packages/framework-arduinoespressif8266/tools/sdk/ld/eagle.rom.addr.v6.ld')
 with tempfile.TemporaryDirectory() as tmp:
     # la ROM de la puce fournit les divisions, la virgule flottante et memcpy : la machine les émule
     with open(os.path.join(here, 'link.ld')) as f, open(os.path.join(tmp, 'link.ld'), 'w') as g:
