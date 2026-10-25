@@ -5388,6 +5388,8 @@ static int esp_start(const uint8_t *fw, size_t fwlen, const uint8_t *rom, size_t
         emuTarget=TGT_AKA;pk_screen_reconfig();
         snprintf(fwPath,sizeof fwPath,"%s",name);fwName=fwPath;fwLoaded=1;
         printf("AKA firmware: %s (%zu KB), Xtensa + platform HLE, timing estimated\n",name,fwlen/1024);
+        if (aka_degraded())
+            fprintf(stderr,"AKA: no entrypoint symbol (m0boy_console_main/app_main); booting at image entrypoint, degraded mode - platform services are not hooked, provide a matching --sym\n");
         return 0;
     }
     { const char *m = getenv("GM0_ESP_FLASH_MISS"); esp_miss_opt = m ? (uint32_t)atoi(m) : 0; }
@@ -5435,7 +5437,11 @@ static void aka_frame(void) {
     tickCount = (uint32_t)aka_cycles();
     aka_render(pix);
     const char *err = aka_error();
-    if (err && !aka_failed) { fprintf(stderr, "AKA: %s\n", err); aka_failed=1; }
+    if (err && !aka_failed) {
+        fprintf(stderr, "AKA: %s\n", err); aka_failed=1;
+        if (aka_degraded())
+            fprintf(stderr, "AKA: degraded boot without symbols - platform services are not hooked, a matching --sym is required\n");
+    }
 }
 static void esp_frame(void) {
     esp_run((uint64_t)(esp.cpu_hz / 59.7275 + 0.5));

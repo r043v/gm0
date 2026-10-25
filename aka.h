@@ -11,6 +11,7 @@ void aka_render(uint16_t *out);
 void aka_set_keys(uint8_t keys);
 uint64_t aka_cycles(void);
 const char *aka_error(void);
+int aka_degraded(void);
 extern void aka_audio_sample(int16_t, uint64_t);
 extern int aka_sd_read(uint32_t, uint8_t *);
 extern int aka_sd_write(uint32_t, const uint8_t *);

@@ -21,12 +21,12 @@ static unsigned depth;
 static uint8_t keys;
 static uint32_t heap = AKA_PSRAM, internal_heap = AKA_DRAM + 0x50000;
 static uint32_t entrypoint;
+static int degraded;
 static unsigned frames_drawn;
 static uint64_t audio_at;
 static uint32_t ring_addr, head_addr, tail_addr;
 static int16_t last_sample;
-static uint8_t *mem(uint32_t a, size_t n) {
-  uint32_t off;
+static uint8_t *mem(uint32_t a, size_t n) {  uint32_t off;
   if (n > 0x800000)
     return NULL;
   if ((off = a - AKA_DRAM) < AKA_DRAM_SIZE && n <= AKA_DRAM_SIZE - off)
@@ -41,9 +41,17 @@ static uint8_t *mem(uint32_t a, size_t n) {
     return psram + off;
   return NULL;
 }
+/* Fenêtre périphériques S3 (cache/MMU, horloges, timers...) : le démarrage
+ * ESP-IDF et les drivers y font des lectures/écritures de configuration.
+ * Lectures à 0, écritures ignorées — mode dégradé, aucun état simulé. */
+static int xt_periph(uint32_t a, unsigned n) {
+  return a - 0x60000000u < 0x1000000u && n == 4 && !(a & 3);
+}
 static uint32_t xt_load(uint32_t a, unsigned n) {
   uint8_t *p = mem(a, n);
   uint32_t v = 0;
+  if (xt_periph(a, n))
+    return 0;
   if (!p || (a & (n - 1))) {
     xt_fault("AKA load %u at %08x pc=%08x", n, a, xt.pc);
     return 0;
@@ -53,6 +61,8 @@ static uint32_t xt_load(uint32_t a, unsigned n) {
 }
 static void xt_store(uint32_t a, uint32_t v, unsigned n) {
   uint8_t *p = mem(a, n);
+  if (xt_periph(a, n))
+    return;
   if (!p || (a & (n - 1))) {
     xt_fault("AKA store %u at %08x pc=%08x", n, a, xt.pc);
     return;
@@ -605,12 +615,63 @@ static struct {
   uint32_t *windows;
 } jumps[16];
 static int xt_rom_call(uint32_t pc) {
-  if (pc == 0x40000ffcu) {
+  uint32_t *a = xt.a;
+  if (pc == 0x40000ffc) {
     xt.halted = 2;
     snprintf(xt.msg, sizeof xt.msg, "AKA application returned");
     return 1;
   }
-  for (unsigned i = 0; i < nsymbols; i++)
+  /* Démarrage ESP-IDF : routines de la ROM S3 à adresses fixes. Le cache et
+   * la MMU sont logiquement transparents ici (flash déjà plate en
+   * 0x42000000), ils sont donc des no-ops. */
+  int handled = 0;
+  switch (pc) {
+  case 0x4000057c: /* rtc_get_reset_reason : power-on reset */
+    a[2] = 1;
+    handled = 1;
+    break;
+  case 0x400011e8: /* memset */
+  case 0x40001260: /* bzero */
+    if (a[4] && !mem(a[2], a[4])) {
+      xt_fault("AKA memset %08x + %u pc=%08x", a[2], a[4], xt.pc);
+      return 0;
+    }
+    if (a[4])
+      memset(mem(a[2], a[4]), pc == 0x40001260 ? 0 : a[3], a[4]);
+    handled = 1;
+    break;
+  case 0x400011f4: /* memcpy */
+  case 0x40001200: /* memmove */
+    if (a[4] && (!mem(a[2], a[4]) || !mem(a[3], a[4]))) {
+      xt_fault("AKA memcpy %08x <- %08x + %u pc=%08x", a[2], a[3], a[4], xt.pc);
+      return 0;
+    }
+    if (a[4])
+      memmove(mem(a[2], a[4]), mem(a[3], a[4]), a[4]);
+    handled = 1;
+    break;
+  case 0x4000186c: /* Cache_Disable_ICache */
+  case 0x40001878: /* Cache_Enable_ICache */
+  case 0x40001884: /* Cache_Disable_DCache */
+  case 0x40001890: /* Cache_Enable_DCache */
+  case 0x4000189c: /* rom_Cache_Suspend_ICache */
+  case 0x400018a8: /* Cache_Resume_ICache */
+  case 0x400018b4: /* rom_Cache_Suspend_DCache */
+  case 0x400018c0: /* Cache_Resume_DCache */
+  case 0x40001914: /* Cache_Set_IDROM_MMU_Size */
+  case 0x40001950: /* Cache_Set_IDROM_MMU_Info */
+  case 0x40001974: /* Cache_Owner_Init */
+  case 0x40001998: /* Cache_MMU_Init */
+  case 0x400019a4: /* Cache_Ibus_MMU_Set */
+  case 0x400019b0: /* Cache_Dbus_MMU_Set */
+  case 0x40001a1c: /* rom_config_instruction_cache_mode */
+  case 0x40001a28: /* rom_config_data_cache_mode */
+    handled = 1;
+    break;
+  }
+  if (!handled) {
+    /* pas une routine ROM connue : les appels accrochés par symbole passent là */
+    for (unsigned i = 0; i < nsymbols; i++)
     if (symbols[i].address == pc) {
       unsigned inc = (xt.ps >> 16) & 3;
       uint32_t ret = xt.a[0];
@@ -672,7 +733,15 @@ static int xt_rom_call(uint32_t pc) {
       xt.cycles += 12;
       return 1;
     }
-  return 0;
+    return 0;
+  }
+  unsigned inc = (xt.ps >> 16) & 3;
+  uint32_t ret = a[0];
+  if (inc)
+    xt_entry(1, 0);
+  xt.pc = inc ? xt_retw(pc) : ret;
+  xt.cycles += 12;
+  return 1;
 }
 static int bounds(size_t off, size_t n, size_t len) {
   return off <= len && n <= len - off;
@@ -753,10 +822,13 @@ int aka_load(const uint8_t *b, size_t n, const char *syms, size_t slen) {
   frames_drawn = sequence = 0;
   if (!aka_is_image(b, n))
     return -1;
+  uint32_t img_entry = 0;
   if (!memcmp(b, "\177ELF", 4)) {
+    img_entry = word(b + 24);
     if (load_elf(b, n))
       return -1;
   } else {
+    img_entry = word(b + 4); /* en-tête image ESP : point d'entrée à l'octet 4 */
     size_t off = 24;
     for (unsigned i = 0; i < b[1]; i++) {
       if (!bounds(off, 8, n))
@@ -806,9 +878,18 @@ int aka_load(const uint8_t *b, size_t n, const char *syms, size_t slen) {
   entrypoint = symbol("m0boy_console_main");
   if (!entrypoint)
     entrypoint = symbol("app_main");
+  degraded = 0;
   if (!entrypoint) {
-    xt_fault("AKA needs matching ELF or firmware.sym (app_main absent)");
-    return -2;
+    /* Pas de table de symboles (ou table d'un autre build) : boot au point
+     * d'entrée de l'image, en mode dégradé — les services plateforme ne
+     * peuvent pas être accrochés par nom, l'exécution s'arrêtera au premier
+     * service non intercepté. */
+    if (!mem(img_entry, 4)) {
+      xt_fault("AKA needs matching ELF or firmware.sym (no usable entrypoint)");
+      return -2;
+    }
+    entrypoint = img_entry;
+    degraded = 1;
   }
   for (unsigned i = 0; services[i]; i++) {
     uint8_t *p = mem(symbol(services[i]), 3);
@@ -851,3 +932,4 @@ void aka_render(uint16_t *out) { memcpy(out, screen, sizeof screen); }
 void aka_set_keys(uint8_t k) { keys = k; }
 uint64_t aka_cycles(void) { return xt.cycles; }
 const char *aka_error(void) { return xt.halted ? xt.msg : NULL; }
+int aka_degraded(void) { return degraded; }
