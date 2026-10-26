@@ -19,6 +19,8 @@ static uint16_t screen[320 * 240];
 static uint32_t saved[1024][16];
 static unsigned depth;
 static uint8_t keys;
+static uint16_t extra_keys;
+static int joyx_mv = 1650, joyy_mv = 1650;
 static uint32_t heap = AKA_PSRAM, internal_heap = AKA_DRAM + 0x50000;
 static uint32_t entrypoint;
 static int degraded;
@@ -279,7 +281,14 @@ static uint32_t alloc(unsigned n, int internal) {
 static const char *services[] = {"_ZN7gb_core4initEv",
                                  "lcd_set_fps",
                                  "gb_ll_expander_read",
-                                 "_ZN11gb_joystick6updateEv",
+                                 "gb_ll_adc_init",
+                                 "gb_ll_adc_read_joyx",
+                                 "gb_ll_adc_read_joyy",
+                                 "gb_ll_adc_read_vbatt_mv",
+                                 "gb_ll_adc_read_vbatt_percent",
+                                 "gb_get_millis",
+                                 "gb_delay_ms",
+                                 "gb_delay_us",
                                  "_ZN11gb_graphics6updateEv",
                                  "vsnprintf",
                                  "xTaskGetTickCount",
@@ -329,9 +338,40 @@ static const char *services[] = {"_ZN7gb_core4initEv",
 static int service(const char *name) {
   uint32_t *a = xt.a;
   uint32_t x = a[2], y = a[3], z = a[4];
-  if (!strcmp(name, "_ZN7gb_core4initEv") ||
-      !strcmp(name, "_ZN11gb_joystick6updateEv"))
+  if (!strcmp(name, "_ZN7gb_core4initEv"))
     return 1;
+  if (!strcmp(name, "gb_ll_adc_init")) {
+    a[2] = 0; /* GB_OK */
+    return 1;
+  }
+  if (!strcmp(name, "gb_ll_adc_read_joyx")) {
+    a[2] = joyx_mv;
+    return 1;
+  }
+  if (!strcmp(name, "gb_ll_adc_read_joyy")) {
+    a[2] = joyy_mv;
+    return 1;
+  }
+  if (!strcmp(name, "gb_ll_adc_read_vbatt_mv")) {
+    a[2] = 3900;
+    return 1;
+  }
+  if (!strcmp(name, "gb_ll_adc_read_vbatt_percent")) {
+    a[2] = 100 * (3900 - 3300) / (4000 - 3300);
+    return 1;
+  }
+  if (!strcmp(name, "gb_get_millis")) {
+    a[2] = xt.cycles / 240000;
+    return 1;
+  }
+  if (!strcmp(name, "gb_delay_ms")) {
+    xt.cycles += (uint64_t)x * 240000;
+    return 1;
+  }
+  if (!strcmp(name, "gb_delay_us")) {
+    xt.cycles += ((((uint64_t)y << 32) | x) * 240);
+    return 1;
+  }
   if (!strcmp(name, "lcd_set_fps")) {
     a[2] = x;
     return 1;
@@ -342,10 +382,20 @@ static int service(const char *name) {
     return 1;
   }
   if (!strcmp(name, "gb_ll_expander_read")) {
-    a[2] = ((keys & 1) ? 0x400 : 0) | ((keys & 2) ? 0x800 : 0) |
-           ((keys & 4) ? 0x100 : 0) | ((keys & 8) ? 0x200 : 0) |
-           ((keys & 16) ? 0x8000 : 0) | ((keys & 32) ? 0x2000 : 0) |
-           ((keys & 64) ? 2 : 0) | ((keys & 128) ? 4 : 0);
+    /* PCF8574 halves on Aka CORE v1.4: released keys are pulled high,
+     * except RUN, which reads high only while pressed. The frontend's
+     * eight common buttons map HOME to RUN and MENU to MENU. */
+    uint32_t pins = 0xfffd;
+    if (keys & 1) pins &= ~0x0400u;  /* down */
+    if (keys & 2) pins &= ~0x0800u;  /* left */
+    if (keys & 4) pins &= ~0x0100u;  /* right */
+    if (keys & 8) pins &= ~0x0200u;  /* up */
+    if (keys & 16) pins &= ~0x8000u; /* A */
+    if (keys & 32) pins &= ~0x2000u; /* B */
+    if (keys & 64) pins &= ~0x0004u; /* MENU */
+    if (keys & 128) pins |= 0x0002u; /* RUN */
+    pins &= ~(extra_keys & (0x0040u | 0x0080u | 0x1000u | 0x4000u));
+    a[2] = pins;
     return 1;
   }
   if (!strcmp(name, "_ZN11gb_graphics6updateEv")) {
@@ -820,6 +870,8 @@ int aka_load(const uint8_t *b, size_t n, const char *syms, size_t slen) {
   heap = AKA_PSRAM;
   internal_heap = AKA_DRAM + 0x50000;
   frames_drawn = sequence = 0;
+  joyx_mv = joyy_mv = 1650;
+  extra_keys = 0;
   if (!aka_is_image(b, n))
     return -1;
   uint32_t img_entry = 0;
@@ -830,19 +882,40 @@ int aka_load(const uint8_t *b, size_t n, const char *syms, size_t slen) {
   } else {
     img_entry = word(b + 4); /* en-tête image ESP : point d'entrée à l'octet 4 */
     size_t off = 24;
+    uint8_t checksum = 0xef; /* ESP application image segment checksum */
     for (unsigned i = 0; i < b[1]; i++) {
-      if (!bounds(off, 8, n))
+      if (!bounds(off, 8, n)) {
+        xt_fault("AKA truncated ESP segment header");
         return -1;
+      }
       uint32_t a = word(b + off), size = word(b + off + 4);
       off += 8;
-      if (!bounds(off, size, n))
+      if (!bounds(off, size, n)) {
+        xt_fault("AKA truncated ESP segment at %08x", a);
         return -1;
+      }
+      if (!mem(a, size) && a != 0x50000000) {
+        xt_fault("AKA invalid ESP segment at %08x + %u", a, size);
+        return -1;
+      }
+      for (uint32_t j = 0; j < size; j++) checksum ^= b[off + j];
+      off += size;
+    }
+    size_t checkpos = off + (15 - (off & 15));
+    if (!bounds(checkpos, 1, n) || (b[23] && !bounds(checkpos + 1, 32, n))) {
+      xt_fault("AKA truncated ESP image checksum or SHA-256 trailer");
+      return -1;
+    }
+    if (b[checkpos] != checksum) {
+      xt_fault("AKA ESP image checksum mismatch");
+      return -1;
+    }
+    off = 24;
+    for (unsigned i = 0; i < b[1]; i++) {
+      uint32_t a = word(b + off), size = word(b + off + 4);
+      off += 8;
       uint8_t *dst = mem(a, size);
-      if (!dst) {
-        if (a != 0x50000000)
-          return -1;
-      } else
-        memcpy(dst, b + off, size);
+      if (dst) memcpy(dst, b + off, size);
       off += size;
     }
   }
@@ -930,6 +1003,11 @@ void aka_run(uint64_t cycles) {
 }
 void aka_render(uint16_t *out) { memcpy(out, screen, sizeof screen); }
 void aka_set_keys(uint8_t k) { keys = k; }
+void aka_set_extra_keys(uint16_t k) { extra_keys = k; }
+void aka_set_joystick(int16_t x, int16_t y) {
+  joyx_mv = 1650 + (int32_t)x * 1650 / 32768;
+  joyy_mv = 1650 - (int32_t)y * 1650 / 32768;
+}
 uint64_t aka_cycles(void) { return xt.cycles; }
 const char *aka_error(void) { return xt.halted ? xt.msg : NULL; }
 int aka_degraded(void) { return degraded; }

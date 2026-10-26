@@ -278,7 +278,7 @@ Diagnostics are enabled through environment variables; the most useful:
 
 | Variable | Effect |
 |---|---|
-| `EMU_INPUT="frame:keys:len,..."` | scripted input (keys among `UDLRABMH`), e.g. `200:A:5,300:R:40`; H is the m0boy menu key on every console (the META's HOME, the Pokitto's C) |
+| `EMU_INPUT="frame:keys:len,..."` | scripted input (keys among `UDLRABMH`), e.g. `200:A:5,300:R:40`; H is the m0boy menu key on every console (the META's HOME, the Pokitto's C). Aka also accepts `C` (C), `X` (D), `Q` (L1), `E` (R1) |
 | `EMU_NOPACE=1` | run as fast as possible (benchmarks) |
 | `EMU_TRACE=1` | screen hash every 60 frames, periodic CPU trace |
 | `TRACE_TAIL=N` | keep the last N executed instructions, dumped on a wild PC |
@@ -337,6 +337,11 @@ co-authored with Claude Opus 5.5 in Claude Code.
 
 ## Credits and references
 
+Jicehel shared the [Aka QEMU emulator](https://github.com/Jicehel-Aka/aka-emulator).
+Its expander and ADC models, image checker, and Launcher sources clarified
+the Aka CORE v1.4 input wiring and ESP image format used in gm0. See
+[Aka support](docs-AKA.md).
+
 Logic was ported from two MIT-licensed emulators:
 
 - **gamebuino-emulator** by Andy O'Neill (TypeScript) — the first C port
@@ -383,4 +388,7 @@ binaries, or the official library.
 
 ## Gamebuino AKA
 
-Experimental ESP32-S3 application emulation: [usage, services and limits](docs-AKA.md).
+Experimental ESP32-S3 application emulation, plus an optional full-system
+backend using Jicehel's separately installed QEMU emulator:
+`gm0 game.bin --aka-system /path/to/aka-emulator`. See
+[usage, services and limits](docs-AKA.md).

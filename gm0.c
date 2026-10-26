@@ -31,6 +31,11 @@
 #include <time.h>
 #include <math.h>
 #include <stdarg.h>
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <limits.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #ifdef GM0_EMBEDDED_GAME
 #include "gm0_bundle.h"
 #endif
@@ -5151,6 +5156,12 @@ static const struct keymap keys[] = {
     { SDLK_RETURN, BTN_MENU }, { SDLK_KP_ENTER, BTN_MENU },
 };
 static uint8_t key_bit(SDL_Keycode sym) {
+    if (emuTarget == TGT_AKA) {
+        if (sym == SDLK_x) return BTN_A;
+        if (sym == SDLK_z) return BTN_B;
+        if (sym == SDLK_RETURN || sym == SDLK_KP_ENTER) return BTN_HOME; /* RUN */
+        if (sym == SDLK_ESCAPE) return BTN_MENU;
+    }
     const struct keymap *m = keys;
     size_t n = sizeof keys / sizeof *m;
     for (size_t i = 0; i < n; i++) if (m[i].sym == sym) return m[i].mask;
@@ -5164,6 +5175,29 @@ static uint8_t esp_key_bits(uint8_t m) {
                      ((m & BTN_B) ? 16u : 0u) | ((m & BTN_A) ? 32u : 0u) | ((m & BTN_HOME) ? 64u : 0u) | ((m & BTN_MENU) ? 128u : 0u));
 }
 static uint8_t heldKeys; /* touches tenues (BTN_*), toutes cibles : --record-input */
+static uint16_t akaExtraKeys; /* bits physiques Aka C, D, L1, R1 */
+static uint8_t akaAnalogKeys; /* J/L : X, I/K : Y */
+static uint16_t aka_extra_key(SDL_Keycode key) {
+    if (key == SDLK_s) return 0x4000; /* C */
+    if (key == SDLK_d) return 0x1000; /* D */
+    if (key == SDLK_q) return 0x0080; /* L1 */
+    if (key == SDLK_e) return 0x0040; /* R1 */
+    return 0;
+}
+static uint8_t aka_analog_key(SDL_Keycode key) {
+    if (key == SDLK_j) return 1; /* left */
+    if (key == SDLK_l) return 2; /* right */
+    if (key == SDLK_i) return 4; /* up */
+    if (key == SDLK_k) return 8; /* down */
+    return 0;
+}
+static uint16_t aka_extra_pad(uint8_t button) {
+    if (button == SDL_CONTROLLER_BUTTON_Y) return 0x4000;
+    if (button == SDL_CONTROLLER_BUTTON_X) return 0x1000;
+    if (button == SDL_CONTROLLER_BUTTON_LEFTSHOULDER) return 0x0080;
+    if (button == SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) return 0x0040;
+    return 0;
+}
 static int ffActive, ffReplaying; /* avance rapide d'un instantané : seules les touches rejouées comptent */
 static int snapRequest;           /* F2 : 1, prendre un instantané ; F4 : 2, y revenir */
 static void btn_press(uint8_t mask) {
@@ -5192,10 +5226,12 @@ static void btn_release(uint8_t mask) {
  * Pokitto, sans effet de plus sur la META que Start/Back) */
 static uint8_t pad_button_mask(uint8_t b) {
     switch (b) {
-        case SDL_CONTROLLER_BUTTON_A: return BTN_A;
-        case SDL_CONTROLLER_BUTTON_B: return BTN_B;
-        case SDL_CONTROLLER_BUTTON_X: case SDL_CONTROLLER_BUTTON_START: return BTN_MENU;
-        case SDL_CONTROLLER_BUTTON_Y: case SDL_CONTROLLER_BUTTON_BACK:
+        case SDL_CONTROLLER_BUTTON_A: return emuTarget == TGT_AKA ? BTN_B : BTN_A;
+        case SDL_CONTROLLER_BUTTON_B: return emuTarget == TGT_AKA ? BTN_A : BTN_B;
+        case SDL_CONTROLLER_BUTTON_X: return emuTarget == TGT_AKA ? 0 : BTN_MENU;
+        case SDL_CONTROLLER_BUTTON_START: return emuTarget == TGT_AKA ? BTN_HOME : BTN_MENU;
+        case SDL_CONTROLLER_BUTTON_Y: return emuTarget == TGT_AKA ? 0 : BTN_HOME;
+        case SDL_CONTROLLER_BUTTON_BACK: return emuTarget == TGT_AKA ? BTN_MENU : BTN_HOME;
         case SDL_CONTROLLER_BUTTON_GUIDE: return BTN_HOME;
         case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return BTN_DOWN;
         case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return BTN_LEFT;
@@ -5220,6 +5256,11 @@ static uint8_t pad_dir_bits(SDL_GameController *pad) {
 
 /* joystick sans mapping (boutons 0..3 = A, B, MENU, HOME ; chapeau = croix) */
 static uint8_t joy_button_mask(uint8_t b) {
+    if (emuTarget == TGT_AKA) {
+        if (b == 2 || b == 3 || b == 4 || b == 5) return 0;
+        if (b == 6) return BTN_MENU;
+        if (b == 7) return BTN_HOME;
+    }
     switch (b) {
         case 0: return BTN_A;
         case 1: return BTN_B;
@@ -5433,6 +5474,25 @@ static void esp_load_firmware(const uint8_t *data, size_t len, const char *path)
 
 static void aka_frame(void) {
     aka_set_keys((uint8_t)~buttonData);
+    aka_set_extra_keys(akaExtraKeys);
+    int16_t ax = 0, ay = 0;
+    if (pad) {
+        ax = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
+        ay = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+    } else if (joyFb && SDL_JoystickNumAxes(joyFb) >= 2) {
+        ax = SDL_JoystickGetAxis(joyFb, 0);
+        ay = SDL_JoystickGetAxis(joyFb, 1);
+    }
+    uint8_t pressed = (uint8_t)~buttonData;
+    if (akaAnalogKeys & 3)
+        ax = (akaAnalogKeys & 2) ? 32767 : -32768;
+    if (akaAnalogKeys & 12)
+        ay = (akaAnalogKeys & 8) ? 32767 : -32768;
+    if (ax > -6000 && ax < 6000)
+        ax = (pressed & BTN_RIGHT) ? 32767 : (pressed & BTN_LEFT) ? -32768 : 0;
+    if (ay > -6000 && ay < 6000)
+        ay = (pressed & BTN_DOWN) ? 32767 : (pressed & BTN_UP) ? -32768 : 0;
+    aka_set_joystick(ax, ay);
     aka_run(4000000);
     tickCount = (uint32_t)aka_cycles();
     aka_render(pix);
@@ -5778,6 +5838,17 @@ static int poll_events(void) {
             osd_push("%s", dispFull ? TR("PLEIN ECRAN", "FULLSCREEN") : TR("FENETRE", "WINDOWED"));
         }
         else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+            if (emuTarget == TGT_AKA) {
+                uint16_t extra = aka_extra_key(ev.key.keysym.sym);
+                uint8_t analog = aka_analog_key(ev.key.keysym.sym);
+                if (ev.type == SDL_KEYDOWN) {
+                    akaExtraKeys |= extra;
+                    akaAnalogKeys |= analog;
+                } else {
+                    akaExtraKeys &= (uint16_t)~extra;
+                    akaAnalogKeys &= (uint8_t)~analog;
+                }
+            }
             uint8_t m = key_bit(ev.key.keysym.sym);
             if (m) {
                 if (ev.type == SDL_KEYDOWN) btn_press(m);
@@ -5805,6 +5876,11 @@ static int poll_events(void) {
             }
         }
         else if (ev.type == SDL_CONTROLLERBUTTONDOWN || ev.type == SDL_CONTROLLERBUTTONUP) {
+            if (emuTarget == TGT_AKA) {
+                uint16_t extra = aka_extra_pad(ev.cbutton.button);
+                if (ev.type == SDL_CONTROLLERBUTTONDOWN) akaExtraKeys |= extra;
+                else akaExtraKeys &= (uint16_t)~extra;
+            }
             uint8_t m = pad ? pad_button_mask(ev.cbutton.button) : 0;
             if (m) {
                 if (ev.type == SDL_CONTROLLERBUTTONDOWN) btn_press(m);
@@ -5812,7 +5888,7 @@ static int poll_events(void) {
             }
         }
         else if (ev.type == SDL_CONTROLLERAXISMOTION) {
-            if (pad && (ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX ||
+            if (pad && emuTarget != TGT_AKA && (ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX ||
                         ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY)) {
                 uint8_t want = pad_dir_bits(pad) & BTN_DIRMASK;
                 btn_release(padDirBits & ~want);  /* directions quittées */
@@ -5821,6 +5897,12 @@ static int poll_events(void) {
             }
         }
         else if (ev.type == SDL_JOYBUTTONDOWN || ev.type == SDL_JOYBUTTONUP) {
+            if (emuTarget == TGT_AKA && joyFb) {
+                uint16_t extra = ev.jbutton.button == 2 ? 0x4000 : ev.jbutton.button == 3 ? 0x1000 :
+                                 ev.jbutton.button == 4 ? 0x0080 : ev.jbutton.button == 5 ? 0x0040 : 0;
+                if (ev.type == SDL_JOYBUTTONDOWN) akaExtraKeys |= extra;
+                else akaExtraKeys &= (uint16_t)~extra;
+            }
             uint8_t m = joyFb ? joy_button_mask(ev.jbutton.button) : 0;
             if (m) {
                 if (ev.type == SDL_JOYBUTTONDOWN) btn_press(m);
@@ -6356,7 +6438,142 @@ int main(int argc, char **argv) {
 #elif !defined(__EMSCRIPTEN__)
 /* ------------------------------------------------------------ natif --- */
 
+/* Full-system Aka backend supplied separately by Jicehel's aka-emulator.
+ * The application-level interpreter above remains available for ELF/symbols.
+ * No QEMU code or firmware is bundled with gm0. */
+static int aka_system_launch(int argc, char **argv) {
+#if defined(_WIN32)
+    (void)argc; (void)argv;
+    fprintf(stderr, "AKA system backend is currently available on POSIX hosts only\n");
+    return 1;
+#else
+    const char *root = NULL, *game = NULL, *sd = NULL, *flash_arg = NULL;
+    const char *shot_arg = NULL, *shot_delay = "15000", *press_arg = NULL;
+    const char *parts_arg = NULL, *boot_arg = NULL, *launcher_arg = NULL;
+    int fresh = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "--aka-fresh")) { fresh = 1; continue; }
+        if ((!strcmp(a, "--aka-system") || !strcmp(a, "--aka-sd") ||
+             !strcmp(a, "--aka-flash") || !strcmp(a, "--aka-screenshot") ||
+             !strcmp(a, "--aka-shot-delay") || !strcmp(a, "--aka-press") ||
+             !strcmp(a, "--aka-partitions") ||
+             !strcmp(a, "--aka-bootloader") || !strcmp(a, "--aka-launcher")) && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (!strcmp(a, "--aka-system")) root = v;
+            else if (!strcmp(a, "--aka-sd")) sd = v;
+            else if (!strcmp(a, "--aka-flash")) flash_arg = v;
+            else if (!strcmp(a, "--aka-screenshot")) shot_arg = v;
+            else if (!strcmp(a, "--aka-shot-delay")) shot_delay = v;
+            else if (!strcmp(a, "--aka-press")) press_arg = v;
+            else if (!strcmp(a, "--aka-partitions")) parts_arg = v;
+            else if (!strcmp(a, "--aka-bootloader")) boot_arg = v;
+            else if (!strcmp(a, "--aka-launcher")) launcher_arg = v;
+            continue;
+        }
+        if (!strcmp(a, "--target") && i + 1 < argc && !strcasecmp(argv[i + 1], "aka")) { i++; continue; }
+        if (a[0] != '-' && !game) { game = a; continue; }
+        fprintf(stderr, "AKA system backend: unsupported or incomplete argument %s\n", a);
+        return 1;
+    }
+    if (!root || !game) {
+        fprintf(stderr, "usage: gm0 game.bin --aka-system DIR [--aka-sd DIR] [--aka-flash FILE] [--aka-fresh] [--aka-screenshot BMP] [--aka-shot-delay MS] [--aka-press MASK:MS:DURATION]\n");
+        return 1;
+    }
+    char dir[PATH_MAX], firmware[PATH_MAX], card[PATH_MAX];
+    char front[PATH_MAX], qemu[PATH_MAX], bios[PATH_MAX];
+    char parts[PATH_MAX], boot[PATH_MAX], launcher[PATH_MAX];
+    char flash[PATH_MAX], shot[PATH_MAX], temp[] = "/tmp/gm0-aka-XXXXXX";
+    if (!realpath(root, dir) || !realpath(game, firmware) ||
+        (sd && !realpath(sd, card))) {
+        perror("AKA system backend path"); return 1;
+    }
+#define AKA_PATH(dst, fmt, ...) do { \
+    if (snprintf(dst, sizeof(dst), fmt, __VA_ARGS__) >= (int)sizeof(dst)) { \
+        fprintf(stderr, "AKA system backend: path too long\n"); return 1; \
+    } \
+} while (0)
+    AKA_PATH(front, "%s/bin/aka-front", dir);
+    AKA_PATH(qemu, "%s/bin/qemu-system-xtensa", dir);
+    AKA_PATH(bios, "%s/bin/pc-bios", dir);
+    AKA_PATH(parts, "%s/sample/real-ota/partitions.bin", dir);
+    AKA_PATH(boot, "%s/sample/real-ota/bootloader.bin", dir);
+    AKA_PATH(launcher, "%s/sample/real-ota/launcher.bin", dir);
+    if (parts_arg && !realpath(parts_arg, parts)) { perror(parts_arg); return 1; }
+    if (boot_arg && !realpath(boot_arg, boot)) { perror(boot_arg); return 1; }
+    if (launcher_arg && !realpath(launcher_arg, launcher)) { perror(launcher_arg); return 1; }
+    if (access(front, X_OK) || access(qemu, X_OK) || access(parts, R_OK) ||
+        access(boot, R_OK) || access(launcher, R_OK) || access(bios, R_OK)) {
+        fprintf(stderr, "AKA system backend: missing resources or non-executable binaries in %s\n", dir);
+        return 1;
+    }
+    if (!mkdtemp(temp)) { perror("mkdtemp"); return 1; }
+    if (flash_arg) {
+        if (flash_arg[0] == '/') AKA_PATH(flash, "%s", flash_arg);
+        else {
+            char cwd[PATH_MAX];
+            if (!getcwd(cwd, sizeof cwd)) { perror("getcwd"); rmdir(temp); return 1; }
+            AKA_PATH(flash, "%s/%s", cwd, flash_arg);
+        }
+    } else AKA_PATH(flash, "%s/flash.bin", temp);
+    if (shot_arg) {
+        if (shot_arg[0] == '/') AKA_PATH(shot, "%s", shot_arg);
+        else {
+            char cwd[PATH_MAX];
+            if (!getcwd(cwd, sizeof cwd)) { perror("getcwd"); rmdir(temp); return 1; }
+            AKA_PATH(shot, "%s/%s", cwd, shot_arg);
+        }
+    }
+#undef AKA_PATH
+    /* aka-front hides QEMU's exit status, so catch missing shared libraries
+     * and non-runnable binaries before opening its window. */
+    pid_t child = fork();
+    if (child == 0) {
+        execl(qemu, qemu, "--version", (char *)NULL);
+        perror(qemu); _exit(127);
+    }
+    int status = 0;
+    if (child < 0 || waitpid(child, &status, 0) < 0 ||
+        !WIFEXITED(status) || WEXITSTATUS(status)) {
+        fprintf(stderr, "AKA system backend: QEMU cannot start\n");
+        rmdir(temp); return 1;
+    }
+    char *args[32]; int n = 0;
+    args[n++] = front;
+    args[n++] = "--qemu"; args[n++] = qemu;
+    args[n++] = "--bios"; args[n++] = bios;
+    args[n++] = "--partitions"; args[n++] = parts;
+    args[n++] = "--bootloader"; args[n++] = boot;
+    args[n++] = "--launcher"; args[n++] = launcher;
+    args[n++] = "--game"; args[n++] = firmware;
+    args[n++] = "--boot-game";
+    args[n++] = "--flash"; args[n++] = flash;
+    if (fresh) args[n++] = "--fresh";
+    if (sd) { args[n++] = "--sd"; args[n++] = card; }
+    if (shot_arg) {
+        args[n++] = "--screenshot"; args[n++] = shot;
+        args[n++] = "--shot-delay"; args[n++] = (char *)shot_delay;
+    }
+    if (press_arg) { args[n++] = "--press"; args[n++] = (char *)press_arg; }
+    args[n] = NULL;
+    child = fork();
+    if (child == 0) {
+        if (chdir(temp)) { perror(temp); _exit(127); }
+        execv(front, args);
+        perror(front); _exit(127);
+    }
+    if (child < 0 || waitpid(child, &status, 0) < 0) {
+        perror("AKA system backend fork/wait"); status = 1;
+    }
+    if (!flash_arg) unlink(flash);
+    rmdir(temp);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+#endif
+}
+
 int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++)
+        if (!strcmp(argv[i], "--aka-system")) return aka_system_launch(argc, argv);
     gm0Argc = argc; gm0Argv = argv; /* F4 : relance de gm0 lui-même */
 #ifndef GM0_EMBEDDED_GAME
     if (argc < 2)
@@ -6487,15 +6704,24 @@ int main(int argc, char **argv) {
             if (in == (const char *)1) in = getenv("EMU_INPUT");
             for (const char *q = in; q && *q;) {
                 unsigned f0 = 0, len = 3; char keys[16] = {0};
-                if (sscanf(q, "%u:%15[UDLRABMH]:%u", &f0, keys, &len) >= 2) {
+                if (sscanf(q, "%u:%15[UDLRABMHCXQE]:%u", &f0, keys, &len) >= 2) {
                     uint8_t m = 0;
                     for (char *k = keys; *k; k++)
                         m |= *k == 'U' ? BTN_UP : *k == 'D' ? BTN_DOWN : *k == 'L' ? BTN_LEFT :
                              *k == 'R' ? BTN_RIGHT : *k == 'A' ? BTN_A : *k == 'B' ? BTN_B :
-                             *k == 'M' ? BTN_MENU : BTN_HOME;
+                             *k == 'M' ? BTN_MENU : *k == 'H' ? BTN_HOME : 0;
                     if (emuTarget == TGT_POKITTO && strchr(keys, 'H')) m |= BTN_MENU;
                     if (frame == f0) btn_press(m);
                     if (frame == f0 + len) btn_release(m);
+                    if (emuTarget == TGT_AKA) {
+                        uint16_t extra = 0;
+                        if (strchr(keys, 'C')) extra |= 0x4000;
+                        if (strchr(keys, 'X')) extra |= 0x1000;
+                        if (strchr(keys, 'Q')) extra |= 0x0080;
+                        if (strchr(keys, 'E')) extra |= 0x0040;
+                        if (frame == f0) akaExtraKeys |= extra;
+                        if (frame == f0 + len) akaExtraKeys &= (uint16_t)~extra;
+                    }
                 }
                 q = strchr(q, ','); if (q) q++;
             }

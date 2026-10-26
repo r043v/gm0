@@ -286,7 +286,7 @@ Les diagnostics s'activent par variables d'environnement ; les plus utiles :
 
 | Variable | Effet |
 |---|---|
-| `EMU_INPUT="frame:touches:durée,..."` | entrées scriptées (touches parmi `UDLRABMH`), ex. `200:A:5,300:R:40` ; H est la touche de menu des firmwares m0boy sur toutes les consoles (HOME de la META, C de la Pokitto) |
+| `EMU_INPUT="frame:touches:durée,..."` | entrées scriptées (touches parmi `UDLRABMH`), ex. `200:A:5,300:R:40` ; H est la touche de menu des firmwares m0boy sur toutes les consoles (HOME de la META, C de la Pokitto). Aka accepte aussi `C` (C), `X` (D), `Q` (L1), `E` (R1) |
 | `EMU_NOPACE=1` | exécution aussi rapide que possible (mesures) |
 | `EMU_TRACE=1` | empreinte de l'écran toutes les 60 frames, trace CPU périodique |
 | `TRACE_TAIL=N` | conserve les N dernières instructions, vidées sur un PC hors mémoire |
@@ -396,4 +396,9 @@ lapinou, des binaires META ni de la lib officielle.
 
 ## Gamebuino AKA
 
-Experimental ESP32-S3 application emulation: [usage, services and limits](docs-AKA.md).
+Merci à Jicehel pour le partage de son [émulateur Aka basé sur QEMU](https://github.com/Jicehel-Aka/aka-emulator) : ses modèles de l'expander et de l'ADC, son vérificateur d'images et les sources du Launcher ont permis d'améliorer les boutons, le joystick, la batterie et le chargement des images ESP dans gm0.
+
+Émulation applicative ESP32-S3 expérimentale et mode système complet optionnel
+avec l'émulateur QEMU de Jicehel, installé séparément :
+`gm0 jeu.bin --aka-system /chemin/vers/aka-emulator`.
+Voir [utilisation, services et limites](docs-AKA.md).
