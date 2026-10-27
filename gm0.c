@@ -6385,11 +6385,20 @@ static void snapshot_rewind(void) {
     argv[n] = NULL;
     printf(TR("retour à l'instantané : image %u (avance rapide)\n", "back to snapshot: frame %u (fast forward)\n"), snapFrame);
     fflush(stdout);
+#if defined(_WIN32)
+    /* pas d'execv sous Windows : l'émulateur continue, le retour à
+     * l'instantané se fait en relançant gm0 avec ces arguments */
+    fprintf(stderr, TR("retour à l'instantané : relancez gm0 avec --play-input %s --resume-at %s\n",
+                       "snapshot: restart gm0 with --play-input %s --resume-at %s\n"), journal, at);
+    free(argv);
+    return;
+#else
     unsetenv("EMU_SNAP"); /* ses événements ont eu lieu */
     SDL_Quit();
     execv("/proc/self/exe", argv);
     perror("execv");
     free(argv);
+#endif
 }
 /* l'image gm0 f est atteinte : fin de l'avance rapide d'une reprise */
 static void fast_forward_check(uint32_t f) {

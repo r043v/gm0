@@ -388,7 +388,24 @@ binaries, or the official library.
 
 ## Gamebuino AKA
 
-Experimental ESP32-S3 application emulation, plus an optional full-system
-backend using Jicehel's separately installed QEMU emulator:
-`gm0 game.bin --aka-system /path/to/aka-emulator`. See
-[usage, services and limits](docs-AKA.md).
+Thanks to Jicehel for sharing his [QEMU-based Aka
+emulator](https://github.com/Jicehel-Aka/aka-emulator): its expander and ADC
+models, image checker and Launcher sources improved gm0's buttons, joystick,
+battery and ESP image loading.
+
+gm0 executes the firmware's own Xtensa code (experimental application-level
+emulation): an ELF with symbols, or a `.bin`/`.zip` shipped with its
+`firmware.sym` (`gm0 game.zip`). Platform services are hooked by name; an
+unknown instruction or service stops with a diagnostic.
+
+The optional full-system mode boots the bootloader, FreeRTOS and drivers in
+Jicehel's QEMU emulator, installed separately (Linux and other POSIX hosts):
+
+```
+gm0 game.bin --aka-system /path/to/aka-emulator [--aka-sd card-folder] [--aka-flash file]
+```
+
+`--aka-sd` serves a folder as the Launcher's SD card (one sub-folder per
+application: `firmware.bin`, `meta.json`); `--aka-flash` keeps the flash —
+installed games and saves — between runs.
+See [usage, services and limits](docs-AKA.md).

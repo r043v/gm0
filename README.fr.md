@@ -398,7 +398,20 @@ lapinou, des binaires META ni de la lib officielle.
 
 Merci à Jicehel pour le partage de son [émulateur Aka basé sur QEMU](https://github.com/Jicehel-Aka/aka-emulator) : ses modèles de l'expander et de l'ADC, son vérificateur d'images et les sources du Launcher ont permis d'améliorer les boutons, le joystick, la batterie et le chargement des images ESP dans gm0.
 
-Émulation applicative ESP32-S3 expérimentale et mode système complet optionnel
-avec l'émulateur QEMU de Jicehel, installé séparément :
-`gm0 jeu.bin --aka-system /chemin/vers/aka-emulator`.
+gm0 exécute le code Xtensa du firmware lui-même (émulation applicative
+expérimentale) : un ELF avec symboles, ou un `.bin`/`.zip` accompagné de son
+`firmware.sym` (`gm0 jeu.zip`). Les services plateforme sont interceptés par
+nom ; une instruction ou un service inconnu s'arrête avec un diagnostic.
+
+Le mode système complet optionnel démarre le bootloader, FreeRTOS et les
+drivers dans l'émulateur QEMU de Jicehel, installé séparément (Linux et
+autres hôtes POSIX) :
+
+```
+gm0 jeu.bin --aka-system /chemin/vers/aka-emulator [--aka-sd dossier-carte] [--aka-flash fichier]
+```
+
+`--aka-sd` sert un dossier comme carte SD du Launcher (un sous-dossier par
+application : `firmware.bin`, `meta.json`) ; `--aka-flash` garde la flash —
+donc les jeux installés et les sauvegardes — d'un run à l'autre.
 Voir [utilisation, services et limites](docs-AKA.md).
