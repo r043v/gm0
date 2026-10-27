@@ -4760,9 +4760,11 @@ static inline uint32_t rgb565_argb(uint16_t p) {
     uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
     /* Pokitto et ESPboy : RGB565 natif ; la META garde le sien permuté (voir plus haut) */
     if (emuTarget == TGT_POKITTO || emuTarget == TGT_ESPBOY) { uint32_t t = r; r = b; b = t; }
-    /* AKA : vitre RVB ordinaire ; MADCTL bit 3 = 1 fait lire les mots en BGR (la lib officielle,
-     * lcd_color_rgb, range le rouge dans les bits bas), bit 3 = 0 les lit en RVB */
-    else if (emuTarget == TGT_AKA && !aka_panel_bgr()) { uint32_t t = r; r = b; b = t; }
+    /* AKA : MADCTL bit 3 (sémantique ST7789) à 1 fait lire les mots pixel en
+     * BGR par le panneau (la lib officielle, lcd_color_rgb, y range le rouge
+     * dans les bits bas) — la fenêtre échange alors rouge et bleu ; à 0, les
+     * mots RGB565 du firmware m0boy s'affichent droits (confirmé sur carte) */
+    else if (emuTarget == TGT_AKA && aka_panel_bgr()) { uint32_t t = r; r = b; b = t; }
     return 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
 }
 /* la même couleur à k % d'intensité, canal par canal */
