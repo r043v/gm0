@@ -16,6 +16,18 @@ static uint8_t dram[AKA_DRAM_SIZE + 8], iram[AKA_IRAM_SIZE + 8],
     psram[AKA_PSRAM_SIZE + 8];
 static uint8_t rodata[8 * 1024 * 1024 + 8];
 static uint16_t screen[320 * 240];
+/* The panel as the firmware set it up (m0_aka_lcd, aka_hw.cpp: the values its
+ * init sends).  A firmware without it predates hardware byte swapping: its
+ * words are already in wire order and the glass keeps the official MADCTL. */
+static struct { uint8_t madctl, swap_color_bytes; } panel = {0x68, 0};
+/* The i80 bus sends the high byte first when swap_color_bytes is on; without
+ * it the panel reads the byte-swapped word.  Pixels stay as the panel got them. */
+static uint16_t panel_word(uint16_t c) {
+  return panel.swap_color_bytes ? c : (uint16_t)((c >> 8) | (c << 8));
+}
+/* MADCTL bit 3 set puts the channels right on the BGR-wired glass; clear, red
+ * and blue show swapped. */
+int aka_panel_bgr(void) { return (panel.madctl >> 3) & 1; }
 static uint32_t saved[1024][16];
 static unsigned depth;
 static uint8_t keys;
@@ -568,7 +580,7 @@ static int service(const char *name) {
       for (unsigned py = lo; py < hi; py++)
         for (unsigned px = 0; px < 320; px++) {
           uint16_t c = p[row * 160 + px / 2];
-          screen[py * 320 + px] = (c >> 8) | (c << 8);
+          screen[py * 320 + px] = panel_word(c);
         }
     }
     a[2] = ++sequence;
@@ -586,7 +598,7 @@ static int service(const char *name) {
     for (unsigned row = 0; row < z; row++)
       for (unsigned px = 0; px < 320; px++) {
         uint16_t c = p[row * 320 + px];
-        screen[(y + row) * 320 + px] = (c >> 8) | (c << 8);
+        screen[(y + row) * 320 + px] = panel_word(c);
       }
     a[2] = ++sequence;
     frames_drawn++;
@@ -598,7 +610,7 @@ static int service(const char *name) {
     return 1;
   }
   if (!strcmp(name, "m0_lcd_fill")) {
-    uint16_t c = (x >> 8) | (x << 8);
+    uint16_t c = panel_word((uint16_t)x);
     for (unsigned i = 0; i < 320 * 240; i++)
       screen[i] = c;
     return 1;
@@ -1138,6 +1150,8 @@ int aka_load(const uint8_t *b, size_t n, const char *syms, size_t slen) {
     }
   }
   frames_drawn = sequence = 0;
+  panel.madctl = 0x68;
+  panel.swap_color_bytes = 0;
   joyx_mv = joyy_mv = 1650;
   extra_keys = 0;
   if (!aka_is_image(b, n))
@@ -1216,6 +1230,15 @@ int aka_load(const uint8_t *b, size_t n, const char *syms, size_t slen) {
   }
   audio_at = 0;
   last_sample = 0;
+  {
+    const uint8_t *setup = mem(symbol("m0_aka_lcd"), 4);
+    if (setup) {
+      panel.madctl = setup[0];
+      panel.swap_color_bytes = setup[2];
+      if (getenv("EMU_LCD_DEBUG"))
+        fprintf(stderr, "[lcd] AKA MADCTL %02x (BGR=%d) swap_color_bytes=%d\n", panel.madctl, aka_panel_bgr(), panel.swap_color_bytes);
+    }
+  }
   entrypoint = symbol("m0boy_console_main");
   if (!entrypoint)
     entrypoint = symbol("app_main");

@@ -8,6 +8,8 @@ int aka_is_image(const uint8_t *, size_t);
 int aka_load(const uint8_t *, size_t, const char *symbols, size_t symbols_len);
 void aka_run(uint64_t cycles);
 void aka_render(uint16_t *out);
+/* MADCTL bit 3 as the firmware set the panel. */
+int aka_panel_bgr(void);
 void aka_set_keys(uint8_t keys);
 /* Additional Aka expander keys: R1=0x40, L1=0x80, D=0x1000, C=0x4000. */
 void aka_set_extra_keys(uint16_t keys);

@@ -4759,7 +4759,9 @@ static const char *filter_name(int f) {
 static inline uint32_t rgb565_argb(uint16_t p) {
     uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
     /* Pokitto et ESPboy : RGB565 natif ; la META garde le sien permuté (voir plus haut) */
-    if (emuTarget == TGT_POKITTO || emuTarget == TGT_ESPBOY || emuTarget == TGT_AKA) { uint32_t t = r; r = b; b = t; }
+    if (emuTarget == TGT_POKITTO || emuTarget == TGT_ESPBOY) { uint32_t t = r; r = b; b = t; }
+    /* AKA : la vitre est câblée BGR, le bit 3 du MADCTL du firmware la remet droite */
+    else if (emuTarget == TGT_AKA && aka_panel_bgr()) { uint32_t t = r; r = b; b = t; }
     return 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
 }
 /* la même couleur à k % d'intensité, canal par canal */
