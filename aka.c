@@ -55,7 +55,7 @@ static uint32_t xt_load(uint32_t a, unsigned n) {
   if (xt_periph(a, n))
     return 0;
   if (!p || (a & (n - 1))) {
-    xt_fault("AKA load %u at %08x pc=%08x", n, a, xt.pc);
+    xt_fault("AKA load %u at %08x pc=%08x ret=%08x a0=%08x", n, a, xt.pc, xt.a[8], xt.a[0]);
     return 0;
   }
   memcpy(&v, p, n);
@@ -66,7 +66,7 @@ static void xt_store(uint32_t a, uint32_t v, unsigned n) {
   if (xt_periph(a, n))
     return;
   if (!p || (a & (n - 1))) {
-    xt_fault("AKA store %u at %08x pc=%08x", n, a, xt.pc);
+    xt_fault("AKA store %u at %08x pc=%08x a0=%08x", n, a, xt.pc, xt.a[0]);
     return;
   }
   memcpy(p, &v, n);
@@ -262,6 +262,10 @@ static unsigned source_rows = 128;
 static uint32_t sequence;
 static int audio_volume = 4, clock_mhz = 240;
 static uint32_t rng = 0x4a3b2917;
+/* ets_get_cpu_frequency : la fréquence que setup() demande (MHz) */
+static uint32_t ets_freq = 240;
+/* les lignes de log du firmware, vidées en stderr (vprintf avalé) */
+static unsigned log_lines;
 static void *guest(uint32_t a, size_t n) {
   void *p = mem(a, n);
   if (!p)
@@ -270,8 +274,9 @@ static void *guest(uint32_t a, size_t n) {
 }
 static uint32_t alloc(unsigned n, int internal) {
   uint32_t *cursor = internal ? &internal_heap : &heap;
+  /* le haut du PSRAM garde le _REENT factice de newlib (aka_load) */
   uint32_t limit = internal ? AKA_DRAM + AKA_DRAM_SIZE - 0x10000
-                            : AKA_PSRAM + AKA_PSRAM_SIZE;
+                            : AKA_PSRAM + AKA_PSRAM_SIZE - 0x1000;
   if (n > limit - *cursor)
     return 0;
   uint32_t p = *cursor;
@@ -305,6 +310,7 @@ static const char *services[] = {"_ZN7gb_core4initEv",
                                  "esp32_buttons",
                                  "m0_lcd_init",
                                  "m0_lcd_send_rows",
+                                 "m0_lcd_send_wide",
                                  "m0_lcd_done_seq",
                                  "m0_lcd_busy",
                                  "m0_lcd_release",
@@ -332,6 +338,7 @@ static const char *services[] = {"_ZN7gb_core4initEv",
                                  "strlen",
                                  "esp_random",
                                  "esp32_restart",
+                                 "esp_error_check_failed_print",
                                  "_Z4millisv",
                                  "_Z5delaym",
                                  NULL};
@@ -536,6 +543,19 @@ static int service(const char *name) {
     a[2] = keys;
     return 1;
   }
+  /* L'échec d'un ESP_ERROR_CHECK : affiché (site fautif) puis ignoré —
+   * pas d'abort, le firmware continue comme une build qui ne bloque pas. */
+  if (!strcmp(name, "esp_error_check_failed_print") || !strcmp(name, "esp_error_check_failed")) {
+    uint32_t func = a[5];
+    fprintf(stderr, "[fw] ESP_ERROR_CHECK err=0x%x %s:%u (%s)\n", x,
+            mem(y, 1) ? (const char *)mem(y, 1) : "?", z,
+            mem(func, 1) ? (const char *)mem(func, 1) : "?");
+    return 1;
+  }
+  if (!strcmp(name, "abort")) {
+    xt_fault("AKA abort (assert ou check) — a0=%08x", xt.a[0]);
+    return 1;
+  }
   if (!strcmp(name, "m0_lcd_send_rows")) {
     uint16_t *p = guest(x, (size_t)z * 160 * 2);
     if (!p || y + z > source_rows) {
@@ -554,6 +574,23 @@ static int service(const char *name) {
     a[2] = ++sequence;
     frames_drawn++;
     xt.cycles += (uint64_t)z * 160 * 2 * 12;
+    return 1;
+  }
+  if (!strcmp(name, "m0_lcd_send_wide")) {
+    /* les lignes natives 320 colonnes (Mega Drive, Vectrex AKA) : 1:1 */
+    uint16_t *p = guest(x, (size_t)z * 320 * 2);
+    if (!p || y + z > 240) {
+      xt_fault("AKA invalid wide LCD rows");
+      return 1;
+    }
+    for (unsigned row = 0; row < z; row++)
+      for (unsigned px = 0; px < 320; px++) {
+        uint16_t c = p[row * 320 + px];
+        screen[(y + row) * 320 + px] = (c >> 8) | (c << 8);
+      }
+    a[2] = ++sequence;
+    frames_drawn++;
+    xt.cycles += (uint64_t)z * 320 * 2 * 12;
     return 1;
   }
   if (!strcmp(name, "m0_lcd_done_seq")) {
@@ -602,6 +639,10 @@ static int service(const char *name) {
     a[2] = alloc(x, 0);
     return 1;
   }
+  if (!strcmp(name, "pvalloc") || !strcmp(name, "valloc")) {
+    a[2] = alloc(x, 0);
+    return 1;
+  }
   if (!strcmp(name, "calloc") || !strcmp(name, "heap_caps_calloc")) {
     if (y && x > 0xffffffffu / y)
       a[2] = 0;
@@ -646,6 +687,219 @@ static int service(const char *name) {
     a[2] = rng;
     return 1;
   }
+  /* Les helpers Xtos de la ROM (l'ELF du firmware les définit à leur
+   * adresse) : le niveau d'interruption est le champ INTLEVEL de PS. */
+  if (!strcmp(name, "_xtos_set_intlevel") || !strcmp(name, "_xtos_restore_intlevel")) {
+    a[2] = xt.ps & XT_PS_INTLEVEL;
+    xt.ps = (xt.ps & ~XT_PS_INTLEVEL) | (x & XT_PS_INTLEVEL);
+    xt_sr_changed(SR_PS);
+    return 1;
+  }
+  if (!strcmp(name, "ets_update_cpu_frequency")) {
+    ets_freq = x;
+    return 1;
+  }
+  if (!strcmp(name, "ets_get_cpu_frequency")) {
+    a[2] = ets_freq;
+    return 1;
+  }
+  /* La sortie console n'existe pas ici (pas d'UART) : les logs du SDK
+   * (esp_log -> vprintf) s'y perdraient ; le format brut va en stderr,
+   * plafonné, pour la mise au point. */
+  if (!strcmp(name, "vprintf") || !strcmp(name, "printf") || !strcmp(name, "esp_rom_printf")) {
+    if (log_lines < 32) {
+      log_lines++;
+      fputc('[', stderr);
+      fputc('f', stderr);
+      fputc('w', stderr);
+      fputc(']', stderr);
+      fputc(' ', stderr);
+      for (unsigned i = 0; i < 4096; i++) {
+        const uint8_t *p = mem(x + i, 1);
+        if (!p || !*p) break;
+        fputc(*p, stderr);
+      }
+      /* les mots de la va_list (diagnostic des messages du firmware) */
+      for (unsigned w = 0; w < 6 && mem(y + 4 * w, 4); w++) {
+        uint32_t v;
+        memcpy(&v, mem(y + 4 * w, 4), 4);
+        fprintf(stderr, " | %08x", v);
+      }
+      fputc('\n', stderr);
+    }
+    a[2] = 0;
+    return 1;
+  }
+  if (!strcmp(name, "puts") || !strcmp(name, "putchar") || !strcmp(name, "putchar_unlocked")) {
+    a[2] = 0;
+    return 1;
+  }
+  /* itoa de la ROM : la valeur en a[10], le tampon en a[11], la base en
+   * a[12] ; les chiffres sont écrits à l'envers puis retournés. */
+  if (!strcmp(name, "itoa")) {
+    uint8_t *buf = mem(y, 36);
+    if (!buf) {
+      xt_fault("AKA itoa buffer %08x pc=%08x", y, xt.pc);
+      return 0;
+    }
+    const char *digits = "0123456789abcdef";
+    unsigned base = z ? z : 10, n = 0;
+    uint32_t v = x;
+    if (!v)
+      buf[n++] = '0';
+    else
+      while (v) {
+        buf[n++] = digits[v % base];
+        v /= base;
+      }
+    for (unsigned i = 0; i < n / 2; i++) {
+      const uint8_t t = buf[i];
+      buf[i] = buf[n - 1 - i];
+      buf[n - 1 - i] = t;
+    }
+    buf[n] = 0;
+    a[2] = y;
+    return 1;
+  }
+  /* Les routines ROM de chaînes, appelées par nom comme les services */
+  if (!strcmp(name, "strcmp") || !strcmp(name, "strncmp")) {
+    const unsigned bounded = name[3] == 'n' ? z : 0xffffffffu;
+    for (unsigned i = 0; i < bounded; i++) {
+      const uint8_t *p = mem(x + i, 1), *q = mem(y + i, 1);
+      if (!p || !q) {
+        xt_fault("AKA %s %08x %08x pc=%08x", name, x, y, xt.pc);
+        return 0;
+      }
+      if (*p != *q || !*p) {
+        a[2] = *p < *q ? 0xffffffffu : *p > *q;
+        return 1;
+      }
+    }
+    a[2] = 0;
+    return 1;
+  }
+  if (!strcmp(name, "strcasecmp") || !strcmp(name, "strncasecmp")) {
+    const unsigned bounded = name[3] == 'n' ? z : 0xffffffffu;
+    for (unsigned i = 0; i < bounded; i++) {
+      const uint8_t *p = mem(x + i, 1), *q = mem(y + i, 1);
+      if (!p || !q) return 0;
+      const int cp = *p >= 'A' && *p <= 'Z' ? *p + 32 : *p;
+      const int cq = *q >= 'A' && *q <= 'Z' ? *q + 32 : *q;
+      if (cp != cq || !cp) {
+        a[2] = cp < cq ? 0xffffffffu : cp > cq;
+        return 1;
+      }
+    }
+    a[2] = 0;
+    return 1;
+  }
+  if (!strcmp(name, "strcat") || !strcmp(name, "strncat")) {
+    unsigned n = 0;
+    while (n < 4096 && mem(y + n, 1) && *mem(y + n, 1)) n++;
+    const unsigned room = name[3] == 'n' ? z : 0xffffffffu;
+    for (unsigned i = 0; i < room && n < 4095; i++) {
+      const uint8_t *p = mem(x + i, 1);
+      uint8_t *q = mem(y + n, 1);
+      if (!p || !q) return 0;
+      q[0] = *p;
+      n++;
+      if (!*p) break;
+    }
+    if (n < 4096) {
+      uint8_t *q = mem(y + n, 1);
+      if (q) *q = 0;
+    }
+    a[2] = y;
+    return 1;
+  }
+  if (!strcmp(name, "strncpy")) {
+    for (unsigned i = 0; i < z; i++) {
+      const uint8_t *p = mem(x + i, 1);
+      uint8_t *q = mem(y + i, 1);
+      if (!p || !q) return 0;
+      q[0] = *p;
+      if (!*p)
+        for (i++; i < z; i++) {
+          uint8_t *r = mem(y + i, 1);
+          if (!r) return 0;
+          *r = 0;
+        }
+      if (!*p) break;
+    }
+    a[2] = y;
+    return 1;
+  }
+  if (!strcmp(name, "strlcpy")) {
+    unsigned n = 0;
+    while (n < 4096 && mem(x + n, 1) && *mem(x + n, 1)) n++;
+    if (z)
+      for (unsigned i = 0; i < z - 1 && i < n; i++) {
+        const uint8_t *p = mem(x + i, 1);
+        uint8_t *q = mem(y + i, 1);
+        if (!p || !q) return 0;
+        *q = *p;
+      }
+    uint8_t *q = mem(y + (z ? z - 1 : 0), 1);
+    if (q && z) *q = 0;
+    a[2] = n;
+    return 1;
+  }
+  if (!strcmp(name, "strlcat")) {
+    unsigned n = 0;
+    while (n < z && n < 4096 && mem(y + n, 1) && *mem(y + n, 1)) n++;
+    const unsigned base = n;
+    for (unsigned i = 0; i < 4096 && mem(x + i, 1) && *mem(x + i, 1); i++) {
+      uint8_t *q = mem(y + n, 1);
+      const uint8_t *p = mem(x + i, 1);
+      if (!q || !p) return 0;
+      if (n + 1 < z) q[0] = *p;
+      n++;
+    }
+    uint8_t *q = mem(y + (n < z ? n : z - 1), 1);
+    if (q && z) *q = 0;
+    a[2] = base + n - base; /* strlen(y) d'origine + strlen(x) */
+    return 1;
+  }
+  if (!strcmp(name, "strchr") || !strcmp(name, "strrchr")) {
+    const uint8_t c = (uint8_t)y;
+    uint32_t found = 0;
+    for (unsigned i = 0; i < 4096; i++) {
+      const uint8_t *p = mem(x + i, 1);
+      if (!p) return 0;
+      if (*p == c) {
+        found = x + i;
+        if (name[3] != 'r') break;
+      }
+      if (!*p) break;
+    }
+    a[2] = found;
+    return 1;
+  }
+  if (!strcmp(name, "strstr")) {
+    for (unsigned i = 0; i < 4096; i++) {
+      const uint8_t *p = mem(x + i, 1);
+      if (!p) return 0;
+      if (!*p) break;
+      unsigned j = 0;
+      for (; j < 4096; j++) {
+        const uint8_t *pp = mem(x + i + j, 1), *qq = mem(y + j, 1);
+        if (!pp || !qq) return 0;
+        if (!*qq) break;
+        if (*pp != *qq) break;
+        if (!*pp) {
+          if (!*qq) break;
+          j = 4096;
+          break;
+        }
+      }
+      if (j < 4096 && !*mem(y + j, 1)) {
+        a[2] = x + i;
+        return 1;
+      }
+    }
+    a[2] = 0;
+    return 1;
+  }
   if (!strcmp(name, "esp32_restart")) {
     xt_fault("AKA application requested restart");
     return 1;
@@ -671,6 +925,14 @@ static int xt_rom_call(uint32_t pc) {
     snprintf(xt.msg, sizeof xt.msg, "AKA application returned");
     return 1;
   }
+  /* L'appelant a posé ses arguments dans sa fenêtre (a[10..12] pour un
+   * call8) ; l'entrée de la routine ne s'exécutant pas, la fenêtre n'a pas
+   * tourné.  Tourner ici, avant de lire a[2..4], comme l'ENTRY l'aurait
+   * fait — le chemin des services, plus bas, fait déjà ainsi. */
+  unsigned inc = (xt.ps >> 16) & 3;
+  uint32_t ret = a[0];
+  if (inc)
+    xt_entry(1, 0);
   /* Démarrage ESP-IDF : routines de la ROM S3 à adresses fixes. Le cache et
    * la MMU sont logiquement transparents ici (flash déjà plate en
    * 0x42000000), ils sont donc des no-ops. */
@@ -723,10 +985,6 @@ static int xt_rom_call(uint32_t pc) {
     /* pas une routine ROM connue : les appels accrochés par symbole passent là */
     for (unsigned i = 0; i < nsymbols; i++)
     if (symbols[i].address == pc) {
-      unsigned inc = (xt.ps >> 16) & 3;
-      uint32_t ret = xt.a[0];
-      if (inc)
-        xt_entry(1, 0);
       const char *name = symbols[i].name;
       if (!strcmp(name, "longjmp")) {
         uint32_t buffer = xt.a[2], value = xt.a[3];
@@ -751,7 +1009,7 @@ static int xt_rom_call(uint32_t pc) {
       if (jump_buffer)
         xt.a[2] = 0;
       else if (!service(name)) {
-        xt_fault("AKA unknown service %s at %08x", symbols[i].name, pc);
+        xt_fault("AKA unknown service %s at %08x ret=%08x/%08x", symbols[i].name, pc, xt.a[4], xt.a[8]);
         return 0;
       }
       xt.pc = inc ? xt_retw(pc) : ret;
@@ -785,10 +1043,6 @@ static int xt_rom_call(uint32_t pc) {
     }
     return 0;
   }
-  unsigned inc = (xt.ps >> 16) & 3;
-  uint32_t ret = a[0];
-  if (inc)
-    xt_entry(1, 0);
   xt.pc = inc ? xt_retw(pc) : ret;
   xt.cycles += 12;
   return 1;
@@ -869,6 +1123,20 @@ int aka_load(const uint8_t *b, size_t n, const char *syms, size_t slen) {
   nsymbols = depth = 0;
   heap = AKA_PSRAM;
   internal_heap = AKA_DRAM + 0x50000;
+  log_lines = 0;
+  /* La ROM du S3 garde _impure_ptr à 0x3fceffd0 ; le boot dégradé ne
+   * l'initialise pas, newlib dérive donc un reent nul (vprintf
+   * déréférençait +8 sur NULL). Un _REENT zéro suffit aux chemins sans
+   * FILE (snprintf, rand...) ; les sorties console, elles, sont avalées
+   * dans service(). */
+  {
+    uint32_t *ip = (uint32_t *)mem(0x3fceffd0, 4);
+    uint8_t *reent = mem(AKA_PSRAM + AKA_PSRAM_SIZE - 0x1000, 0x1000);
+    if (ip && reent) {
+      memset(reent, 0, 0x1000);
+      *ip = AKA_PSRAM + AKA_PSRAM_SIZE - 0x1000;
+    }
+  }
   frames_drawn = sequence = 0;
   joyx_mv = joyy_mv = 1650;
   extra_keys = 0;
@@ -968,6 +1236,15 @@ int aka_load(const uint8_t *b, size_t n, const char *syms, size_t slen) {
     uint8_t *p = mem(symbol(services[i]), 3);
     if (p)
       memset(p, 0, 3);
+  }
+  /* La sortie de log du SDK (esp_log_writev appelle s_log_print_func) part
+   * vers esp_rom_printf, accrochée : vprintf resterait dans la newlib du
+   * firmware avec le _REENT factice sans FILE. */
+  {
+    uint32_t *lp = (uint32_t *)mem(symbol("s_log_print_func"), 4);
+    uint32_t rom_printf = symbol("esp_rom_printf");
+    if (lp && rom_printf)
+      *lp = rom_printf;
   }
   /* All current m0boy ESP32 frontends feed a 160x128 panel surface.
    * Sega scaling (120 rows plus border) already happened in guest code. */
