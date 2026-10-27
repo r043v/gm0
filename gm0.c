@@ -698,7 +698,7 @@ static void sd_command(uint8_t cmd, uint32_t arg) {
     if (sdDbg && cmd != 55)
         fprintf(stderr, "[sd] CMD%u arg=%u (%#x) @tick=%u\n", cmd, arg, arg, tickCount);
     switch (cmd) {
-        case 0:  sd_out_push(sd_initialized ? 0x00 : 0x01); break; /* idle */
+        case 0:  sd_out_push(0x01); sd_initialized = 0; break; /* GO_IDLE : une vraie carte SPI y retourne, l'init rejoue */
         case 8:  sd_out_push(0x01); sd_out_push(0x00);
                  sd_out_push(0x00); sd_out_push(0x01);
                  sd_out_push(0xaa); break;
@@ -4760,8 +4760,9 @@ static inline uint32_t rgb565_argb(uint16_t p) {
     uint32_t r = (p >> 11) & 0x1f, g = (p >> 5) & 0x3f, b = p & 0x1f;
     /* Pokitto et ESPboy : RGB565 natif ; la META garde le sien permuté (voir plus haut) */
     if (emuTarget == TGT_POKITTO || emuTarget == TGT_ESPBOY) { uint32_t t = r; r = b; b = t; }
-    /* AKA : la vitre est câblée BGR, le bit 3 du MADCTL du firmware la remet droite */
-    else if (emuTarget == TGT_AKA && aka_panel_bgr()) { uint32_t t = r; r = b; b = t; }
+    /* AKA : vitre RVB ordinaire ; MADCTL bit 3 = 1 fait lire les mots en BGR (la lib officielle,
+     * lcd_color_rgb, range le rouge dans les bits bas), bit 3 = 0 les lit en RVB */
+    else if (emuTarget == TGT_AKA && !aka_panel_bgr()) { uint32_t t = r; r = b; b = t; }
     return 0xff000000u | ((b << 3) << 16) | ((g << 2) << 8) | (r << 3);
 }
 /* la même couleur à k % d'intensité, canal par canal */

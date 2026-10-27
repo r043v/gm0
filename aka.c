@@ -25,8 +25,8 @@ static struct { uint8_t madctl, swap_color_bytes; } panel = {0x68, 0};
 static uint16_t panel_word(uint16_t c) {
   return panel.swap_color_bytes ? c : (uint16_t)((c >> 8) | (c << 8));
 }
-/* MADCTL bit 3 set puts the channels right on the BGR-wired glass; clear, red
- * and blue show swapped. */
+/* MADCTL bit 3 (ST7789 semantics): set, the panel reads the pixel words as BGR
+ * (the official library's lcd_color_rgb); clear, as RGB. */
 int aka_panel_bgr(void) { return (panel.madctl >> 3) & 1; }
 static uint32_t saved[1024][16];
 static unsigned depth;
@@ -521,6 +521,17 @@ static int service(const char *name) {
       else
         v = strstr(name, "mod") ? (uint64_t)(sn % sd) : (uint64_t)(sn / sd);
     }
+    a[2] = v;
+    a[3] = v >> 32;
+    return 1;
+  }
+  if (!strcmp(name, "__ashldi3") || !strcmp(name, "__lshrdi3") || !strcmp(name, "__ashrdi3")) {
+    /* libgcc des décalages 64 bits : (x, y) = valeur basse/haute, z = compte */
+    uint64_t v = ((uint64_t)y << 32) | x;
+    unsigned c = z & 63u;
+    v = !strcmp(name, "__ashldi3") ? v << c
+        : !strcmp(name, "__lshrdi3") ? v >> c
+                                     : (uint64_t)((int64_t)v >> c);
     a[2] = v;
     a[3] = v >> 32;
     return 1;
