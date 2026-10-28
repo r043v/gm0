@@ -5501,6 +5501,10 @@ static void aka_frame(void) {
     aka_run(4000000);
     tickCount = (uint32_t)aka_cycles();
     aka_render(pix);
+    static unsigned dbgFrame;
+    if (getenv("EMU_AKA_DEBUG") && (++dbgFrame % 120) == 0)
+        fprintf(stderr, "[aka] frame=%u pc=%08x (%s) frames_drawn=%u\n",
+                dbgFrame, aka_pc(), aka_where(aka_pc()), aka_frames_drawn());
     const char *err = aka_error();
     if (err && !aka_failed) {
         fprintf(stderr, "AKA: %s\n", err); aka_failed=1;

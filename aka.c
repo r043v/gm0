@@ -265,6 +265,21 @@ static uint32_t word(const uint8_t *p) {
   memcpy(&v, p, 4);
   return v;
 }
+/* EMU_AKA_DEBUG : le symbole le plus proche sous une adresse */
+const char *aka_where(uint32_t pc) {
+  static char out[180];
+  const char *best = "?";
+  uint32_t best_a = 0;
+  for (unsigned i = 0; i < nsymbols; i++)
+    if (symbols[i].address <= pc && symbols[i].address >= best_a) {
+      best_a = symbols[i].address;
+      best = symbols[i].name;
+    }
+  snprintf(out, sizeof out, "%s+%#x", best, pc - best_a);
+  return out;
+}
+unsigned aka_frames_drawn(void) { return frames_drawn; }
+uint32_t aka_pc(void) { return xt.pc; }
 static uint16_t half(const uint8_t *p) {
   uint16_t v;
   memcpy(&v, p, 2);
@@ -272,6 +287,7 @@ static uint16_t half(const uint8_t *p) {
 }
 static unsigned source_rows = 128;
 static uint32_t sequence;
+static unsigned wide_row;
 static int audio_volume = 4, clock_mhz = 240;
 static uint32_t rng = 0x4a3b2917;
 /* ets_get_cpu_frequency : la fréquence que setup() demande (MHz) */
@@ -323,6 +339,10 @@ static const char *services[] = {"_ZN7gb_core4initEv",
                                  "m0_lcd_init",
                                  "m0_lcd_send_rows",
                                  "m0_lcd_send_wide",
+                                 "m0_lcd_wide_begin",
+                                 "m0_lcd_wide_reserve",
+                                 "m0_lcd_wide_submit",
+                                 "m0_lcd_wide_flush",
                                  "m0_lcd_done_seq",
                                  "m0_lcd_busy",
                                  "m0_lcd_release",
@@ -536,6 +556,21 @@ static int service(const char *name) {
     a[3] = v >> 32;
     return 1;
   }
+  if (!strcmp(name, "__bswapsi2")) {
+    /* libgcc de l'échange d'octets 32 bits, fournie par la ROM S3 */
+    uint32_t v = x;
+    a[2] = (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24);
+    return 1;
+  }
+  if (!strcmp(name, "__bswapdi2")) {
+    uint64_t v = ((uint64_t)y << 32) | x;
+    v = (v >> 56) | ((v >> 40) & 0xff00ull) | ((v >> 24) & 0xff0000ull) |
+        ((v >> 8) & 0xff000000ull) | ((v << 8) & 0xff00000000ull) |
+        ((v << 24) & 0xff0000000000ull) | ((v << 40) & 0xff000000000000ull) | (v << 56);
+    a[2] = v;
+    a[3] = v >> 32;
+    return 1;
+  }
   if (!strcmp(name, "m0_micros") || !strcmp(name, "esp_timer_get_time")) {
     uint64_t t = xt.cycles / 240;
     a[2] = t;
@@ -614,6 +649,30 @@ static int service(const char *name) {
     a[2] = ++sequence;
     frames_drawn++;
     xt.cycles += (uint64_t)z * 320 * 2 * 12;
+    return 1;
+  }
+  /* le chemin asynchrone des lignes larges (Mega Drive, Vectrex) : une
+   * fenêtre de rangées (begin), puis des lots de rangées dans l'ordre
+   * (submit) ; la réservation et le flush n'attendent rien ici */
+  if (!strcmp(name, "m0_lcd_wide_begin")) {
+    wide_row = x;
+    return 1;
+  }
+  if (!strcmp(name, "m0_lcd_wide_reserve") || !strcmp(name, "m0_lcd_wide_flush"))
+    return 1;
+  if (!strcmp(name, "m0_lcd_wide_submit")) {
+    uint16_t *p = guest(x, (size_t)y * 320 * 2);
+    if (!p || wide_row + y > 240) {
+      xt_fault("AKA invalid wide LCD batch");
+      return 1;
+    }
+    for (unsigned row = 0; row < y; row++)
+      for (unsigned px = 0; px < 320; px++)
+        screen[(wide_row + row) * 320 + px] = panel_word(p[row * 320 + px]);
+    wide_row += y;
+    ++sequence;
+    frames_drawn++;
+    xt.cycles += (uint64_t)y * 320 * 2 * 12;
     return 1;
   }
   if (!strcmp(name, "m0_lcd_done_seq")) {

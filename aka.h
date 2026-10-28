@@ -18,6 +18,10 @@ void aka_set_joystick(int16_t x, int16_t y);
 uint64_t aka_cycles(void);
 const char *aka_error(void);
 int aka_degraded(void);
+/* EMU_AKA_DEBUG : où tourne l'invité, combien de frames ont atteint l'écran. */
+const char *aka_where(uint32_t pc);
+unsigned aka_frames_drawn(void);
+uint32_t aka_pc(void);
 extern void aka_audio_sample(int16_t, uint64_t);
 extern int aka_sd_read(uint32_t, uint8_t *);
 extern int aka_sd_write(uint32_t, const uint8_t *);
